@@ -2,7 +2,14 @@
 //          + notifyUser (C1) + EMAIL (D) + GeNova HTML TEMPLATE (uses src/utils/emailTemplate.js)
 //          + OFFLINE EDGE-CASE SUPPORT: lastResult + /my-latest-result + /mark-result-seen
 
-// ===== Render key bootstrap (safe, no duplicate imports) =====
+const admin = require("firebase-admin");
+const { Expo } = require("expo-server-sdk");
+const express = require("express");
+const multer = require("multer");
+const fs = require("fs");
+const path = require("path");
+
+// ===== Render key bootstrap (CommonJS safe) =====
 function writeJsonKeyFileIfMissing(relPath, envVarName) {
   try {
     const abs = path.resolve(process.cwd(), relPath);
@@ -18,43 +25,20 @@ function writeJsonKeyFileIfMissing(relPath, envVarName) {
     const dir = path.dirname(abs);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-    const json =
-      typeof raw === "string" ? JSON.parse(raw) : raw;
-
-    fs.writeFileSync(
-      abs,
-      JSON.stringify(json, null, 2),
-      "utf8"
-    );
+    const json = JSON.parse(String(raw));
+    fs.writeFileSync(abs, JSON.stringify(json, null, 2), "utf8");
 
     console.log(`🧾 Key file written: ${relPath}`);
   } catch (err) {
-    console.error(
-      `❌ Failed writing key file ${relPath} from ${envVarName}`,
-      err
-    );
+    console.error(`❌ Failed writing key file ${relPath} from ${envVarName}`, err);
   }
 }
 
 // Files expected by existing code
-writeJsonKeyFileIfMissing(
-  "./firebase-admin-key.json",
-  "FIREBASE_ADMIN_KEY_JSON"
-);
+writeJsonKeyFileIfMissing("./firebase-admin-key.json", "FIREBASE_ADMIN_KEY_JSON");
+writeJsonKeyFileIfMissing("./google-cloud-key.json", "GOOGLE_CLOUD_KEY_JSON");
+// =================================================
 
-writeJsonKeyFileIfMissing(
-  "./google-cloud-key.json",
-  "GOOGLE_CLOUD_KEY_JSON"
-);
-// ============================================================
-
-
-const admin = require("firebase-admin");
-const { Expo } = require("expo-server-sdk");
-const express = require("express");
-const multer = require("multer");
-const fs = require("fs");
-const path = require("path");
 const { Storage } = require("@google-cloud/storage");
 const nodemailer = require("nodemailer");
 require("dotenv").config();
@@ -1545,8 +1529,3 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 5000;
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
-
-
-
-
-
