@@ -3,11 +3,6 @@
 //          + OFFLINE EDGE-CASE SUPPORT: lastResult + /my-latest-result + /mark-result-seen
 
 
-// Your server.js expects these exact files:
-writeJsonKeyFileIfMissing("./firebase-admin-key.json", "FIREBASE_ADMIN_KEY_JSON");
-writeJsonKeyFileIfMissing("./google-cloud-key.json", "GOOGLE_CLOUD_KEY_JSON");
-// =====================================================
-
 const admin = require("firebase-admin");
 const { Expo } = require("expo-server-sdk");
 const express = require("express");
@@ -1504,5 +1499,6 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 5000;
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
+
 
 
