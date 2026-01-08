@@ -2,31 +2,6 @@
 //          + notifyUser (C1) + EMAIL (D) + GeNova HTML TEMPLATE (uses src/utils/emailTemplate.js)
 //          + OFFLINE EDGE-CASE SUPPORT: lastResult + /my-latest-result + /mark-result-seen
 
-// ===== Render key bootstrap (DO NOT COMMIT KEYS) =====
-import fs from "fs";
-import path from "path";
-
-function writeJsonKeyFileIfMissing(relPath, envVarName) {
-  try {
-    const abs = path.resolve(process.cwd(), relPath);
-
-    if (fs.existsSync(abs)) return;
-
-    const raw = process.env[envVarName];
-    if (!raw || !String(raw).trim()) return;
-
-    const dir = path.dirname(abs);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-    // raw can be JSON string; ensure it's valid JSON before writing
-    const json = typeof raw === "string" ? JSON.parse(raw) : raw;
-    fs.writeFileSync(abs, JSON.stringify(json, null, 2), "utf8");
-
-    console.log(`🧾 Wrote key file: ${relPath} from ${envVarName}`);
-  } catch (e) {
-    console.log(`❌ Failed to write key file ${relPath} from ${envVarName}`, e);
-  }
-}
 
 // Your server.js expects these exact files:
 writeJsonKeyFileIfMissing("./firebase-admin-key.json", "FIREBASE_ADMIN_KEY_JSON");
@@ -1529,4 +1504,5 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 5000;
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
+
 
