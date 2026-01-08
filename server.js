@@ -2,6 +2,53 @@
 //          + notifyUser (C1) + EMAIL (D) + GeNova HTML TEMPLATE (uses src/utils/emailTemplate.js)
 //          + OFFLINE EDGE-CASE SUPPORT: lastResult + /my-latest-result + /mark-result-seen
 
+// ===== Render key bootstrap (safe, no duplicate imports) =====
+function writeJsonKeyFileIfMissing(relPath, envVarName) {
+  try {
+    const abs = path.resolve(process.cwd(), relPath);
+
+    if (fs.existsSync(abs)) return;
+
+    const raw = process.env[envVarName];
+    if (!raw || !String(raw).trim()) {
+      console.log(`⚠️ ENV ${envVarName} not set, skipping ${relPath}`);
+      return;
+    }
+
+    const dir = path.dirname(abs);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    const json =
+      typeof raw === "string" ? JSON.parse(raw) : raw;
+
+    fs.writeFileSync(
+      abs,
+      JSON.stringify(json, null, 2),
+      "utf8"
+    );
+
+    console.log(`🧾 Key file written: ${relPath}`);
+  } catch (err) {
+    console.error(
+      `❌ Failed writing key file ${relPath} from ${envVarName}`,
+      err
+    );
+  }
+}
+
+// Files expected by existing code
+writeJsonKeyFileIfMissing(
+  "./firebase-admin-key.json",
+  "FIREBASE_ADMIN_KEY_JSON"
+);
+
+writeJsonKeyFileIfMissing(
+  "./google-cloud-key.json",
+  "GOOGLE_CLOUD_KEY_JSON"
+);
+// ============================================================
+=========
+
 
 const admin = require("firebase-admin");
 const { Expo } = require("expo-server-sdk");
@@ -1499,6 +1546,7 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 5000;
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
+
 
 
 
