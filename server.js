@@ -1,0 +1,1500 @@
+// server.js — PROMPT + IMAGE SUPPORT (FINAL) + /notify (PREFS) + PUSH UTIL (FINAL)
+//          + notifyUser (C1) + EMAIL (D) + GeNova HTML TEMPLATE (uses src/utils/emailTemplate.js)
+//          + OFFLINE EDGE-CASE SUPPORT: lastResult + /my-latest-result + /mark-result-seen
+
+const admin = require("firebase-admin");
+const { Expo } = require("expo-server-sdk");
+const express = require("express");
+const multer = require("multer");
+const fs = require("fs");
+const path = require("path");
+const { Storage } = require("@google-cloud/storage");
+const nodemailer = require("nodemailer");
+require("dotenv").config();
+
+const { emailTemplate } = require("./src/utils/emailTemplate");
+
+const BUILD_TAG =
+  "PROMPT_IMAGE_NOTIFYUSER_EMAIL_TEMPLATE_FIXED_2025-12-21__LASTRESULT_2025-12-21__PUSH_I18N_2025-12-26";
+
+const app = express();
+app.use(express.json({ limit: "10mb" }));
+
+console.log("🔥 RUNNING SERVER FILE:", __filename);
+console.log("🔥 BUILD:", BUILD_TAG);
+
+// ------------------------------------------------------------
+// Firebase Admin init
+// ------------------------------------------------------------
+if (!admin.apps.length) {
+  const sa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+    ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
+    : require("./firebase-admin-key.json");
+
+  admin.initializeApp({
+    credential: admin.credential.cert(sa),
+  });
+}
+
+const db = admin.firestore();
+const expo = new Expo();
+
+// ------------------------------------------------------------
+// Auth middleware
+// ------------------------------------------------------------
+const verifyFirebaseToken = async (req, res, next) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token)
+    return res
+      .status(401)
+      .json({ success: false, error: "Missing Bearer token" });
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.uid = decoded.uid;
+    next();
+  } catch {
+    return res.status(403).json({ success: false, error: "Invalid token" });
+  }
+};
+
+// ------------------------------------------------------------
+// Health + Version
+// ------------------------------------------------------------
+app.get("/health", (_, res) => res.json({ ok: true }));
+app.get("/version", (_, res) => res.json({ ok: true, build: BUILD_TAG }));
+
+// ------------------------------------------------------------
+// 🌍 i18n helpers (EN/HU/DE) for PUSH + lastResult
+// ------------------------------------------------------------
+function normalizeLang(lang) {
+  const l = String(lang || "").trim().toLowerCase();
+  if (l.startsWith("hu")) return "hu";
+  if (l.startsWith("de")) return "de";
+  return "en";
+}
+
+function getUserLang(userDoc) {
+  // priority: notifPrefs.language (as agreed)
+  const prefLang = userDoc?.notifPrefs?.language;
+  return normalizeLang(prefLang);
+}
+
+function formatVideoMetaLine({ lang, model, videoLength, resolution, fps }) {
+  const m = model || "";
+  const len = videoLength ?? "";
+  const res = resolution || "";
+  const f = fps ?? "";
+
+  if (lang === "hu") {
+    // "Modell" Hungarian spelling often "Modell", but "Model" is also OK. Using "Modell" for HU.
+    return `Modell: ${m} • ${len}s • ${res} • ${f}fps`;
+  }
+  if (lang === "de") {
+    return `Modell: ${m} • ${len}s • ${res} • ${f}fps`;
+  }
+  return `Model: ${m} • ${len}s • ${res} • ${f}fps`;
+}
+
+/**
+ * Localize notifications by type. Uses data if available.
+ * Returns { title, body }.
+ */
+function localizeNotification({ lang, type, title, body, data }) {
+  const L = normalizeLang(lang);
+
+  const model = data?.model ?? data?.meta?.model ?? "";
+  const videoLength = data?.videoLength ?? data?.meta?.length ?? "";
+  const resolution = data?.resolution ?? data?.meta?.resolution ?? "";
+  const fps = data?.fps ?? data?.meta?.fps ?? "";
+
+  if (type === "video") {
+    const t =
+      L === "hu"
+        ? "🎬 A videó elkészült"
+        : L === "de"
+        ? "🎬 Dein Video ist fertig"
+        : "🎬 Your video has been generated";
+
+    const b =
+      model || videoLength || resolution || fps
+        ? formatVideoMetaLine({ lang: L, model, videoLength, resolution, fps })
+        : body || "";
+
+    return { title: t, body: b };
+  }
+
+  if (type === "system") {
+    const t =
+      L === "hu"
+        ? "⚠️ Generálás sikertelen"
+        : L === "de"
+        ? "⚠️ Generierung fehlgeschlagen"
+        : "⚠️ Generation failed";
+    const b = body || (L === "hu" ? "Ismeretlen hiba" : L === "de" ? "Unbekannter Fehler" : "Unknown error");
+    return { title: t, body: b };
+  }
+
+  if (type === "marketing") {
+    // Keep provided title if it's custom, otherwise localize a generic one
+    const t =
+      title?.trim()
+        ? title
+        : L === "hu"
+        ? "📣 GeNova újdonság"
+        : L === "de"
+        ? "📣 GeNova Update"
+        : "📣 GeNova update";
+    const b = body || "";
+    return { title: t, body: b };
+  }
+
+  // default/generic
+  return { title: title || "GeNova", body: body || "" };
+}
+
+// ------------------------------------------------------------
+// 🔔 PUSH HELPERS (prefs + safe send)
+// ------------------------------------------------------------
+function allowByPrefs(type, userDoc) {
+  const p = userDoc?.notifPrefs;
+  if (!p?.pushNotif) return false;
+
+  if (type === "video") return !!p.videoNotif;
+  if (type === "system") return !!p.systemNotif;
+  if (type === "marketing") return !!p.marketingNotif;
+
+  // NOTE: emailNotif is not a push type; kept for completeness only.
+  if (type === "email") return !!p.emailNotif;
+
+  return false;
+}
+
+async function getUserDoc(uid) {
+  const snap = await db.collection("users").doc(uid).get();
+  if (!snap.exists) return null;
+  return snap.data();
+}
+
+/**
+ * ------------------------------------------------------------
+ * Monetization (v1): Credits + time-based add-ons (entitlements)
+ * - Source of truth: Firestore users/{uid}
+ * - Credits debit is enforced server-side (transactions)
+ * - Add-ons can be purchased for 7d / 30d (extend if already active)
+ * ------------------------------------------------------------
+ */
+
+const MONETIZATION = {
+  TRIAL_CREDITS: 5,
+  DEFAULT_PLAN: "free",
+  GENERATION_COST: 1, // credits per generation
+  ADDONS: {
+    // Watermark removal (time-based)
+    no_watermark_7d: { cost: 50, days: 7, entitlementKey: "noWatermarkUntil" },
+    no_watermark_30d: { cost: 150, days: 30, entitlementKey: "noWatermarkUntil" },
+
+    // Ad-free (time-based) — for future UI/ads
+    ad_free_7d: { cost: 20, days: 7, entitlementKey: "adFreeUntil" },
+    ad_free_30d: { cost: 50, days: 30, entitlementKey: "adFreeUntil" },
+  },
+};
+
+
+// ✅ Pack catalog (credit costs). Keep IDs in sync with src/data/promptPacks.js
+const PACK_CATALOG = {
+  product_pro: { cost: 60, tier: "pro" },
+  // add more packs here later...
+};
+
+
+// 💰 Monetization v2 — compute-based costs + plan limits (hard caps)
+// - Cost depends on: length, resolution, fps, model
+// - Plan controls max allowed params + watermark defaults
+const BILLING = {
+  HARD_CAPS: {
+    MAX_LENGTH_SEC: 20,
+    MAX_FPS: 60,
+  },
+  // Allowed maxima per plan (v1)
+  PLAN_LIMITS: {
+    free:   { maxLength: 5,  maxFps: 30, maxResolution: "720p" },
+    basic:  { maxLength: 5,  maxFps: 30, maxResolution: "1080p" },
+    pro:    { maxLength: 10, maxFps: 60, maxResolution: "4k" },
+    studio: { maxLength: 20, maxFps: 60, maxResolution: "4k" },
+  },
+  // Cost factors
+  FPS_FACTOR: {
+    24: 0.8,
+    30: 1.0,
+    60: 2.0,
+  },
+  RES_FACTOR: {
+    "720p": 1.0,
+    "1080p": 1.5,
+    "4k": 3.0,
+  },
+  // Model cost multipliers (v1 defaults)
+  MODEL_FACTOR: {
+    kling: 1.0,
+    veo: 1.4,
+    runway: 1.3,
+    pika: 1.2,
+    svd: 1.0,
+    default: 1.0,
+  },
+};
+
+function normalizePlan(p) {
+  const plan = String(p || MONETIZATION.DEFAULT_PLAN).toLowerCase();
+  return BILLING.PLAN_LIMITS[plan] ? plan : MONETIZATION.DEFAULT_PLAN;
+}
+
+function normalizeResolution(res) {
+  const r = String(res || "").toLowerCase().trim();
+  if (r.includes("4k") || r.includes("2160")) return "4k";
+  if (r.includes("1080")) return "1080p";
+  if (r.includes("720")) return "720p";
+  // fallback
+  return "1080p";
+}
+
+function clampInt(v, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.floor(n);
+}
+
+function resRank(r) {
+  return r === "4k" ? 3 : (r === "1080p" ? 2 : 1);
+}
+
+function enforceCapsAndLimits({ plan, lengthSec, fps, resolution }) {
+  // Hard caps
+  if (lengthSec > BILLING.HARD_CAPS.MAX_LENGTH_SEC) {
+    const err = new Error("LIMIT_HARD_CAP_LENGTH");
+    err.code = "LIMIT_HARD_CAP_LENGTH";
+    err.meta = { max: BILLING.HARD_CAPS.MAX_LENGTH_SEC, got: lengthSec };
+    throw err;
+  }
+  if (fps > BILLING.HARD_CAPS.MAX_FPS) {
+    const err = new Error("LIMIT_HARD_CAP_FPS");
+    err.code = "LIMIT_HARD_CAP_FPS";
+    err.meta = { max: BILLING.HARD_CAPS.MAX_FPS, got: fps };
+    throw err;
+  }
+
+  const p = normalizePlan(plan);
+  const limits = BILLING.PLAN_LIMITS[p] || BILLING.PLAN_LIMITS.free;
+
+  if (lengthSec > limits.maxLength) {
+    const err = new Error("LIMIT_LENGTH");
+    err.code = "LIMIT_LENGTH";
+    err.meta = { max: limits.maxLength, got: lengthSec, plan: p };
+    throw err;
+  }
+
+  if (fps > limits.maxFps) {
+    const err = new Error("LIMIT_FPS");
+    err.code = "LIMIT_FPS";
+    err.meta = { max: limits.maxFps, got: fps, plan: p };
+    throw err;
+  }
+
+  if (resRank(resolution) > resRank(limits.maxResolution)) {
+    const err = new Error("LIMIT_RESOLUTION");
+    err.code = "LIMIT_RESOLUTION";
+    err.meta = { max: limits.maxResolution, got: resolution, plan: p };
+    throw err;
+  }
+
+  return { plan: p, limits };
+}
+
+function computeGenerationCost({ lengthSec, fps, resolution, model }) {
+  const baseUnits = Math.max(1, Math.ceil(lengthSec / 5)); // 1 unit per 5s
+  const fpsKey = fps >= 60 ? 60 : (fps <= 24 ? 24 : 30);
+  const fpsFactor = BILLING.FPS_FACTOR[fpsKey] ?? 1.0;
+  const resFactor = BILLING.RES_FACTOR[resolution] ?? 1.0;
+  const modelKey = String(model || "").toLowerCase().trim();
+  const modelFactor = BILLING.MODEL_FACTOR[modelKey] ?? BILLING.MODEL_FACTOR.default ?? 1.0;
+
+  const cost = Math.max(1, Math.ceil(baseUnits * fpsFactor * resFactor * modelFactor));
+  return { cost, breakdown: { baseUnits, fpsKey, fpsFactor, resFactor, modelFactor } };
+}
+
+
+function isTsLike(v) {
+  return v && typeof v === "object" && typeof v.toDate === "function";
+}
+
+function tsNow() {
+  return admin.firestore.Timestamp.now();
+}
+
+function addDaysTs(baseTs, days) {
+  const base = isTsLike(baseTs) ? baseTs.toDate() : new Date();
+  return admin.firestore.Timestamp.fromDate(new Date(base.getTime() + days * 24 * 60 * 60 * 1000));
+}
+
+function entitlementActive(untilTs) {
+  if (!isTsLike(untilTs)) return false;
+  return untilTs.toMillis() > tsNow().toMillis();
+}
+
+function computeWatermarkApplied(userData) {
+  const plan = String(userData?.plan || MONETIZATION.DEFAULT_PLAN);
+  const ent = userData?.entitlements || {};
+  const noWm = entitlementActive(ent?.noWatermarkUntil);
+  const planNoWm = plan === "pro" || plan === "studio";
+  return !(planNoWm || noWm);
+}
+
+
+async function ensureTrialValidateAndDebit(uid, genParams) {
+  // genParams: { model, lengthSec, fps, resolution }
+  const userRef = db.collection("users").doc(uid);
+
+  let result = {
+    creditsBefore: 0,
+    creditsAfter: 0,
+    plan: MONETIZATION.DEFAULT_PLAN,
+    entitlements: {},
+    watermarkApplied: true,
+    trialGranted: false,
+    cost: 0,
+    breakdown: {},
+    limits: BILLING.PLAN_LIMITS.free,
+    normalized: {},
+  };
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+
+    // If missing, create minimal doc and grant trial once
+    if (!snap.exists) {
+      const init = {
+        plan: MONETIZATION.DEFAULT_PLAN,
+        credits: MONETIZATION.TRIAL_CREDITS,
+        trialCreditsGranted: true,
+        entitlements: {},
+        notifPrefs: {},
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      // Validate/cost under free plan caps
+      const planInfo = enforceCapsAndLimits({
+        plan: init.plan,
+        lengthSec: genParams.lengthSec,
+        fps: genParams.fps,
+        resolution: genParams.resolution,
+      });
+      const costInfo = computeGenerationCost({
+        lengthSec: genParams.lengthSec,
+        fps: genParams.fps,
+        resolution: genParams.resolution,
+        model: genParams.model,
+      });
+
+      tx.set(userRef, init, { merge: true });
+
+      const credits = init.credits || 0;
+      result.trialGranted = true;
+      result.plan = planInfo.plan;
+      result.entitlements = init.entitlements;
+      result.watermarkApplied = computeWatermarkApplied({ plan: planInfo.plan, entitlements: init.entitlements });
+      result.limits = planInfo.limits;
+      result.cost = costInfo.cost;
+      result.breakdown = costInfo.breakdown;
+      result.normalized = { ...genParams, plan: planInfo.plan };
+
+      if (credits < costInfo.cost) {
+        const err = new Error("NO_CREDITS");
+        err.code = "NO_CREDITS";
+        throw err;
+      }
+
+      result.creditsBefore = credits;
+      result.creditsAfter = credits - costInfo.cost;
+
+      tx.update(userRef, {
+        credits: admin.firestore.FieldValue.increment(-costInfo.cost),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return;
+    }
+
+    const data = snap.data() || {};
+    const credits = Number(data.credits ?? 0);
+    const plan = normalizePlan(data.plan);
+    const entitlements = data.entitlements || {};
+
+    // Grant trial once if needed (legacy users)
+    if (!data.trialCreditsGranted) {
+      tx.update(userRef, {
+        credits: admin.firestore.FieldValue.increment(MONETIZATION.TRIAL_CREDITS),
+        trialCreditsGranted: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      result.trialGranted = true;
+    }
+
+    const creditsEffective = credits + (data.trialCreditsGranted ? 0 : MONETIZATION.TRIAL_CREDITS);
+
+    // Validate params under plan limits (hard caps included)
+    const planInfo = enforceCapsAndLimits({
+      plan,
+      lengthSec: genParams.lengthSec,
+      fps: genParams.fps,
+      resolution: genParams.resolution,
+    });
+
+    const costInfo = computeGenerationCost({
+      lengthSec: genParams.lengthSec,
+      fps: genParams.fps,
+      resolution: genParams.resolution,
+      model: genParams.model,
+    });
+
+    result.plan = planInfo.plan;
+    result.entitlements = entitlements;
+    result.watermarkApplied = computeWatermarkApplied({ plan: planInfo.plan, entitlements });
+    result.limits = planInfo.limits;
+    result.cost = costInfo.cost;
+    result.breakdown = costInfo.breakdown;
+    result.normalized = { ...genParams, plan: planInfo.plan };
+
+    result.creditsBefore = creditsEffective;
+
+    if (creditsEffective < costInfo.cost) {
+      const err = new Error("NO_CREDITS");
+      err.code = "NO_CREDITS";
+      throw err;
+    }
+
+    result.creditsAfter = creditsEffective - costInfo.cost;
+
+    tx.update(userRef, {
+      credits: admin.firestore.FieldValue.increment(-costInfo.cost),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  return result;
+}
+
+async function ensureTrialAndDebitCredits(uid, cost) {
+  const userRef = db.collection("users").doc(uid);
+
+  let result = {
+    creditsBefore: 0,
+    creditsAfter: 0,
+    plan: MONETIZATION.DEFAULT_PLAN,
+    entitlements: {},
+    watermarkApplied: true,
+    trialGranted: false,
+  };
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+
+    // Create user doc if missing (minimal), and grant trial once
+    if (!snap.exists) {
+      const init = {
+        credits: MONETIZATION.TRIAL_CREDITS,
+        plan: MONETIZATION.DEFAULT_PLAN,
+        trialCreditsGranted: true,
+        entitlements: {},
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+      tx.set(userRef, init, { merge: true });
+
+      const credits = init.credits || 0;
+      result.trialGranted = true;
+      result.plan = init.plan;
+      result.entitlements = init.entitlements;
+      result.watermarkApplied = computeWatermarkApplied(init);
+
+      if (credits < cost) {
+        const err = new Error("NO_CREDITS");
+        err.code = "NO_CREDITS";
+        throw err;
+      }
+
+      result.creditsBefore = credits;
+      result.creditsAfter = credits - cost;
+
+      tx.update(userRef, {
+        credits: admin.firestore.FieldValue.increment(-cost),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return;
+    }
+
+    const data = snap.data() || {};
+    const credits = Number(data.credits ?? 0);
+    const plan = String(data.plan || MONETIZATION.DEFAULT_PLAN);
+    const entitlements = data.entitlements || {};
+
+    // Grant trial once if not granted yet
+    if (!data.trialCreditsGranted) {
+      tx.update(userRef, {
+        credits: admin.firestore.FieldValue.increment(MONETIZATION.TRIAL_CREDITS),
+        plan: plan || MONETIZATION.DEFAULT_PLAN,
+        trialCreditsGranted: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      result.trialGranted = true;
+    }
+
+    const creditsEffective = credits + (data.trialCreditsGranted ? 0 : MONETIZATION.TRIAL_CREDITS);
+
+    result.plan = plan;
+    result.entitlements = entitlements;
+    result.watermarkApplied = computeWatermarkApplied({ plan, entitlements });
+    result.creditsBefore = creditsEffective;
+
+    if (creditsEffective < cost) {
+      const err = new Error("NO_CREDITS");
+      err.code = "NO_CREDITS";
+      throw err;
+    }
+
+    result.creditsAfter = creditsEffective - cost;
+
+    tx.update(userRef, {
+      credits: admin.firestore.FieldValue.increment(-cost),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  return result;
+}
+
+async function buyAddon(uid, addonKey) {
+  const cfg = MONETIZATION.ADDONS[addonKey];
+  if (!cfg) {
+    const err = new Error("UNKNOWN_ADDON");
+    err.code = "UNKNOWN_ADDON";
+    throw err;
+  }
+
+  const userRef = db.collection("users").doc(uid);
+  let out = { addon: addonKey, cost: cfg.cost, creditsBefore: 0, creditsAfter: 0, entitlementKey: cfg.entitlementKey, until: null };
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    if (!snap.exists) {
+      const err = new Error("USER_NOT_FOUND");
+      err.code = "USER_NOT_FOUND";
+      throw err;
+    }
+    const data = snap.data() || {};
+    const credits = Number(data.credits ?? 0);
+    if (credits < cfg.cost) {
+      const err = new Error("NO_CREDITS");
+      err.code = "NO_CREDITS";
+      throw err;
+    }
+
+    const ent = data.entitlements || {};
+    const currentUntil = ent?.[cfg.entitlementKey];
+    const base = entitlementActive(currentUntil) ? currentUntil : tsNow();
+    const nextUntil = addDaysTs(base, cfg.days);
+
+    out.creditsBefore = credits;
+    out.creditsAfter = credits - cfg.cost;
+    out.until = nextUntil;
+
+    tx.update(userRef, {
+      credits: admin.firestore.FieldValue.increment(-cfg.cost),
+      [`entitlements.${cfg.entitlementKey}`]: nextUntil,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  return out;
+}
+
+async function sendPush(userDoc, payload) {
+  try {
+    const token = userDoc?.expoPushToken;
+    if (!token) return { skipped: true, reason: "no_token" };
+    if (!Expo.isExpoPushToken(token))
+      return { skipped: true, reason: "invalid_token" };
+    if (!allowByPrefs(payload.type, userDoc))
+      return { skipped: true, reason: "prefs" };
+
+    const messages = [
+      {
+        to: token,
+        sound: "default",
+        title: payload.title || "GeNova",
+        body: payload.body || "",
+        data: payload.data || {},
+        priority: "high",
+      },
+    ];
+
+    const chunks = expo.chunkPushNotifications(messages);
+    const tickets = [];
+
+    for (const chunk of chunks) {
+      // eslint-disable-next-line no-await-in-loop
+      const ticketChunk = await expo.sendPushNotificationsAsync(chunk);
+      tickets.push(...ticketChunk);
+    }
+
+    return { success: true, tickets };
+  } catch (e) {
+    console.log("❌ sendPush error:", e);
+    return { success: false, error: e?.message || "push_error" };
+  }
+}
+
+// ------------------------------------------------------------
+// ✉️ EMAIL HELPERS (MailerSend primary, SMTP fallback)
+// ------------------------------------------------------------
+function canEmailByPrefs(userDoc) {
+  const p = userDoc?.notifPrefs;
+  return !!p?.emailNotif;
+}
+
+async function resolveUserEmail(uid, userDoc) {
+  if (userDoc?.email) return userDoc.email;
+
+  // fallback: Firebase Auth
+  try {
+    const u = await admin.auth().getUser(uid);
+    if (u?.email) return u.email;
+  } catch (_) {}
+
+  return null;
+}
+
+/**
+ * Build BOTH: text + html
+ * - html is the GeNova template
+ * - text kept minimal to avoid "mixed" looking previews in some clients
+ *
+ * ✅ marketing: can optionally include a CTA button if data.url exists
+ */
+function buildEmailForType(type, { title, body, data }) {
+  const safeTitle = title || "GeNova notification";
+  const safeBody = body || "";
+
+  if (type === "video") {
+    const videoUrl = data?.videoUrl || "";
+    return {
+      subject: "🎬 Your GeNova video is ready",
+      text: safeBody || "Your video is ready.",
+      html: emailTemplate({
+        title: safeTitle,
+        message: safeBody,
+        buttonText: "View video",
+        buttonUrl: videoUrl || null,
+      }),
+    };
+  }
+
+  // NOTE: system email template exists, but SYSTEM emails are DISABLED by policy (see sendEmailIfAllowed)
+  if (type === "system") {
+    return {
+      subject: "⚠️ GeNova: system message",
+      text: safeBody || "System message.",
+      html: emailTemplate({
+        title: safeTitle,
+        message: safeBody,
+        buttonText: null,
+        buttonUrl: null,
+      }),
+    };
+  }
+
+  if (type === "marketing") {
+    const url = data?.url || null;
+    const btnText = data?.buttonText || "Open";
+    return {
+      subject: safeTitle || "GeNova update",
+      text: safeBody || "Update.",
+      html: emailTemplate({
+        title: safeTitle || "GeNova update",
+        message: safeBody,
+        buttonText: url ? btnText : null,
+        buttonUrl: url,
+      }),
+    };
+  }
+
+  // generic
+  const url = data?.url || null;
+  const btnText = data?.buttonText || "Open";
+  return {
+    subject: safeTitle,
+    text: safeBody || "Notification.",
+    html: emailTemplate({
+      title: safeTitle,
+      message: safeBody,
+      buttonText: url ? btnText : null,
+      buttonUrl: url,
+    }),
+  };
+}
+
+async function sendEmailMailerSend({ to, subject, text, html }) {
+  const apiKey = process.env.MAILERSEND_API_KEY;
+  if (!apiKey) throw new Error("MAILERSEND_API_KEY missing");
+
+  const fromEmail = process.env.MAIL_FROM_EMAIL;
+  const fromName = process.env.MAIL_FROM_NAME || "GeNova";
+  if (!fromEmail) throw new Error("MAIL_FROM_EMAIL missing");
+
+  const res = await fetch("https://api.mailersend.com/v1/email", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      from: { email: fromEmail, name: fromName },
+      to: [{ email: to }],
+      subject,
+      text: text || "",
+      html: html || "",
+    }),
+  });
+
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(json?.message || `MailerSend error (${res.status})`);
+  }
+  return json;
+}
+
+async function sendEmailSMTP({ to, subject, text, html }) {
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || 587);
+  const secure = String(process.env.SMTP_SECURE || "false") === "true";
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+
+  const fromEmail = process.env.MAIL_FROM_EMAIL || user;
+  const fromName = process.env.MAIL_FROM_NAME || "GeNova";
+
+  if (!host || !user || !pass) {
+    throw new Error("SMTP env missing (SMTP_HOST/USER/PASS)");
+  }
+
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: { user, pass },
+  });
+
+  await transporter.sendMail({
+    from: `"${fromName}" <${fromEmail}>`,
+    to,
+    subject,
+    text: text || "",
+    html: html || "",
+  });
+
+  return { ok: true };
+}
+
+async function sendEmailWithFallback({ to, subject, text, html }) {
+  try {
+    const r = await sendEmailMailerSend({ to, subject, text, html });
+    return { success: true, provider: "mailersend", resp: r };
+  } catch (e) {
+    console.log("⚠️ MailerSend failed, trying SMTP fallback:", e?.message || e);
+  }
+
+  const r2 = await sendEmailSMTP({ to, subject, text, html });
+  return { success: true, provider: "smtp", resp: r2 };
+}
+
+async function sendEmailIfAllowed({ uid, userDoc, type, title, body, data }) {
+  if (!userDoc) return { skipped: true, reason: "no_userdoc" };
+  if (!canEmailByPrefs(userDoc)) return { skipped: true, reason: "prefs" };
+
+  // ✅ POLICY: system messages MUST NOT be sent via email.
+  // Only allow "video" (and you can later add "marketing" if you want).
+  const allowedTypes = new Set(["video"]);
+  if (!allowedTypes.has(type)) return { skipped: true, reason: "type_not_enabled" };
+
+  const to = await resolveUserEmail(uid, userDoc);
+  if (!to) return { skipped: true, reason: "no_email" };
+
+  const built = buildEmailForType(type, { title, body, data });
+  const result = await sendEmailWithFallback({ to, ...built });
+  return result;
+}
+
+// ------------------------------------------------------------
+// ✅ lastResult helpers (offline / push-missed safety net)
+// ------------------------------------------------------------
+async function setLastResult(uid, payload) {
+  if (!uid) return;
+  await db
+    .collection("users")
+    .doc(uid)
+    .set(
+      {
+        lastResult: {
+          id: payload?.id || String(Date.now()),
+          status: payload?.status || "ready", // "ready" | "error"
+          title: payload?.title || "",
+          message: payload?.message || "",
+          url: payload?.url || "",
+          meta: payload?.meta || {},
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          seenAt: null,
+        },
+      },
+      { merge: true }
+    );
+}
+
+function normalizeLastResultMeta({ model, videoLength, resolution, fps } = {}) {
+  return {
+    model: model || "",
+    length:
+      typeof videoLength === "number" || typeof videoLength === "string"
+        ? videoLength
+        : "",
+    resolution: resolution || "",
+    fps:
+      typeof fps === "number" || typeof fps === "string"
+        ? fps
+        : "",
+  };
+}
+
+// ------------------------------------------------------------
+// ✅ notifyUser (C1 + D) — single entrypoint for ALL notifications
+//      ✅ NOW: localized by Firestore users/{uid}.notifPrefs.language
+// ------------------------------------------------------------
+async function notifyUser({ uid, type, title, body, data }) {
+  if (!uid) return { skipped: true, reason: "no_uid" };
+  if (!type) return { skipped: true, reason: "no_type" };
+
+  const userDoc = await getUserDoc(uid);
+  if (!userDoc) return { skipped: true, reason: "user_not_found" };
+
+  // ✅ Localize push (and we pass same localized texts into email builder too)
+  const lang = getUserLang(userDoc);
+  const localized = localizeNotification({ lang, type, title, body, data });
+
+  // 1) PUSH
+  const pushResult = await sendPush(userDoc, {
+    type,
+    title: localized.title,
+    body: localized.body,
+    data: data || {},
+  });
+
+  // 2) EMAIL
+  let emailResult = null;
+  try {
+    emailResult = await sendEmailIfAllowed({
+      uid,
+      userDoc,
+      type,
+      title: localized.title,
+      body: localized.body,
+      data,
+    });
+  } catch (e) {
+    console.log("❌ email send error:", e?.message || e);
+    emailResult = { success: false, error: e?.message || "email_error" };
+  }
+
+  return { pushResult, emailResult, lang };
+}
+
+// ------------------------------------------------------------
+// ✅ /notify endpoint (B) — backend decides by Firestore prefs
+// ------------------------------------------------------------
+app.post("/notify", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { type, title, body, data } = req.body || {};
+    if (!type)
+      return res.status(400).json({ success: false, error: "type required" });
+
+    const result = await notifyUser({ uid: req.uid, type, title, body, data });
+    return res.json({ success: true, result });
+  } catch (e) {
+    console.log("❌ /notify error:", e);
+    return res
+      .status(500)
+      .json({ success: false, error: e?.message || "server_error" });
+  }
+});
+
+// ------------------------------------------------------------
+// ✅ OFFLINE EDGE-CASE ENDPOINTS
+// ------------------------------------------------------------
+
+/**
+ * Returns the lastResult if it exists and has not been seen yet.
+ * Client calls this on app start and on foreground to recover missed pushes.
+ */
+app.get("/my-latest-result", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+
+    const snap = await db.collection("users").doc(uid).get();
+    if (!snap.exists)
+      return res
+        .status(404)
+        .json({ success: false, error: "User doc not found" });
+
+    const userDoc = snap.data() || {};
+    const lr = userDoc.lastResult || null;
+
+    if (!lr) return res.json({ success: true, result: null });
+    if (lr.seenAt) return res.json({ success: true, result: null });
+
+    return res.json({
+      success: true,
+      result: {
+        id: lr.id || null,
+        status: lr.status || null,
+        title: lr.title || "",
+        message: lr.message || "",
+        url: lr.url || "",
+        meta: lr.meta || {},
+        createdAt: lr.createdAt || null,
+      },
+    });
+  } catch (e) {
+    console.log("❌ /my-latest-result error:", e);
+    return res
+      .status(500)
+      .json({ success: false, error: e?.message || "server_error" });
+  }
+});
+
+/**
+ * Marks lastResult as seen (best-effort). Optionally checks id matches.
+ */
+app.post("/mark-result-seen", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const { id } = req.body || {};
+
+    const userRef = db.collection("users").doc(uid);
+    const snap = await userRef.get();
+    if (!snap.exists)
+      return res
+        .status(404)
+        .json({ success: false, error: "User doc not found" });
+
+    const userDoc = snap.data() || {};
+    const lr = userDoc.lastResult || null;
+    if (!lr) return res.json({ success: true });
+
+    if (id && lr.id && id !== lr.id) {
+      // not the current lastResult anymore -> ignore
+      return res.json({ success: true });
+    }
+
+    await userRef.set(
+      { lastResult: { ...lr, seenAt: admin.firestore.FieldValue.serverTimestamp() } },
+      { merge: true }
+    );
+
+    return res.json({ success: true });
+  } catch (e) {
+    console.log("❌ /mark-result-seen error:", e);
+    return res
+      .status(500)
+      .json({ success: false, error: e?.message || "server_error" });
+  }
+});
+
+// ------------------------------------------------------------
+// Upload (multer)
+// ------------------------------------------------------------
+const upload = multer({ dest: "uploads/" });
+
+// ------------------------------------------------------------
+// GCS
+// ------------------------------------------------------------
+const storage = new Storage({
+  projectId: "genova-27d76",
+  keyFilename: "./google-cloud-key.json",
+});
+const bucket = storage.bucket("genova-27d76.firebasestorage.app");
+
+// ------------------------------------------------------------
+// Dummy generators (placeholder)
+// ------------------------------------------------------------
+const PLACEHOLDER_MP4_BASE64 =
+  "AAAAHGZ0eXBpc29tAAAAAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAABXRtZGF0AAAAAA==";
+
+async function genFromPrompt(out) {
+  fs.writeFileSync(out, Buffer.from(PLACEHOLDER_MP4_BASE64, "base64"));
+}
+async function genFromImage(inp, out) {
+  fs.copyFileSync(inp, out);
+}
+
+// ------------------------------------------------------------
+// 🎬 MAIN ROUTE — prompt + image support + notifyUser (C1 + D)
+//          + lastResult write for offline recovery
+// ------------------------------------------------------------
+
+
+async function buyPack({ uid, packId, costCredits }) {
+  if (!uid) throw new Error("NO_UID");
+  if (!packId || typeof packId !== "string") throw new Error("NO_PACK_ID");
+
+  // For MVP we accept cost from client; you can hardcode/validate per-pack later.
+  const cost =
+    typeof costCredits === "number" && Number.isFinite(costCredits) ? Math.max(0, Math.min(1000, costCredits)) : null;
+
+  if (cost === null) {
+    throw new Error("PACK_PRICE_MISSING");
+  }
+
+  const userRef = db.collection("users").doc(uid);
+
+  const result = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const d = snap.exists ? snap.data() : {};
+    const credits = typeof d?.credits === "number" ? d.credits : 0;
+    const ent = d?.entitlements || {};
+    const owned = Array.isArray(ent?.packsOwned) ? ent.packsOwned : [];
+
+    if (owned.includes(packId)) {
+      return { ok: true, alreadyOwned: true, credits };
+    }
+
+    if (credits < cost) {
+      return { ok: false, error: "NO_CREDITS", credits };
+    }
+
+    const newCredits = credits - cost;
+    const newOwned = [...owned, packId];
+
+    tx.set(
+      userRef,
+      {
+        credits: newCredits,
+        entitlements: { ...ent, packsOwned: newOwned },
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+
+    return { ok: true, credits: newCredits };
+  });
+
+  return result;
+}
+
+async function buyCredits(uid, pack) {
+  const PACKS = {
+    credits_20: 20,
+    credits_60: 60,
+    credits_150: 150,
+	credits_400: 400,
+  };
+
+  const amount = PACKS[pack];
+  if (!amount) {
+    const err = new Error("UNKNOWN_PACK");
+    err.code = "UNKNOWN_PACK";
+    throw err;
+  }
+
+  const userRef = db.collection("users").doc(uid);
+
+  let result = { pack, amount, creditsBefore: 0, creditsAfter: 0 };
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+
+    // Create user doc if missing (do NOT auto-grant trial here; trial is granted on first generation)
+    if (!snap.exists) {
+      tx.set(
+        userRef,
+        {
+          credits: 0,
+          plan: MONETIZATION.DEFAULT_PLAN,
+          trialCreditsGranted: false,
+          entitlements: {},
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    const data = snap.exists ? snap.data() : { credits: 0 };
+    const before = Number(data?.credits || 0);
+    const after = before + amount;
+
+    result.creditsBefore = before;
+    result.creditsAfter = after;
+
+    tx.set(
+      userRef,
+      {
+        credits: admin.firestore.FieldValue.increment(amount),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+
+  return result;
+}
+
+
+app.post("/buy-addon", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const addon = String(req.body?.addon || "").trim();
+
+    if (!addon) {
+      return res.status(400).json({ success: false, error: "MISSING_ADDON" });
+    }
+
+    const result = await buyAddon(uid, addon);
+
+    return res.json({
+      success: true,
+      addon: result.addon,
+      cost: result.cost,
+      creditsBefore: result.creditsBefore,
+      creditsAfter: result.creditsAfter,
+      entitlementKey: result.entitlementKey,
+      until: result.until, // Firestore Timestamp (client can render)
+    });
+  } catch (e) {
+    const code = String(e?.code || e?.message || "BUY_ADDON_FAILED");
+
+    if (code === "NO_CREDITS") {
+      return res.status(402).json({ success: false, error: "NO_CREDITS" });
+    }
+    if (code === "UNKNOWN_ADDON") {
+      return res.status(400).json({ success: false, error: "UNKNOWN_ADDON" });
+    }
+    if (code === "USER_NOT_FOUND") {
+      return res.status(404).json({ success: false, error: "USER_NOT_FOUND" });
+    }
+
+    console.log("❌ /buy-addon error:", e);
+    return res.status(500).json({ success: false, error: "BUY_ADDON_FAILED" });
+  }
+});
+
+
+app.post("/buy-credits", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const pack = String(req.body?.pack || "").trim();
+
+
+// ✅ Buy pack — debits credits and adds packId to entitlements.packsOwned
+// Body: { packId: "product_pro" | ... }
+
+
+    if (!pack) {
+      return res.status(400).json({ success: false, error: "MISSING_PACK" });
+    }
+
+    const result = await buyCredits(uid, pack);
+
+    return res.json({
+      success: true,
+      pack: result.pack,
+      amount: result.amount,
+      creditsBefore: result.creditsBefore,
+      creditsAfter: result.creditsAfter,
+    });
+  } catch (e) {
+    const code = String(e?.code || e?.message || "BUY_CREDITS_FAILED");
+
+    if (code === "UNKNOWN_PACK") {
+      return res.status(400).json({ success: false, error: "UNKNOWN_PACK" });
+    }
+
+    console.log("❌ /buy-credits error:", e);
+    return res.status(500).json({ success: false, error: "BUY_CREDITS_FAILED" });
+  }
+});
+
+
+app.post("/buy-pack", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const { packId, costCredits } = req.body || {};
+    const r = await buyPack({ uid, packId, costCredits });
+    if (!r.ok) {
+      return res.status(400).json({ success: false, error: r.error || "BUY_PACK_FAILED", credits: r.credits });
+    }
+    return res.json({ success: true, credits: r.credits, alreadyOwned: !!r.alreadyOwned });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: String(e?.message || "BUY_PACK_ERROR") });
+  }
+});
+
+
+app.post(
+  "/generate-video",
+  verifyFirebaseToken,
+  upload.single("file"),
+  async (req, res) => {
+    let uploadedOutPath = null;
+
+    // Make a jobId that both the result + client can refer to (dedup friendly)
+    const generatedJobId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const incomingJobId = (req.body && req.body.jobId) ? String(req.body.jobId).trim() : "";
+    const jobId = incomingJobId.length > 6 ? incomingJobId : generatedJobId;
+
+    try {
+      const {
+        model = "kling",
+        prompt = "",
+        videoLength = 5,
+        resolution = "1080p",
+        fps = 30,
+      } = req.body;
+
+      const hasImage = !!req.file;
+
+
+const uid = req.uid;
+
+// 💰 Monetization v2: validate params (hard caps + plan limits), compute cost, grant trial once, then debit credits
+      const genParams = {
+        model: String(model || "kling").toLowerCase(),
+        lengthSec: clampInt(videoLength, 5),
+        fps: clampInt(fps, 30),
+        resolution: normalizeResolution(resolution),
+      };
+
+      const monet = await ensureTrialValidateAndDebit(uid, genParams);
+      const watermarkApplied = monet.watermarkApplied;
+
+
+      const hasPrompt = !!String(prompt || "").trim();
+
+      console.log("🎬 MODE:", hasImage ? "IMAGE" : "PROMPT");
+
+      if (!hasImage && !hasPrompt) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Missing file or prompt" });
+      }
+
+      // fetch user lang once for localized lastResult strings (best effort)
+      let userDocForLang = null;
+      try {
+        userDocForLang = await getUserDoc(req.uid);
+      } catch (_) {}
+      const lang = getUserLang(userDocForLang);
+
+      if (!fs.existsSync("outputs")) fs.mkdirSync("outputs");
+      const out = path.join("outputs", `${Date.now()}.mp4`);
+      uploadedOutPath = out;
+
+      // Generate
+      if (hasImage) {
+        await genFromImage(req.file.path, out);
+        try {
+          fs.unlinkSync(req.file.path);
+        } catch (_) {}
+      } else {
+        await genFromPrompt(out);
+      }
+
+      // Upload to GCS
+      const [file] = await bucket.upload(out, {
+        destination: path.basename(out),
+        contentType: "video/mp4",
+      });
+
+      const [url] = await file.getSignedUrl({
+        action: "read",
+        expires: Date.now() + 86400000, // 24h
+      });
+
+      // cleanup local output
+      try {
+        fs.unlinkSync(out);
+      } catch (_) {}
+
+      const meta = normalizeLastResultMeta({ model, videoLength, resolution, fps });
+
+      // ✅ Gallery persistence on backend (works even if app is closed)
+      try {
+        await db
+          .collection("users")
+          .doc(req.uid)
+          .collection("creations")
+          .doc(jobId)
+          .set(
+            {
+              prompt: String(prompt || ""),
+              model: String(model || "kling"),
+              type: hasImage ? "image_to_video" : "prompt_to_video",
+              duration: Number(videoLength) || 0,
+              aspectRatio: null,
+              status: "ready",
+              videoUrl: url,
+              thumbUrl: null,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              // preserve createdAt if already set by client
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+      } catch (e) {
+        console.log("⚠️ backend gallery set error:", e?.message || e);
+      }
+
+
+      // ✅ Localized texts for lastResult
+      const lrLocalized = localizeNotification({
+        lang,
+        type: "video",
+        title: null,
+        body: null,
+        data: { model, videoLength, resolution, fps, videoUrl: url, jobId, meta },
+      });
+
+      // ✅ 1) Persist lastResult (offline safety net)
+      await setLastResult(req.uid, {
+        id: jobId,
+        status: "ready",
+        title: lrLocalized.title,
+        message: lrLocalized.body,
+        url,
+        meta,
+      });
+
+      // ✅ 2) Success notification (push + email) through ONE pipe
+      await notifyUser({
+        uid: req.uid,
+        type: "video",
+        // title/body can be omitted; notifyUser will localize anyway.
+        title: null,
+        body: null,
+        data: { videoUrl: url, model, videoLength, resolution, fps, jobId, meta },
+      });
+
+      return res.json({ success: true, videoUrl: url, jobId, watermarkApplied, billing: { creditsBefore: monet.creditsBefore, creditsAfter: monet.creditsAfter, plan: monet.plan, trialGranted: monet.trialGranted, cost: monet.cost, billing: { cost: monet.cost, creditsBefore: monet.creditsBefore, creditsAfter: monet.creditsAfter, plan: monet.plan, watermarkApplied, limits: monet.limits, breakdown: monet.breakdown } } });
+    } catch (e) {
+      console.error("❌ generate-video error:", e);
+
+      const code = String(e?.code || e?.message || "");
+      if (code === "NO_CREDITS") {
+        return res.status(402).json({ success: false, error: "NO_CREDITS" });
+      }
+
+
+if (
+  code === "LIMIT_LENGTH" ||
+  code === "LIMIT_FPS" ||
+  code === "LIMIT_RESOLUTION" ||
+  code === "LIMIT_HARD_CAP_LENGTH" ||
+  code === "LIMIT_HARD_CAP_FPS"
+) {
+  return res.status(403).json({
+    success: false,
+    error: code,
+    meta: e?.meta || null,
+  });
+}
+
+
+      // cleanup temp upload if exists
+      try {
+        if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      } catch (_) {}
+
+      // cleanup output if exists
+      try {
+        if (uploadedOutPath && fs.existsSync(uploadedOutPath)) fs.unlinkSync(uploadedOutPath);
+      } catch (_) {}
+
+      // fetch user lang once for localized failure texts (best effort)
+      let userDocForLang = null;
+      try {
+        userDocForLang = await getUserDoc(req.uid);
+      } catch (_) {}
+      const lang = getUserLang(userDocForLang);
+
+      const errBody = e?.message || (lang === "hu" ? "Ismeretlen hiba" : lang === "de" ? "Unbekannter Fehler" : "Unknown error");
+
+      // ✅ Gallery persistence on backend (failed)
+      try {
+        await db
+          .collection("users")
+          .doc(req.uid)
+          .collection("creations")
+          .doc(jobId || `${Date.now()}`)
+          .set(
+            {
+              status: "failed",
+              error: String(errBody || "error"),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+      } catch (e2) {
+        console.log("⚠️ backend gallery fail set error:", e2?.message || e2);
+      }
+      const lrFail = localizeNotification({
+        lang,
+        type: "system",
+        title: null,
+        body: errBody,
+        data: { error: e?.message || "unknown", jobId },
+      });
+
+      // ✅ Persist lastResult as error (offline safety net)
+      await setLastResult(req.uid, {
+        id: jobId,
+        status: "error",
+        title: lrFail.title,
+        message: lrFail.body,
+        url: "",
+        meta: {},
+      });
+
+      // ✅ System notification on failure (PUSH only; email is disabled for system by policy)
+      try {
+        await notifyUser({
+          uid: req.uid,
+          type: "system",
+          title: null,
+          body: errBody,
+          data: { error: e?.message || "unknown", jobId },
+        });
+      } catch (_) {}
+
+      return res
+        .status(500)
+        .json({ success: false, error: e?.message || "server_error", jobId });
+    }
+  }
+);
+
+// ------------------------------------------------------------
+// START
+// ------------------------------------------------------------
+const PORT = process.env.PORT ? Number(process.env.PORT) : 5000;
+app.listen(PORT, "0.0.0.0", () =>
+  console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
+);

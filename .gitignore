@@ -1,0 +1,12 @@
+.expo/
+node_modules/
+.env
+android/
+ios/
+.vscode/
+*.key
+*.pem
+*.p12
+service-account*.json
+firebase*admin*.json
+google*service*.json
