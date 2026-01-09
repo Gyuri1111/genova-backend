@@ -1083,33 +1083,40 @@ async function genFromImage(inp, out) {
 // ------------------------------------------------------------
 
 
-async function buyPack({ uid, packId, costCredits }) {
+async function buyPack({ uid, packId }) {
   if (!uid) throw new Error("NO_UID");
   if (!packId || typeof packId !== "string") throw new Error("NO_PACK_ID");
 
-  // For MVP we accept cost from client; you can hardcode/validate per-pack later.
-  const cost =
-    typeof costCredits === "number" && Number.isFinite(costCredits) ? Math.max(0, Math.min(1000, costCredits)) : null;
-
-  if (cost === null) {
-    throw new Error("PACK_PRICE_MISSING");
+  const cfg = PACK_CATALOG[String(packId).trim()];
+  if (!cfg) {
+    const err = new Error("UNKNOWN_PACK");
+    err.code = "UNKNOWN_PACK";
+    throw err;
   }
 
   const userRef = db.collection("users").doc(uid);
 
   const result = await db.runTransaction(async (tx) => {
     const snap = await tx.get(userRef);
-    const d = snap.exists ? snap.data() : {};
-    const credits = typeof d?.credits === "number" ? d.credits : 0;
+    const d = snap.exists ? (snap.data() || {}) : {};
+    const credits = typeof d?.credits === "number" ? d.credits : Number(d?.credits || 0) || 0;
     const ent = d?.entitlements || {};
     const owned = Array.isArray(ent?.packsOwned) ? ent.packsOwned : [];
 
-    if (owned.includes(packId)) {
-      return { ok: true, alreadyOwned: true, credits };
+    // If plan includes this tier, treat as owned
+    const plan = normalizePlan(d?.plan);
+    const planTier = plan === "studio" ? "studio" : (plan === "pro" ? "pro" : (plan === "basic" ? "basic" : "free"));
+    const includedByPlan =
+      (cfg.tier === "pro" && (planTier === "pro" || planTier === "studio")) ||
+      (cfg.tier === "studio" && planTier === "studio");
+
+    if (includedByPlan || owned.includes(packId)) {
+      return { ok: true, alreadyOwned: true, credits, packsOwned: owned };
     }
 
+    const cost = Number(cfg.cost || 0) || 0;
     if (credits < cost) {
-      return { ok: false, error: "NO_CREDITS", credits };
+      return { ok: false, error: "NO_CREDITS", credits, cost };
     }
 
     const newCredits = credits - cost;
@@ -1120,12 +1127,12 @@ async function buyPack({ uid, packId, costCredits }) {
       {
         credits: newCredits,
         entitlements: { ...ent, packsOwned: newOwned },
-        updatedAt: new Date().toISOString(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
 
-    return { ok: true, credits: newCredits };
+    return { ok: true, credits: newCredits, cost, packsOwned: newOwned };
   });
 
   return result;
@@ -1268,259 +1275,31 @@ app.post("/buy-credits", verifyFirebaseToken, async (req, res) => {
 app.post("/buy-pack", verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
-    const { packId, costCredits } = req.body || {};
-    const r = await buyPack({ uid, packId, costCredits });
+    const { packId } = req.body || {};
+    const r = await buyPack({ uid, packId });
+
     if (!r.ok) {
+      if (r.error === "NO_CREDITS") {
+        return res.status(402).json({ success: false, error: "NO_CREDITS", credits: r.credits, cost: r.cost || null });
+      }
       return res.status(400).json({ success: false, error: r.error || "BUY_PACK_FAILED", credits: r.credits });
     }
-    return res.json({ success: true, credits: r.credits, alreadyOwned: !!r.alreadyOwned });
+
+    return res.json({
+      success: true,
+      credits: r.credits,
+      cost: r.cost || 0,
+      alreadyOwned: !!r.alreadyOwned,
+      packsOwned: r.packsOwned || null,
+    });
   } catch (e) {
-    return res.status(500).json({ success: false, error: String(e?.message || "BUY_PACK_ERROR") });
+    const code = String(e?.code || e?.message || "BUY_PACK_ERROR");
+    if (code === "UNKNOWN_PACK") {
+      return res.status(400).json({ success: false, error: "UNKNOWN_PACK" });
+    }
+    return res.status(500).json({ success: false, error: "BUY_PACK_ERROR" });
   }
 });
-
-
-app.post(
-  "/generate-video",
-  verifyFirebaseToken,
-  upload.single("file"),
-  async (req, res) => {
-    let uploadedOutPath = null;
-
-    // Make a jobId that both the result + client can refer to (dedup friendly)
-    const generatedJobId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-    const incomingJobId = (req.body && req.body.jobId) ? String(req.body.jobId).trim() : "";
-    const jobId = incomingJobId.length > 6 ? incomingJobId : generatedJobId;
-
-    try {
-      const {
-        model = "kling",
-        prompt = "",
-        videoLength = 5,
-        resolution = "1080p",
-        fps = 30,
-      } = req.body;
-
-      const hasImage = !!req.file;
-
-
-const uid = req.uid;
-
-// 💰 Monetization v2: validate params (hard caps + plan limits), compute cost, grant trial once, then debit credits
-      const genParams = {
-        model: String(model || "kling").toLowerCase(),
-        lengthSec: clampInt(videoLength, 5),
-        fps: clampInt(fps, 30),
-        resolution: normalizeResolution(resolution),
-      };
-
-      const monet = await ensureTrialValidateAndDebit(uid, genParams);
-      const watermarkApplied = monet.watermarkApplied;
-
-
-      const hasPrompt = !!String(prompt || "").trim();
-
-      console.log("🎬 MODE:", hasImage ? "IMAGE" : "PROMPT");
-
-      if (!hasImage && !hasPrompt) {
-        return res
-          .status(400)
-          .json({ success: false, error: "Missing file or prompt" });
-      }
-
-      // fetch user lang once for localized lastResult strings (best effort)
-      let userDocForLang = null;
-      try {
-        userDocForLang = await getUserDoc(req.uid);
-      } catch (_) {}
-      const lang = getUserLang(userDocForLang);
-
-      if (!fs.existsSync("outputs")) fs.mkdirSync("outputs");
-      const out = path.join("outputs", `${Date.now()}.mp4`);
-      uploadedOutPath = out;
-
-      // Generate
-      if (hasImage) {
-        await genFromImage(req.file.path, out);
-        try {
-          fs.unlinkSync(req.file.path);
-        } catch (_) {}
-      } else {
-        await genFromPrompt(out);
-      }
-
-      // Upload to GCS
-      const [file] = await bucket.upload(out, {
-        destination: path.basename(out),
-        contentType: "video/mp4",
-      });
-
-      const [url] = await file.getSignedUrl({
-        action: "read",
-        expires: Date.now() + 86400000, // 24h
-      });
-
-      // cleanup local output
-      try {
-        fs.unlinkSync(out);
-      } catch (_) {}
-
-      const meta = normalizeLastResultMeta({ model, videoLength, resolution, fps });
-
-      // ✅ Gallery persistence on backend (works even if app is closed)
-      try {
-        await db
-          .collection("users")
-          .doc(req.uid)
-          .collection("creations")
-          .doc(jobId)
-          .set(
-            {
-              prompt: String(prompt || ""),
-              model: String(model || "kling"),
-              type: hasImage ? "image_to_video" : "prompt_to_video",
-              duration: Number(videoLength) || 0,
-              aspectRatio: null,
-              status: "ready",
-              videoUrl: url,
-              thumbUrl: null,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-              // preserve createdAt if already set by client
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-            { merge: true }
-          );
-      } catch (e) {
-        console.log("⚠️ backend gallery set error:", e?.message || e);
-      }
-
-
-      // ✅ Localized texts for lastResult
-      const lrLocalized = localizeNotification({
-        lang,
-        type: "video",
-        title: null,
-        body: null,
-        data: { model, videoLength, resolution, fps, videoUrl: url, jobId, meta },
-      });
-
-      // ✅ 1) Persist lastResult (offline safety net)
-      await setLastResult(req.uid, {
-        id: jobId,
-        status: "ready",
-        title: lrLocalized.title,
-        message: lrLocalized.body,
-        url,
-        meta,
-      });
-
-      // ✅ 2) Success notification (push + email) through ONE pipe
-      await notifyUser({
-        uid: req.uid,
-        type: "video",
-        // title/body can be omitted; notifyUser will localize anyway.
-        title: null,
-        body: null,
-        data: { videoUrl: url, model, videoLength, resolution, fps, jobId, meta },
-      });
-
-      return res.json({ success: true, videoUrl: url, jobId, watermarkApplied, billing: { creditsBefore: monet.creditsBefore, creditsAfter: monet.creditsAfter, plan: monet.plan, trialGranted: monet.trialGranted, cost: monet.cost, billing: { cost: monet.cost, creditsBefore: monet.creditsBefore, creditsAfter: monet.creditsAfter, plan: monet.plan, watermarkApplied, limits: monet.limits, breakdown: monet.breakdown } } });
-    } catch (e) {
-      console.error("❌ generate-video error:", e);
-
-      const code = String(e?.code || e?.message || "");
-      if (code === "NO_CREDITS") {
-        return res.status(402).json({ success: false, error: "NO_CREDITS" });
-      }
-
-
-if (
-  code === "LIMIT_LENGTH" ||
-  code === "LIMIT_FPS" ||
-  code === "LIMIT_RESOLUTION" ||
-  code === "LIMIT_HARD_CAP_LENGTH" ||
-  code === "LIMIT_HARD_CAP_FPS"
-) {
-  return res.status(403).json({
-    success: false,
-    error: code,
-    meta: e?.meta || null,
-  });
-}
-
-
-      // cleanup temp upload if exists
-      try {
-        if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-      } catch (_) {}
-
-      // cleanup output if exists
-      try {
-        if (uploadedOutPath && fs.existsSync(uploadedOutPath)) fs.unlinkSync(uploadedOutPath);
-      } catch (_) {}
-
-      // fetch user lang once for localized failure texts (best effort)
-      let userDocForLang = null;
-      try {
-        userDocForLang = await getUserDoc(req.uid);
-      } catch (_) {}
-      const lang = getUserLang(userDocForLang);
-
-      const errBody = e?.message || (lang === "hu" ? "Ismeretlen hiba" : lang === "de" ? "Unbekannter Fehler" : "Unknown error");
-
-      // ✅ Gallery persistence on backend (failed)
-      try {
-        await db
-          .collection("users")
-          .doc(req.uid)
-          .collection("creations")
-          .doc(jobId || `${Date.now()}`)
-          .set(
-            {
-              status: "failed",
-              error: String(errBody || "error"),
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-            { merge: true }
-          );
-      } catch (e2) {
-        console.log("⚠️ backend gallery fail set error:", e2?.message || e2);
-      }
-      const lrFail = localizeNotification({
-        lang,
-        type: "system",
-        title: null,
-        body: errBody,
-        data: { error: e?.message || "unknown", jobId },
-      });
-
-      // ✅ Persist lastResult as error (offline safety net)
-      await setLastResult(req.uid, {
-        id: jobId,
-        status: "error",
-        title: lrFail.title,
-        message: lrFail.body,
-        url: "",
-        meta: {},
-      });
-
-      // ✅ System notification on failure (PUSH only; email is disabled for system by policy)
-      try {
-        await notifyUser({
-          uid: req.uid,
-          type: "system",
-          title: null,
-          body: errBody,
-          data: { error: e?.message || "unknown", jobId },
-        });
-      } catch (_) {}
-
-      return res
-        .status(500)
-        .json({ success: false, error: e?.message || "server_error", jobId });
-    }
-  }
-);
 
 // ------------------------------------------------------------
 // START
