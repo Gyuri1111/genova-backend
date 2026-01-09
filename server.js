@@ -235,6 +235,7 @@ const MONETIZATION = {
 // ✅ Pack catalog (credit costs). Keep IDs in sync with src/data/promptPacks.js
 const PACK_CATALOG = {
   product_pro: { cost: 60, tier: "pro" },
+  templates_pack: { cost: 40, tier: "basic" },
   // add more packs here later...
 };
 
@@ -1298,6 +1299,81 @@ app.post("/buy-pack", verifyFirebaseToken, async (req, res) => {
       return res.status(400).json({ success: false, error: "UNKNOWN_PACK" });
     }
     return res.status(500).json({ success: false, error: "BUY_PACK_ERROR" });
+  }
+});
+
+// 🧾 Buy / extend plan with duration (30/90/180/annual)
+const PLAN_CATALOG = {
+  free:   { cost: 0 },
+  basic:  { cost: 0 },
+  pro:    { cost: 0 },
+  studio: { cost: 0 },
+};
+
+const PERIOD_TO_DAYS = {
+  d30: 30,
+  d90: 90,
+  d180: 180,
+  annual: 365,
+};
+
+async function buyPlan(uid, planId, period) {
+  const nextPlan = String(planId || "").toLowerCase();
+  const per = String(period || "d30");
+  const days = PERIOD_TO_DAYS[per] || 30;
+
+  const userRef = db.collection("users").doc(uid);
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    if (!snap.exists) throw Object.assign(new Error("USER_NOT_FOUND"), { code: "USER_NOT_FOUND" });
+
+    const data = snap.data() || {};
+    const now = admin.firestore.Timestamp.now();
+
+    // If existing planUntil is in the future, extend; else start from now
+    const prevUntil = data.planUntil && typeof data.planUntil.toDate === "function" ? data.planUntil : null;
+    const baseMs = prevUntil ? prevUntil.toDate().getTime() : Date.now();
+    const startMs = baseMs > Date.now() ? baseMs : Date.now();
+    const untilMs = startMs + days * 24 * 60 * 60 * 1000;
+
+    tx.update(userRef, {
+      plan: nextPlan,
+      planUntil: admin.firestore.Timestamp.fromDate(new Date(untilMs)),
+      planPeriod: per,
+      planUpdatedAt: now,
+    });
+  });
+
+  const after = await db.collection("users").doc(uid).get();
+  const afterData = after.data() || {};
+  return {
+    plan: afterData.plan,
+    planUntil: afterData.planUntil || null,
+    planPeriod: afterData.planPeriod || per,
+  };
+}
+
+app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const planId = String(req.body?.planId || "").trim();
+    const period = String(req.body?.period || "d30").trim();
+
+    if (!planId) return res.status(400).json({ success: false, error: "MISSING_PLAN" });
+
+    const result = await buyPlan(uid, planId, period);
+
+    return res.json({
+      success: true,
+      plan: result.plan,
+      planUntil: result.planUntil,
+      planPeriod: result.planPeriod,
+    });
+  } catch (e) {
+    const code = String(e?.code || e?.message || "BUY_PLAN_FAILED");
+    if (code === "USER_NOT_FOUND") return res.status(404).json({ success: false, error: "USER_NOT_FOUND" });
+    console.log("❌ /buy-plan error:", e);
+    return res.status(500).json({ success: false, error: "BUY_PLAN_FAILED" });
   }
 });
 
