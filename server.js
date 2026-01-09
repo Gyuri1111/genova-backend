@@ -68,6 +68,26 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
+
+
+// ✅ Auto-downgrade to FREE when plan is expired
+async function ensurePlanFresh(uid) {
+  const ref = db.collection("users").doc(uid);
+  const snap = await ref.get();
+  if (!snap.exists) return;
+
+  const data = snap.data() || {};
+  const planUntil = data.planUntil && typeof data.planUntil.toDate === "function" ? data.planUntil.toDate() : null;
+
+  if (data.plan && String(data.plan) !== "free" && planUntil && Date.now() > planUntil.getTime()) {
+    await ref.update({
+      plan: "free",
+      planUntil: admin.firestore.FieldValue.delete(),
+      planPeriod: admin.firestore.FieldValue.delete(),
+    });
+  }
+}
+
 const expo = new Expo();
 
 // ------------------------------------------------------------
@@ -1369,6 +1389,7 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
     const period = String(req.body?.period || "d30").trim();
 
     if (!planId) return res.status(400).json({ success: false, error: "MISSING_PLAN" });
+    if (String(planId).toLowerCase() === "free") return res.status(400).json({ success: false, error: "FREE_NOT_PURCHASABLE" });
 
     const result = await buyPlan(uid, planId, period);
 
