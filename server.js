@@ -1303,13 +1303,6 @@ app.post("/buy-pack", verifyFirebaseToken, async (req, res) => {
 });
 
 // 🧾 Buy / extend plan with duration (30/90/180/annual)
-const PLAN_CATALOG = {
-  free:   { cost: 0 },
-  basic:  { cost: 0 },
-  pro:    { cost: 0 },
-  studio: { cost: 0 },
-};
-
 const PERIOD_TO_DAYS = {
   d30: 30,
   d90: 90,
@@ -1330,17 +1323,31 @@ async function buyPlan(uid, planId, period) {
     const data = snap.data() || {};
     const now = admin.firestore.Timestamp.now();
 
-    // If existing planUntil is in the future, extend; else start from now
+    // Extend from existing planUntil if still active, else from now
     const prevUntil = data.planUntil && typeof data.planUntil.toDate === "function" ? data.planUntil : null;
     const baseMs = prevUntil ? prevUntil.toDate().getTime() : Date.now();
     const startMs = baseMs > Date.now() ? baseMs : Date.now();
     const untilMs = startMs + days * 24 * 60 * 60 * 1000;
+
+    // Plan perks are fixed 30 days for simple, stable display
+    const perkUntilMs = Date.now() + 30 * 24 * 60 * 60 * 1000;
 
     tx.update(userRef, {
       plan: nextPlan,
       planUntil: admin.firestore.Timestamp.fromDate(new Date(untilMs)),
       planPeriod: per,
       planUpdatedAt: now,
+
+      // ✅ store perk expiry separately for easy UI display/testing
+      noWatermarkUntil: admin.firestore.Timestamp.fromDate(new Date(perkUntilMs)),
+      adFreeUntil: admin.firestore.Timestamp.fromDate(new Date(perkUntilMs)),
+
+      // ✅ also mirror into an addons map for testing/cleanup
+      addons: {
+        ...(data.addons && typeof data.addons === "object" ? data.addons : {}),
+        no_watermark_30d: { expiresAt: admin.firestore.Timestamp.fromDate(new Date(perkUntilMs)), source: "plan" },
+        ad_free_30d: { expiresAt: admin.firestore.Timestamp.fromDate(new Date(perkUntilMs)), source: "plan" },
+      },
     });
   });
 
@@ -1350,6 +1357,8 @@ async function buyPlan(uid, planId, period) {
     plan: afterData.plan,
     planUntil: afterData.planUntil || null,
     planPeriod: afterData.planPeriod || per,
+    noWatermarkUntil: afterData.noWatermarkUntil || null,
+    adFreeUntil: afterData.adFreeUntil || null,
   };
 }
 
@@ -1368,6 +1377,8 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
       plan: result.plan,
       planUntil: result.planUntil,
       planPeriod: result.planPeriod,
+      noWatermarkUntil: result.noWatermarkUntil,
+      adFreeUntil: result.adFreeUntil,
     });
   } catch (e) {
     const code = String(e?.code || e?.message || "BUY_PLAN_FAILED");
