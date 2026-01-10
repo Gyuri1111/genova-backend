@@ -1272,110 +1272,6 @@ app.post("/buy-credits", verifyFirebaseToken, async (req, res) => {
 });
 
 
-// ------------------------------------------------------------
-// 💳 Buy Plan (time-based)
-// - Updates users/{uid}.plan + planUntil (Timestamp)
-// - Also grants plan-included add-ons (adFreeUntil + noWatermarkUntil) for 30 days (fixed)
-// ------------------------------------------------------------
-app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
-  try {
-    const uid = req.uid;
-    const planIdRaw = String(req.body?.planId || "").toLowerCase();
-    const periodRaw = String(req.body?.period || "d30").toLowerCase();
-
-    // Do not allow buying free directly; free is the fallback when planUntil expires.
-    const allowedPlans = ["basic", "pro", "studio"];
-    if (!allowedPlans.includes(planIdRaw)) {
-      return res.status(400).json({ success: false, error: "UNKNOWN_PLAN" });
-    }
-
-    // Period mapping (supports old/new ids)
-    const periodToDays = (p) => {
-      if (p === "d90" || p === "90") return 90;
-      if (p === "d180" || p === "180") return 180;
-      if (p === "annual" || p === "year" || p === "365") return 365;
-      return 30;
-    };
-    const days = periodToDays(periodRaw);
-
-    // Plan price table (credits) — adjust freely later
-    const PLAN_PRICES = {
-      basic:  { 30: 40, 90: 100, 180: 180, 365: 320 },
-      pro:    { 30: 80, 90: 210, 180: 380, 365: 690 },
-      studio: { 30: 140, 90: 390, 180: 720, 365: 1290 },
-    };
-    const cost = PLAN_PRICES?.[planIdRaw]?.[days];
-    if (typeof cost !== "number") {
-      return res.status(400).json({ success: false, error: "BAD_PERIOD" });
-    }
-
-    const userRef = db.collection("users").doc(uid);
-
-    const result = await db.runTransaction(async (tx) => {
-      const snap = await tx.get(userRef);
-      if (!snap.exists) throw Object.assign(new Error("USER_NOT_FOUND"), { code: "USER_NOT_FOUND" });
-
-      const user = snap.data() || {};
-      const credits = Number(user.credits || 0);
-
-      if (credits < cost) {
-        return { ok: false, error: "NO_CREDITS", credits, cost };
-      }
-
-      const now = Date.now();
-      const planUntilMs = now + days * 24 * 60 * 60 * 1000;
-
-      // Fixed 30-day included add-ons window (as agreed)
-      const addonUntilMs = now + 30 * 24 * 60 * 60 * 1000;
-
-      const update = {
-        credits: credits - cost,
-        plan: planIdRaw,
-        planUntil: admin.firestore.Timestamp.fromMillis(planUntilMs),
-        // Keep entitlements as an object, extend keys if already exist
-        entitlements: {
-          ...(user.entitlements || {}),
-          adFreeUntil: admin.firestore.Timestamp.fromMillis(addonUntilMs),
-          noWatermarkUntil: admin.firestore.Timestamp.fromMillis(addonUntilMs),
-        },
-      };
-
-      tx.set(userRef, update, { merge: true });
-
-      return {
-        ok: true,
-        credits: credits - cost,
-        cost,
-        plan: planIdRaw,
-        planUntil: admin.firestore.Timestamp.fromMillis(planUntilMs),
-        addonUntil: admin.firestore.Timestamp.fromMillis(addonUntilMs),
-      };
-    });
-
-    if (!result.ok) {
-      if (result.error === "NO_CREDITS") {
-        return res.status(402).json({ success: false, error: "NO_CREDITS", credits: result.credits, cost: result.cost });
-      }
-      return res.status(400).json({ success: false, error: result.error || "BUY_PLAN_FAILED" });
-    }
-
-    return res.json({
-      success: true,
-      credits: result.credits,
-      cost: result.cost,
-      plan: result.plan,
-      planUntil: result.planUntil,
-      addonUntil: result.addonUntil,
-    });
-  } catch (e) {
-    const code = String(e?.code || e?.message || "BUY_PLAN_FAILED");
-    if (code === "USER_NOT_FOUND") return res.status(404).json({ success: false, error: "USER_NOT_FOUND" });
-    console.error("❌ /buy-plan error:", e);
-    return res.status(500).json({ success: false, error: "BUY_PLAN_FAILED" });
-  }
-});
-
-
 app.post("/buy-pack", verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
@@ -1402,6 +1298,111 @@ app.post("/buy-pack", verifyFirebaseToken, async (req, res) => {
       return res.status(400).json({ success: false, error: "UNKNOWN_PACK" });
     }
     return res.status(500).json({ success: false, error: "BUY_PACK_ERROR" });
+  }
+});
+
+// -----------------------------------------
+// BUY PLAN (time-based) — sets users/{uid}.plan + planUntil
+// Also grants plan-included add-ons for 30 days (fixed): adFreeUntil + noWatermarkUntil
+// -----------------------------------------
+app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const planId = String(req.body?.planId || "").toLowerCase().trim();
+    const periodRaw = String(req.body?.period || "30").toLowerCase().trim();
+
+    // Free cannot be purchased; it's the fallback when planUntil expires.
+    const allowedPlans = ["basic", "pro", "studio"];
+    if (!allowedPlans.includes(planId)) {
+      return res.status(400).json({ success: false, error: "UNKNOWN_PLAN" });
+    }
+
+    // Period mapping (supports ids from the app)
+    const periodToDays = (p) => {
+      if (p === "90" || p === "d90") return 90;
+      if (p === "180" || p === "d180") return 180;
+      if (p === "365" || p === "annual" || p === "year" || p === "d365") return 365;
+      return 30; // default
+    };
+    const days = periodToDays(periodRaw);
+
+    // Credit prices — adjust as you want later
+    const PLAN_PRICES = {
+      basic:  { 30: 40, 90: 100, 180: 180, 365: 320 },
+      pro:    { 30: 80, 90: 210, 180: 380, 365: 690 },
+      studio: { 30: 140, 90: 390, 180: 720, 365: 1290 },
+    };
+    const cost = PLAN_PRICES?.[planId]?.[days];
+    if (typeof cost !== "number") {
+      return res.status(400).json({ success: false, error: "BAD_PERIOD" });
+    }
+
+    const userRef = db.collection("users").doc(uid);
+
+    const r = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) return { ok: false, error: "USER_NOT_FOUND" };
+
+      const user = snap.data() || {};
+      const credits = Number(user.credits || 0);
+
+      if (credits < cost) {
+        return { ok: false, error: "NO_CREDITS", credits, cost };
+      }
+
+      const nowMs = Date.now();
+      const planUntilMs = nowMs + days * 24 * 60 * 60 * 1000;
+
+      // Fixed 30 days for plan-included add-ons as agreed
+      const addonUntilMs = nowMs + 30 * 24 * 60 * 60 * 1000;
+
+      tx.set(
+        userRef,
+        {
+          credits: credits - cost,
+          plan: planId,
+          planUntil: admin.firestore.Timestamp.fromMillis(planUntilMs),
+          entitlements: {
+            ...(user.entitlements || {}),
+            adFreeUntil: admin.firestore.Timestamp.fromMillis(addonUntilMs),
+            noWatermarkUntil: admin.firestore.Timestamp.fromMillis(addonUntilMs),
+          },
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      return {
+        ok: true,
+        credits: credits - cost,
+        cost,
+        plan: planId,
+        planUntil: admin.firestore.Timestamp.fromMillis(planUntilMs),
+        addonUntil: admin.firestore.Timestamp.fromMillis(addonUntilMs),
+      };
+    });
+
+    if (!r.ok) {
+      if (r.error === "NO_CREDITS") {
+        return res.status(402).json({ success: false, error: "NO_CREDITS", credits: r.credits, cost: r.cost });
+      }
+      if (r.error === "USER_NOT_FOUND") {
+        return res.status(404).json({ success: false, error: "USER_NOT_FOUND" });
+      }
+      return res.status(400).json({ success: false, error: r.error || "BUY_PLAN_FAILED" });
+    }
+
+    return res.json({
+      success: true,
+      credits: r.credits,
+      cost: r.cost,
+      plan: r.plan,
+      planUntil: r.planUntil,
+      addonUntil: r.addonUntil,
+    });
+  } catch (e) {
+    console.error("❌ /buy-plan error:", e);
+    return res.status(500).json({ success: false, error: "BUY_PLAN_FAILED" });
   }
 });
 
