@@ -68,26 +68,6 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
-
-
-// ✅ Auto-downgrade to FREE when plan is expired
-async function ensurePlanFresh(uid) {
-  const ref = db.collection("users").doc(uid);
-  const snap = await ref.get();
-  if (!snap.exists) return;
-
-  const data = snap.data() || {};
-  const planUntil = data.planUntil && typeof data.planUntil.toDate === "function" ? data.planUntil.toDate() : null;
-
-  if (data.plan && String(data.plan) !== "free" && planUntil && Date.now() > planUntil.getTime()) {
-    await ref.update({
-      plan: "free",
-      planUntil: admin.firestore.FieldValue.delete(),
-      planPeriod: admin.firestore.FieldValue.delete(),
-    });
-  }
-}
-
 const expo = new Expo();
 
 // ------------------------------------------------------------
@@ -255,7 +235,6 @@ const MONETIZATION = {
 // ✅ Pack catalog (credit costs). Keep IDs in sync with src/data/promptPacks.js
 const PACK_CATALOG = {
   product_pro: { cost: 60, tier: "pro" },
-  templates_pack: { cost: 40, tier: "basic" },
   // add more packs here later...
 };
 
@@ -1293,6 +1272,110 @@ app.post("/buy-credits", verifyFirebaseToken, async (req, res) => {
 });
 
 
+// ------------------------------------------------------------
+// 💳 Buy Plan (time-based)
+// - Updates users/{uid}.plan + planUntil (Timestamp)
+// - Also grants plan-included add-ons (adFreeUntil + noWatermarkUntil) for 30 days (fixed)
+// ------------------------------------------------------------
+app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const planIdRaw = String(req.body?.planId || "").toLowerCase();
+    const periodRaw = String(req.body?.period || "d30").toLowerCase();
+
+    // Do not allow buying free directly; free is the fallback when planUntil expires.
+    const allowedPlans = ["basic", "pro", "studio"];
+    if (!allowedPlans.includes(planIdRaw)) {
+      return res.status(400).json({ success: false, error: "UNKNOWN_PLAN" });
+    }
+
+    // Period mapping (supports old/new ids)
+    const periodToDays = (p) => {
+      if (p === "d90" || p === "90") return 90;
+      if (p === "d180" || p === "180") return 180;
+      if (p === "annual" || p === "year" || p === "365") return 365;
+      return 30;
+    };
+    const days = periodToDays(periodRaw);
+
+    // Plan price table (credits) — adjust freely later
+    const PLAN_PRICES = {
+      basic:  { 30: 40, 90: 100, 180: 180, 365: 320 },
+      pro:    { 30: 80, 90: 210, 180: 380, 365: 690 },
+      studio: { 30: 140, 90: 390, 180: 720, 365: 1290 },
+    };
+    const cost = PLAN_PRICES?.[planIdRaw]?.[days];
+    if (typeof cost !== "number") {
+      return res.status(400).json({ success: false, error: "BAD_PERIOD" });
+    }
+
+    const userRef = db.collection("users").doc(uid);
+
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) throw Object.assign(new Error("USER_NOT_FOUND"), { code: "USER_NOT_FOUND" });
+
+      const user = snap.data() || {};
+      const credits = Number(user.credits || 0);
+
+      if (credits < cost) {
+        return { ok: false, error: "NO_CREDITS", credits, cost };
+      }
+
+      const now = Date.now();
+      const planUntilMs = now + days * 24 * 60 * 60 * 1000;
+
+      // Fixed 30-day included add-ons window (as agreed)
+      const addonUntilMs = now + 30 * 24 * 60 * 60 * 1000;
+
+      const update = {
+        credits: credits - cost,
+        plan: planIdRaw,
+        planUntil: admin.firestore.Timestamp.fromMillis(planUntilMs),
+        // Keep entitlements as an object, extend keys if already exist
+        entitlements: {
+          ...(user.entitlements || {}),
+          adFreeUntil: admin.firestore.Timestamp.fromMillis(addonUntilMs),
+          noWatermarkUntil: admin.firestore.Timestamp.fromMillis(addonUntilMs),
+        },
+      };
+
+      tx.set(userRef, update, { merge: true });
+
+      return {
+        ok: true,
+        credits: credits - cost,
+        cost,
+        plan: planIdRaw,
+        planUntil: admin.firestore.Timestamp.fromMillis(planUntilMs),
+        addonUntil: admin.firestore.Timestamp.fromMillis(addonUntilMs),
+      };
+    });
+
+    if (!result.ok) {
+      if (result.error === "NO_CREDITS") {
+        return res.status(402).json({ success: false, error: "NO_CREDITS", credits: result.credits, cost: result.cost });
+      }
+      return res.status(400).json({ success: false, error: result.error || "BUY_PLAN_FAILED" });
+    }
+
+    return res.json({
+      success: true,
+      credits: result.credits,
+      cost: result.cost,
+      plan: result.plan,
+      planUntil: result.planUntil,
+      addonUntil: result.addonUntil,
+    });
+  } catch (e) {
+    const code = String(e?.code || e?.message || "BUY_PLAN_FAILED");
+    if (code === "USER_NOT_FOUND") return res.status(404).json({ success: false, error: "USER_NOT_FOUND" });
+    console.error("❌ /buy-plan error:", e);
+    return res.status(500).json({ success: false, error: "BUY_PLAN_FAILED" });
+  }
+});
+
+
 app.post("/buy-pack", verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
@@ -1319,93 +1402,6 @@ app.post("/buy-pack", verifyFirebaseToken, async (req, res) => {
       return res.status(400).json({ success: false, error: "UNKNOWN_PACK" });
     }
     return res.status(500).json({ success: false, error: "BUY_PACK_ERROR" });
-  }
-});
-
-// 🧾 Buy / extend plan with duration (30/90/180/annual)
-const PERIOD_TO_DAYS = {
-  d30: 30,
-  d90: 90,
-  d180: 180,
-  annual: 365,
-};
-
-async function buyPlan(uid, planId, period) {
-  const nextPlan = String(planId || "").toLowerCase();
-  const per = String(period || "d30");
-  const days = PERIOD_TO_DAYS[per] || 30;
-
-  const userRef = db.collection("users").doc(uid);
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(userRef);
-    if (!snap.exists) throw Object.assign(new Error("USER_NOT_FOUND"), { code: "USER_NOT_FOUND" });
-
-    const data = snap.data() || {};
-    const now = admin.firestore.Timestamp.now();
-
-    // Extend from existing planUntil if still active, else from now
-    const prevUntil = data.planUntil && typeof data.planUntil.toDate === "function" ? data.planUntil : null;
-    const baseMs = prevUntil ? prevUntil.toDate().getTime() : Date.now();
-    const startMs = baseMs > Date.now() ? baseMs : Date.now();
-    const untilMs = startMs + days * 24 * 60 * 60 * 1000;
-
-    // Plan perks are fixed 30 days for simple, stable display
-    const perkUntilMs = Date.now() + 30 * 24 * 60 * 60 * 1000;
-
-    tx.update(userRef, {
-      plan: nextPlan,
-      planUntil: admin.firestore.Timestamp.fromDate(new Date(untilMs)),
-      planPeriod: per,
-      planUpdatedAt: now,
-
-      // ✅ store perk expiry separately for easy UI display/testing
-      noWatermarkUntil: admin.firestore.Timestamp.fromDate(new Date(perkUntilMs)),
-      adFreeUntil: admin.firestore.Timestamp.fromDate(new Date(perkUntilMs)),
-
-      // ✅ also mirror into an addons map for testing/cleanup
-      addons: {
-        ...(data.addons && typeof data.addons === "object" ? data.addons : {}),
-        no_watermark_30d: { expiresAt: admin.firestore.Timestamp.fromDate(new Date(perkUntilMs)), source: "plan" },
-        ad_free_30d: { expiresAt: admin.firestore.Timestamp.fromDate(new Date(perkUntilMs)), source: "plan" },
-      },
-    });
-  });
-
-  const after = await db.collection("users").doc(uid).get();
-  const afterData = after.data() || {};
-  return {
-    plan: afterData.plan,
-    planUntil: afterData.planUntil || null,
-    planPeriod: afterData.planPeriod || per,
-    noWatermarkUntil: afterData.noWatermarkUntil || null,
-    adFreeUntil: afterData.adFreeUntil || null,
-  };
-}
-
-app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
-  try {
-    const uid = req.uid;
-    const planId = String(req.body?.planId || "").trim();
-    const period = String(req.body?.period || "d30").trim();
-
-    if (!planId) return res.status(400).json({ success: false, error: "MISSING_PLAN" });
-    if (String(planId).toLowerCase() === "free") return res.status(400).json({ success: false, error: "FREE_NOT_PURCHASABLE" });
-
-    const result = await buyPlan(uid, planId, period);
-
-    return res.json({
-      success: true,
-      plan: result.plan,
-      planUntil: result.planUntil,
-      planPeriod: result.planPeriod,
-      noWatermarkUntil: result.noWatermarkUntil,
-      adFreeUntil: result.adFreeUntil,
-    });
-  } catch (e) {
-    const code = String(e?.code || e?.message || "BUY_PLAN_FAILED");
-    if (code === "USER_NOT_FOUND") return res.status(404).json({ success: false, error: "USER_NOT_FOUND" });
-    console.log("❌ /buy-plan error:", e);
-    return res.status(500).json({ success: false, error: "BUY_PLAN_FAILED" });
   }
 });
 
