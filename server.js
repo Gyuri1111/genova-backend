@@ -265,23 +265,23 @@ const MONETIZATION = {
   TRIAL_CREDITS: 5,
   DEFAULT_PLAN: "free",
   GENERATION_COST: 1, // credits per generation
+  
   ADDONS: {
     // Watermark removal (time-based)
-    no_watermark_7d: { cost: 50, days: 7, entitlementKey: "noWatermarkUntil" },
+    no_watermark_7d:  { cost: 50,  days: 7,  entitlementKey: "noWatermarkUntil" },
     no_watermark_30d: { cost: 150, days: 30, entitlementKey: "noWatermarkUntil" },
 
     // Ad-free (time-based) — for future UI/ads
-    ad_free_7d: { cost: 20, days: 7, entitlementKey: "adFreeUntil" },
+    ad_free_7d:  { cost: 20, days: 7,  entitlementKey: "adFreeUntil" },
     ad_free_30d: { cost: 50, days: 30, entitlementKey: "adFreeUntil" },
 
+    // Templates access (time-based)
+    templates_7d:  { cost: 60,  days: 7,  entitlementKey: "templatesUntil" },
+    templates_30d: { cost: 160, days: 30, entitlementKey: "templatesUntil" },
 
-// Templates access (time-based)
-templates_7d: { cost: 60, days: 7, entitlementKey: "templatesUntil" },
-templates_30d: { cost: 160, days: 30, entitlementKey: "templatesUntil" },
-
-// PRO Prompt Pack access (time-based)
-pro_prompt_7d: { cost: 60, days: 7, entitlementKey: "proPromptUntil" },
-pro_prompt_30d: { cost: 160, days: 30, entitlementKey: "proPromptUntil" },
+    // PRO Prompt Pack access (time-based)
+    pro_prompt_7d:  { cost: 60,  days: 7,  entitlementKey: "proPromptUntil" },
+    pro_prompt_30d: { cost: 160, days: 30, entitlementKey: "proPromptUntil" },
   },
 };
 
@@ -1404,11 +1404,19 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
         return { ok: false, error: "NO_CREDITS", credits, cost };
       }
 
-      const nowMs = Date.now();
-      const planUntilMs = nowMs + days * 24 * 60 * 60 * 1000;
+      
+const nowMs = Date.now();
 
-      // Fixed 30 days for plan-included add-ons as agreed
-      const addonUntilMs = nowMs + 30 * 24 * 60 * 60 * 1000;
+// ✅ Stack plan expiry: base = max(now, existing planUntil)
+const existingPlanUntilMs = toMsFromTimestampLike(user.planUntil);
+const planBaseMs = Math.max(nowMs, Number(existingPlanUntilMs || 0));
+const planUntilMs = planBaseMs + days * 24 * 60 * 60 * 1000;
+
+// ✅ Fixed 30 days for plan-included add-ons as agreed, stacked on existing entitlements
+const existingAdFreeMs = toMsFromTimestampLike(user?.entitlements?.adFreeUntil);
+const existingNoWatermarkMs = toMsFromTimestampLike(user?.entitlements?.noWatermarkUntil);
+const addonBaseMs = Math.max(nowMs, Number(existingAdFreeMs || 0), Number(existingNoWatermarkMs || 0));
+const addonUntilMs = addonBaseMs + 30 * 24 * 60 * 60 * 1000;
 
       tx.set(
         userRef,
