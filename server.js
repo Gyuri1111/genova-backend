@@ -228,14 +228,6 @@ const MONETIZATION = {
     // Ad-free (time-based) — for future UI/ads
     ad_free_7d: { cost: 20, days: 7, entitlementKey: "adFreeUntil" },
     ad_free_30d: { cost: 50, days: 30, entitlementKey: "adFreeUntil" },
-
-    // Templates (time-based)
-    templates_7d: { cost: 30, days: 7, entitlementKey: "templatesUntil" },
-    templates_30d: { cost: 80, days: 30, entitlementKey: "templatesUntil" },
-
-    // PRO Prompt Pack (time-based)
-    pro_prompt_7d: { cost: 60, days: 7, entitlementKey: "proPromptUntil" },
-    pro_prompt_30d: { cost: 150, days: 30, entitlementKey: "proPromptUntil" },
   },
 };
 
@@ -256,7 +248,35 @@ const BILLING = {
     MAX_FPS: 60,
   },
   // Allowed maxima per plan (v1)
-  PLAN_LIMITS: {
+  
+function addDaysToExpiry(existingUntilMs, days) {
+  const now = Date.now();
+  const base = (Number.isFinite(existingUntilMs) && existingUntilMs > now) ? existingUntilMs : now;
+  return base + days * 24 * 60 * 60 * 1000;
+}
+
+function toMsFromTimestampLike(v) {
+  if (!v) return null;
+  if (typeof v === "number") return v < 1e12 ? Math.round(v * 1000) : Math.round(v);
+  if (typeof v === "string") {
+    const d = new Date(v);
+    return !isNaN(d.getTime()) ? d.getTime() : null;
+  }
+  if (typeof v === "object") {
+    if (typeof v.toDate === "function") {
+      const d = v.toDate();
+      return d instanceof Date && !isNaN(d.getTime()) ? d.getTime() : null;
+    }
+    if ("seconds" in v) {
+      const sec = Number(v.seconds);
+      const ns = Number(v.nanoseconds || 0);
+      if (Number.isFinite(sec) && sec > 0) return sec * 1000 + (Number.isFinite(ns) ? Math.floor(ns / 1e6) : 0);
+    }
+  }
+  return null;
+}
+
+PLAN_LIMITS: {
     free:   { maxLength: 5,  maxFps: 30, maxResolution: "720p" },
     basic:  { maxLength: 5,  maxFps: 30, maxResolution: "1080p" },
     pro:    { maxLength: 10, maxFps: 60, maxResolution: "4k" },
