@@ -228,6 +228,14 @@ const MONETIZATION = {
     // Ad-free (time-based) — for future UI/ads
     ad_free_7d: { cost: 20, days: 7, entitlementKey: "adFreeUntil" },
     ad_free_30d: { cost: 50, days: 30, entitlementKey: "adFreeUntil" },
+
+    // Templates (time-based)
+    templates_7d: { cost: 30, days: 7, entitlementKey: "templatesUntil" },
+    templates_30d: { cost: 80, days: 30, entitlementKey: "templatesUntil" },
+
+    // PRO Prompt Pack (time-based)
+    pro_prompt_7d: { cost: 60, days: 7, entitlementKey: "proPromptUntil" },
+    pro_prompt_30d: { cost: 150, days: 30, entitlementKey: "proPromptUntil" },
   },
 };
 
