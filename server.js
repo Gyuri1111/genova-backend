@@ -53,7 +53,7 @@ const BUILD_TAG =
    HELPERS (TOP-LEVEL!)
 ========================= */
 
-function addDaysStacking(existingUntilMs, days) {
+function addDaysToExpiry(existingUntilMs, days) {
   const now = Date.now();
   const base =
     Number.isFinite(existingUntilMs) && existingUntilMs > now
@@ -81,8 +81,8 @@ function toMsFromTimestampLike(v) {
       return d instanceof Date && !isNaN(d.getTime()) ? d.getTime() : null;
     }
     const sec =
-  ("seconds" in v ? Number(tsToMs(v)) : null) ??
-  ("_seconds" in v ? Number(tsToMs(v)) : null);
+  ("seconds" in v ? Number(v.seconds) : null) ??
+  ("_seconds" in v ? Number(v._seconds) : null);
 
 const ns =
   ("nanoseconds" in v ? Number(v.nanoseconds) : null) ??
@@ -1414,7 +1414,7 @@ const nowMs = Date.now();
 
 // ✅ Stack planUntil (extend from existing if still active)
 const existingPlanUntilMs = toMsFromTimestampLike(user.planUntil);
-const planUntilMs = addDaysStacking($1);
+const planUntilMs = addDaysToExpiry(existingPlanUntilMs, days);
 
 // ✅ Plan-included add-ons:
 // - BASIC: none (do NOT overwrite purchases)
@@ -1429,10 +1429,10 @@ if (isProOrStudio) {
   const existingTplMs = toMsFromTimestampLike(ent0.templatesUntil);
   const existingProPromptMs = toMsFromTimestampLike(ent0.proPromptUntil);
 
-  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysStacking(existingAdFreeMs, 30));
-  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysStacking(existingNoWmMs, 30));
-  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysStacking(existingTplMs, 30));
-  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysStacking(existingProPromptMs, 30));
+  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, 30));
+  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, 30));
+  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, 30));
+  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, 30));
 }
 
 tx.set(
