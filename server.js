@@ -280,11 +280,11 @@ const MONETIZATION = {
     ad_free_30d: { cost: 50, days: 30, entitlementKey: "adFreeUntil" },
 
 
-// Templates access (time-based) — app may send 7d/30d ids; durations match the id (7d or 30d)
+// Templates access (time-based)
 templates_7d: { cost: 20, days: 7, entitlementKey: "templatesUntil" },
 templates_30d: { cost: 50, days: 30, entitlementKey: "templatesUntil" },
 
-// PRO Prompt Pack (time-based) — app may send 7d/30d ids; durations match the id (7d or 30d)
+// PRO Prompt Pack (time-based)
 pro_prompt_7d: { cost: 20, days: 7, entitlementKey: "proPromptUntil" },
 pro_prompt_30d: { cost: 50, days: 30, entitlementKey: "proPromptUntil" },
   },
@@ -1377,10 +1377,25 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
     }
 
     // Period mapping (supports ids from the app)
-    const periodToDays = (p) => {
-      if (p === "90" || p === "d90") return 90;
-      if (p === "180" || p === "d180") return 180;
-      if (p === "365" || p === "annual" || p === "year" || p === "d365") return 365;
+    const periodToDays = (pRaw) => {
+      const p = String(pRaw || "30").toLowerCase().trim();
+      if (p === "7" || p === "d7" || p === "w1" || p === "7d") return 7;
+      if (p === "30" || p === "d30" || p === "m1" || p === "30d") return 30;
+      if (p === "90" || p === "d90" || p === "m3" || p === "90d") return 90;
+      if (p === "180" || p === "d180" || p === "m6" || p === "180d") return 180;
+      // yearly variants (app sometimes uses y1 / 1y / p1y)
+      if (
+        p === "365" ||
+        p === "d365" ||
+        p === "annual" ||
+        p === "year" ||
+        p === "yearly" ||
+        p === "y1" ||
+        p === "1y" ||
+        p === "p1y" ||
+        p === "365d"
+      )
+        return 365;
       return 30; // default
     };
     const days = periodToDays(periodRaw);
@@ -1418,7 +1433,7 @@ const planUntilMs = addDaysToExpiry(existingPlanUntilMs, days);
 
 // ✅ Plan-included add-ons:
 // - BASIC: none (do NOT overwrite purchases)
-// - PRO / STUDIO: ad-free + no-watermark + templates + pro prompt (each stacks 30 days)
+// - PRO / STUDIO: ad-free + no-watermark + templates + pro prompt (each stacks the plan period)
 const ent0 = (user.entitlements && typeof user.entitlements === "object") ? user.entitlements : {};
 const isProOrStudio = planId === "pro" || planId === "studio";
 
@@ -1429,10 +1444,10 @@ if (isProOrStudio) {
   const existingTplMs = toMsFromTimestampLike(ent0.templatesUntil);
   const existingProPromptMs = toMsFromTimestampLike(ent0.proPromptUntil);
 
-  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, 30));
-  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, 30));
-  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, 30));
-  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, 30));
+  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, days));
+  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, days));
+  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, days));
+  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, days));
 }
 
 tx.set(
