@@ -118,6 +118,7 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
+const STORE_PACKS_REQUIRE_CREDITS = process.env.STORE_PACKS_REQUIRE_CREDITS === "1";
 const expo = new Expo();
 
 // ------------------------------------------------------------
@@ -1196,7 +1197,6 @@ async function buyPack({ uid, packId }) {
 
   return result;
 }
-
 async function buyCredits(uid, pack) {
   const PACKS = {
     credits_20: 20,
