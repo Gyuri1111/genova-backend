@@ -280,12 +280,12 @@ const MONETIZATION = {
     ad_free_30d: { cost: 50, days: 30, entitlementKey: "adFreeUntil" },
 
 
-// Templates access (time-based) — app may send 7d/30d ids; both grant 30 days by design
-templates_7d: { cost: 20, days: 30, entitlementKey: "templatesUntil" },
+// Templates access (time-based)
+templates_7d: { cost: 20, days: 7, entitlementKey: "templatesUntil" },
 templates_30d: { cost: 50, days: 30, entitlementKey: "templatesUntil" },
 
-// PRO Prompt Pack (time-based) — app may send 7d/30d ids; both grant 30 days by design
-pro_prompt_7d: { cost: 20, days: 30, entitlementKey: "proPromptUntil" },
+// PRO Prompt Pack (time-based)
+pro_prompt_7d: { cost: 20, days: 7, entitlementKey: "proPromptUntil" },
 pro_prompt_30d: { cost: 50, days: 30, entitlementKey: "proPromptUntil" },
   },
 };
@@ -1418,23 +1418,38 @@ const planUntilMs = addDaysToExpiry(existingPlanUntilMs, days);
 
 // ✅ Plan-included add-ons:
 // - BASIC: none (do NOT overwrite purchases)
-// - PRO / STUDIO: ad-free + no-watermark + templates + pro prompt (each stacks 30 days)
+// - PRO / STUDIO: ad-free + no-watermark + templates + PRO prompt pack
+// - STUDIO ONLY: Prompt Builder
+//
+// Rule: plan-included features must be active for AT LEAST the plan duration.
+// We therefore set each included entitlement's expiry to max(existingExpiry, planUntil).
 const ent0 = (user.entitlements && typeof user.entitlements === "object") ? user.entitlements : {};
 const isProOrStudio = planId === "pro" || planId === "studio";
+const isStudio = planId === "studio";
 
 const entUpdates = {};
+const planUntilTs = admin.firestore.Timestamp.fromMillis(planUntilMs);
+const maxWithPlanUntilTs = (existingMs) => {
+  const ms = Number.isFinite(existingMs) ? existingMs : 0;
+  return admin.firestore.Timestamp.fromMillis(Math.max(ms, planUntilMs));
+};
+
 if (isProOrStudio) {
   const existingAdFreeMs = toMsFromTimestampLike(ent0.adFreeUntil);
   const existingNoWmMs = toMsFromTimestampLike(ent0.noWatermarkUntil);
   const existingTplMs = toMsFromTimestampLike(ent0.templatesUntil);
   const existingProPromptMs = toMsFromTimestampLike(ent0.proPromptUntil);
 
-  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, 30));
-  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, 30));
-  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, 30));
-  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, 30));
+  entUpdates.adFreeUntil = maxWithPlanUntilTs(existingAdFreeMs);
+  entUpdates.noWatermarkUntil = maxWithPlanUntilTs(existingNoWmMs);
+  entUpdates.templatesUntil = maxWithPlanUntilTs(existingTplMs);
+  entUpdates.proPromptUntil = maxWithPlanUntilTs(existingProPromptMs);
 }
 
+if (isStudio) {
+  const existingPromptBuilderMs = toMsFromTimestampLike(ent0.promptBuilderUntil);
+  entUpdates.promptBuilderUntil = maxWithPlanUntilTs(existingPromptBuilderMs);
+}
 tx.set(
   userRef,
   {
