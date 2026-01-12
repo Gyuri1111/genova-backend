@@ -118,7 +118,6 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
-const STORE_PACKS_REQUIRE_CREDITS = process.env.STORE_PACKS_REQUIRE_CREDITS === "1";
 const expo = new Expo();
 
 // ------------------------------------------------------------
@@ -281,12 +280,12 @@ const MONETIZATION = {
     ad_free_30d: { cost: 50, days: 30, entitlementKey: "adFreeUntil" },
 
 
-// Templates access (time-based) — app may send 7d/30d ids; both grant 30 days by design
-templates_7d: { cost: 20, days: 30, entitlementKey: "templatesUntil" },
+// Templates access (time-based)
+templates_7d: { cost: 20, days: 7, entitlementKey: "templatesUntil" },
 templates_30d: { cost: 50, days: 30, entitlementKey: "templatesUntil" },
 
-// PRO Prompt Pack (time-based) — app may send 7d/30d ids; both grant 30 days by design
-pro_prompt_7d: { cost: 20, days: 30, entitlementKey: "proPromptUntil" },
+// PRO Prompt Pack (time-based)
+pro_prompt_7d: { cost: 20, days: 7, entitlementKey: "proPromptUntil" },
 pro_prompt_30d: { cost: 50, days: 30, entitlementKey: "proPromptUntil" },
   },
 };
@@ -1197,6 +1196,7 @@ async function buyPack({ uid, packId }) {
 
   return result;
 }
+
 async function buyCredits(uid, pack) {
   const PACKS = {
     credits_20: 20,
@@ -1377,10 +1377,25 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
     }
 
     // Period mapping (supports ids from the app)
-    const periodToDays = (p) => {
-      if (p === "90" || p === "d90") return 90;
-      if (p === "180" || p === "d180") return 180;
-      if (p === "365" || p === "annual" || p === "year" || p === "d365") return 365;
+    const periodToDays = (pRaw) => {
+      const p = String(pRaw || "30").toLowerCase().trim();
+      if (p === "7" || p === "d7" || p === "w1" || p === "7d") return 7;
+      if (p === "30" || p === "d30" || p === "m1" || p === "30d") return 30;
+      if (p === "90" || p === "d90" || p === "m3" || p === "90d") return 90;
+      if (p === "180" || p === "d180" || p === "m6" || p === "180d") return 180;
+      // yearly variants (app sometimes uses y1 / 1y / p1y)
+      if (
+        p === "365" ||
+        p === "d365" ||
+        p === "annual" ||
+        p === "year" ||
+        p === "yearly" ||
+        p === "y1" ||
+        p === "1y" ||
+        p === "p1y" ||
+        p === "365d"
+      )
+        return 365;
       return 30; // default
     };
     const days = periodToDays(periodRaw);
@@ -1411,53 +1426,30 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
 
       
 const nowMs = Date.now();
-        const existingPlanUntilMs = toMsFromTimestampLike(user.planUntil);
 
-        // ✅ Plan duration (days) from selected period
-        const days = periodToDays(planPeriod);
+// ✅ Stack planUntil (extend from existing if still active)
+const existingPlanUntilMs = toMsFromTimestampLike(user.planUntil);
+const planUntilMs = addDaysToExpiry(existingPlanUntilMs, days);
 
-        // ✅ Plan switching rule:
-        // - If buying the SAME plan again -> extend from existingPlanUntil (stack)
-        // - If switching to a DIFFERENT plan -> start from NOW (do NOT stack planUntil across plans)
-        const currentPlanId = (user.plan || "free").toLowerCase();
-        const baseForPlanUntil = currentPlanId === planId ? existingPlanUntilMs : null;
-        const planUntilMs = addDaysToExpiry(baseForPlanUntil, days);
+// ✅ Plan-included add-ons:
+// - BASIC: none (do NOT overwrite purchases)
+// - PRO / STUDIO: ad-free + no-watermark + templates + pro prompt (each stacks the plan period)
+const ent0 = (user.entitlements && typeof user.entitlements === "object") ? user.entitlements : {};
+const isProOrStudio = planId === "pro" || planId === "studio";
 
-        // Plan fields
-        const planUpdates = {
-          plan: planId,
-          planPeriod,
-          planUntil: admin.firestore.Timestamp.fromMillis(planUntilMs),
-        };
+const entUpdates = {};
+if (isProOrStudio) {
+  const existingAdFreeMs = toMsFromTimestampLike(ent0.adFreeUntil);
+  const existingNoWmMs = toMsFromTimestampLike(ent0.noWatermarkUntil);
+  const existingTplMs = toMsFromTimestampLike(ent0.templatesUntil);
+  const existingProPromptMs = toMsFromTimestampLike(ent0.proPromptUntil);
 
-        // Entitlement updates
-        const ent0 = user.entitlements || {};
-        const entUpdates = {};
+  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, days));
+  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, days));
+  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, days));
+  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, days));
+}
 
-        // ✅ Included entitlements from paid plans should EXTEND by the plan's own duration (days)
-        // Rule: newUntil = max(now, existingUntil) + days
-        const isProOrStudio = planId === "pro" || planId === "studio";
-        if (isProOrStudio) {
-          const existingAdFreeMs = toMsFromTimestampLike(ent0.adFreeUntil);
-          const existingNoWatermarkMs = toMsFromTimestampLike(ent0.noWatermarkUntil);
-          const existingTemplatesMs = toMsFromTimestampLike(ent0.templatesUntil);
-          const existingProPromptMs = toMsFromTimestampLike(ent0.proPromptUntil);
-
-          entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, days));
-          entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWatermarkMs, days));
-          entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTemplatesMs, days));
-          entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, days));
-        }
-
-        // ✅ Prompt Builder is a Studio-only feature and is tied to the ACTIVE Studio plan duration.
-        // Not stackable and not independent from the plan.
-        if (planId === "studio") {
-          entUpdates.promptBuilderUntil = admin.firestore.Timestamp.fromMillis(planUntilMs);
-        } else {
-          entUpdates.promptBuilderUntil = null;
-        }
-
-        tx.set(userRef, { ...planUpdates, entitlements: entUpdates }, { merge: true });
 tx.set(
   userRef,
   {
