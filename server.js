@@ -10,8 +10,6 @@ const fs = require("fs");
 const path = require("path");
 
 // ===== Render key bootstrap (CommonJS safe) =====
-
-const DAY_MS = 24 * 60 * 60 * 1000;
 function writeJsonKeyFileIfMissing(relPath, envVarName) {
   try {
     const abs = path.resolve(process.cwd(), relPath);
@@ -282,12 +280,12 @@ const MONETIZATION = {
     ad_free_30d: { cost: 50, days: 30, entitlementKey: "adFreeUntil" },
 
 
-// Templates access (time-based) — app may send 7d/30d ids; both grant 30 days by design
-templates_7d: { cost: 20, days: 30, entitlementKey: "templatesUntil" },
+// Templates access (time-based)
+templates_7d: { cost: 20, days: 7, entitlementKey: "templatesUntil" },
 templates_30d: { cost: 50, days: 30, entitlementKey: "templatesUntil" },
 
-// PRO Prompt Pack (time-based) — app may send 7d/30d ids; both grant 30 days by design
-pro_prompt_7d: { cost: 20, days: 30, entitlementKey: "proPromptUntil" },
+// PRO Prompt Pack (time-based)
+pro_prompt_7d: { cost: 20, days: 7, entitlementKey: "proPromptUntil" },
 pro_prompt_30d: { cost: 50, days: 30, entitlementKey: "proPromptUntil" },
   },
 };
