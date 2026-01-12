@@ -1425,11 +1425,13 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
       }
 
       
-const nowMs = Date.now();
+      const nowMs = Date.now();
 
-// ✅ Stack planUntil (extend from existing if still active)
-const existingPlanUntilMs = toMsFromTimestampLike(user.planUntil);
-const planUntilMs = addDaysToExpiry(existingPlanUntilMs, days);
+      // ✅ Plan switching rule (user requirement):
+      // The *last purchased plan* defines the plan validity window.
+      // Therefore we do NOT stack/extend planUntil from a previous plan.
+      // (Entitlements can still stack separately.)
+      const planUntilMs = nowMs + days * DAY_MS;
 
 // ✅ Plan-included add-ons:
 // - BASIC: none (do NOT overwrite purchases)
@@ -1444,10 +1446,20 @@ if (isProOrStudio) {
   const existingTplMs = toMsFromTimestampLike(ent0.templatesUntil);
   const existingProPromptMs = toMsFromTimestampLike(ent0.proPromptUntil);
 
+  // Studio-only feature: Prompt Builder (NOT the same as proPromptUntil)
+  // This should stack only when a Studio plan is purchased.
+  const existingPromptBuilderMs = toMsFromTimestampLike(ent0.promptBuilderUntil);
+
   entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, days));
   entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, days));
   entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, days));
   entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, days));
+
+  if (planId === "studio") {
+    entUpdates.promptBuilderUntil = admin.firestore.Timestamp.fromMillis(
+      addDaysToExpiry(existingPromptBuilderMs, days)
+    );
+  }
 }
 
 tx.set(
