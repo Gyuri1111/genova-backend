@@ -1438,6 +1438,15 @@ const ent0 = (user.entitlements && typeof user.entitlements === "object") ? user
 const isProOrStudio = planId === "pro" || planId === "studio";
 
 const entUpdates = {};
+      // Prompt Builder is a Studio-only benefit (NOT the same as pro_prompt add-on)
+      // It should always expire together with the active Studio plan.
+      if (planId === "studio") {
+        entUpdates.promptBuilderUntil = admin.firestore.Timestamp.fromMillis(planUntilMs);
+      } else {
+        // Any non-studio plan should not have Prompt Builder active
+        entUpdates.promptBuilderUntil = null;
+      }
+
 if (isProOrStudio) {
   const existingAdFreeMs = toMsFromTimestampLike(ent0.adFreeUntil);
   const existingNoWmMs = toMsFromTimestampLike(ent0.noWatermarkUntil);
@@ -1455,7 +1464,7 @@ tx.set(
   {
     credits: credits - cost,
     plan: planId,
-    planUntil: admin.firestore.Timestamp.fromMillis(planUntilMs),
+    planUntil: planId === "free" ? null : admin.firestore.Timestamp.fromMillis(planUntilMs),
     entitlements: {
       ...ent0,
       ...entUpdates,
@@ -1468,7 +1477,7 @@ tx.set(
         credits: credits - cost,
         cost,
         plan: planId,
-        planUntil: admin.firestore.Timestamp.fromMillis(planUntilMs),
+        planUntil: planId === "free" ? null : admin.firestore.Timestamp.fromMillis(planUntilMs),
         addonUntil: admin.firestore.Timestamp.fromMillis(planUntilMs),
       };
     });
