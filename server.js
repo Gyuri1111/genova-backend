@@ -1403,7 +1403,6 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
       if (!snap.exists) return { ok: false, error: "USER_NOT_FOUND" };
 
       const user = snap.data() || {};
-      const userData = user;
       const credits = Number(user.credits || 0);
 
       if (credits < cost) {
@@ -1430,32 +1429,26 @@ const isProOrStudio = planId === "pro" || planId === "studio";
 
 const entUpdates = {};
 if (isProOrStudio) {
-  const ent0 = userData.entitlements || {};
   const existingAdFreeMs = toMsFromTimestampLike(ent0.adFreeUntil);
   const existingNoWmMs = toMsFromTimestampLike(ent0.noWatermarkUntil);
-  const existingTemplatesMs = toMsFromTimestampLike(ent0.templatesUntil);
+  const existingTplMs = toMsFromTimestampLike(ent0.templatesUntil);
   const existingProPromptMs = toMsFromTimestampLike(ent0.proPromptUntil);
 
-  // ✅ Plan-included entitlements should STACK the planPeriodDays onto any existing remaining time.
-  const stackedAdFreeUntilMs = addDaysToExpiry(existingAdFreeMs, planPeriodDays);
-  const stackedNoWmUntilMs = addDaysToExpiry(existingNoWmMs, planPeriodDays);
-  const stackedTemplatesUntilMs = addDaysToExpiry(existingTemplatesMs, planPeriodDays);
-  const stackedProPromptUntilMs = addDaysToExpiry(existingProPromptMs, planPeriodDays);
+  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, days));
+  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, days));
+  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, days));
+  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, days));
+                  }
 
-  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(stackedAdFreeUntilMs);
-  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(stackedNoWmUntilMs);
-  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(stackedTemplatesUntilMs);
-  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(stackedProPromptUntilMs);
-}
-
-// ✅ Prompt Builder is ONLY for Studio plan.
-// - Studio purchase: it should run until the newPlanUntil
-// - Switching to ANY other plan: it must be cleared in Firestore immediately
-if (planId === "studio") {
-  entUpdates.promptBuilderUntil = admin.firestore.Timestamp.fromMillis(newPlanUntilMs);
-} else {
-  entUpdates.promptBuilderUntil = null;
-}
+      // Prompt Builder is ONLY available for STUDIO plan.
+      // We store it separately from planUntil so it doesn't get 'merged' by plan stacking logic.
+      // - When plan is STUDIO: promptBuilderUntil === planUntil (same expiry)
+      // - When plan is NOT STUDIO: promptBuilderUntil must be null (cleared)
+      if (planId === "studio") {
+        entUpdates.promptBuilderUntil = admin.firestore.Timestamp.fromMillis(planUntilMs);
+      } else {
+        entUpdates.promptBuilderUntil = null;
+      }
 
 tx.set(
   userRef,
