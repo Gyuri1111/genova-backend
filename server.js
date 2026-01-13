@@ -175,6 +175,13 @@ function buildExpiryCleanupPatch(userData, nowMs) {
     ? userData.entitlements
     : {};
 
+  // Plan expiry: if planUntil expired -> fall back to FREE (no stacking here)
+  const planUntilMs = toMsFromTimestampLike(userData?.planUntil);
+  if (planUntilMs && planUntilMs <= nowMs) {
+    patch["plan"] = "free";
+    patch["planUntil"] = null;
+  }
+
   const entitlementKeys = [
     "adFreeUntil",
     "noWatermarkUntil",
