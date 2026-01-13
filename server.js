@@ -133,51 +133,34 @@ const verifyFirebaseToken = async (req, res, next) => {
   try {
     const decoded = await admin.auth().verifyIdToken(token);
     req.uid = decoded.uid;
+
+    // Auto-expiry cleanup (best-effort) so expired entitlements are cleared ASAP
+    cleanupExpiredEntitlementsForUser(req.uid)
+      .catch((e) => console.log('⚠️ cleanupExpiredEntitlementsForUser failed:', e?.message || e));
+
     next();
   } catch {
     return res.status(403).json({ success: false, error: "Invalid token" });
   }
 };
 
+
+// Manual trigger from the app (call on app start / Store open)
+// Clears ONLY expired entitlement Until fields (no plan changes).
+app.post("/cleanup-me", verifyFirebaseToken, async (req, res) => {
+  try {
+    await cleanupExpiredEntitlementsForUser(req.uid);
+    return res.json({ success: true });
+  } catch (e) {
+    console.log("❌ /cleanup-me error:", e);
+    return res.status(500).json({ success: false, error: "CLEANUP_FAILED" });
+  }
+});
+
 // ------------------------------------------------------------
 // Health + Version
 // ------------------------------------------------------------
 
-
-// ---- Expiry cleanup (auto) ----
-function toMsFromTimestampLike(v) {
-  if (!v) return null;
-
-  if (typeof v === "number") {
-    return v < 1e12 ? Math.round(v * 1000) : Math.round(v);
-  }
-
-  if (typeof v === "string") {
-    const d = new Date(v);
-    return !isNaN(d.getTime()) ? d.getTime() : null;
-  }
-
-  if (typeof v === "object") {
-    if (typeof v.toDate === "function") {
-      const d = v.toDate();
-      return d instanceof Date && !isNaN(d.getTime()) ? d.getTime() : null;
-    }
-    const sec =
-  ("seconds" in v ? Number(v.seconds) : null) ??
-  ("_seconds" in v ? Number(v._seconds) : null);
-
-const ns =
-  ("nanoseconds" in v ? Number(v.nanoseconds) : null) ??
-  ("_nanoseconds" in v ? Number(v._nanoseconds) : null) ??
-  0;
-
-if (Number.isFinite(sec) && sec > 0) {
-  return sec * 1000 + (Number.isFinite(ns) ? Math.floor(ns / 1e6) : 0);
-}
-  }
-
-  return null;
-}
 
 // ------------------------------------------------------------
 // Expiry cleanup helpers (server-side safety net)
@@ -187,14 +170,6 @@ if (Number.isFinite(sec) && sec > 0) {
 function buildExpiryCleanupPatch(userData, nowMs) {
   const patch = {};
   const currentPlan = (userData && userData.plan) ? String(userData.plan) : "free";
-  const planUntilMs = toMsFromTimestampLike(userData && userData.planUntil);
-
-  // Plan expiry -> revert to FREE (no time-bound FREE)
-  if (planUntilMs && planUntilMs <= nowMs) {
-    patch.plan = "free";
-    patch.planUntil = null;
-    patch.planPeriod = null;
-  }
 
   const ent = (userData && userData.entitlements && typeof userData.entitlements === "object")
     ? userData.entitlements
@@ -215,7 +190,7 @@ function buildExpiryCleanupPatch(userData, nowMs) {
     }
   }
 
-  const effectivePlan = patch.plan || currentPlan;
+  const effectivePlan = currentPlan;
   if (effectivePlan !== "studio") {
     // Prompt Builder is Studio-only; always clear for non-studio
     patch["entitlements.promptBuilderUntil"] = null;
@@ -238,70 +213,6 @@ async function cleanupExpiredEntitlementsForUser(uid) {
 }
 
 
-
-const app = express();
-app.use(express.json({ limit: "10mb" }));
-
-console.log("🔥 RUNNING SERVER FILE:", __filename);
-console.log("🔥 BUILD:", BUILD_TAG);
-
-// ------------------------------------------------------------
-// Firebase Admin init
-// ------------------------------------------------------------
-if (!admin.apps.length) {
-  const sa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-    ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
-    : require("./firebase-admin-key.json");
-
-  admin.initializeApp({
-    credential: admin.credential.cert(sa),
-  });
-}
-
-const db = admin.firestore();
-const expo = new Expo();
-
-// ------------------------------------------------------------
-// Auth middleware
-// ------------------------------------------------------------
-const verifyFirebaseToken = async (req, res, next) => {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token)
-    return res
-      .status(401)
-      .json({ success: false, error: "Missing Bearer token" });
-
-  try {
-    const decoded = await admin.auth().verifyIdToken(token);
-    req.uid = decoded.uid;
-      // Auto-expiry cleanup (best-effort) so expired entitlements are cleared ASAP
-      cleanupExpiredEntitlementsForUser(req.uid)
-        .catch((e) => console.log('⚠️ cleanupExpiredEntitlementsForUser failed:', e?.message || e));
-    next();
-  } catch {
-    return res.status(403).json({ success: false, error: "Invalid token" });
-  }
-};
-
-// Manual trigger from the app (call on app start / Store open)
-// This is a safe no-op if nothing is expired.
-
-app.post("/cleanup-me", verifyFirebaseToken, async (req, res) => {
-  try {
-    await cleanupExpiredEntitlementsForUser(req.uid);
-    return res.json({ success: true });
-  } catch (e) {
-    console.log("❌ /cleanup-me error:", e);
-    return res.status(500).json({ success: false, error: "CLEANUP_FAILED" });
-  }
-});
-
-
-// ------------------------------------------------------------
-// Health + Version
-// ------------------------------------------------------------
-
-// ---- /Expiry cleanup ----
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 app.get("/version", (_, res) => res.json({ ok: true, build: BUILD_TAG }));
