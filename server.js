@@ -1261,7 +1261,7 @@ app.post("/generate-prompt", verifyFirebaseToken, async (req, res) => {
     // - return as "enhanced" prompt (you can swap in an LLM later)
     const enhanced = p.replace(/\s+/g, " ").trim();
 
-    return res.json({ success: true, prompt: enhanced, uid });
+    return res.json({ success: true, prompt: enhanced, enhancedPrompt: enhanced, result: enhanced, uid });
   } catch (e) {
     console.error("❌ /generate-prompt error:", e);
     return res.status(500).json({ success: false, error: "PROMPT_FAILED" });
@@ -1276,7 +1276,7 @@ app.post("/prompt-only", verifyFirebaseToken, async (req, res) => {
     const p = String(prompt || "").trim();
     if (!p) return res.status(400).json({ success: false, error: "MISSING_PROMPT" });
     const enhanced = p.replace(/\s+/g, " ").trim();
-    return res.json({ success: true, prompt: enhanced, uid });
+    return res.json({ success: true, prompt: enhanced, enhancedPrompt: enhanced, result: enhanced, uid });
   } catch (e) {
     console.error("❌ /prompt-only error:", e);
     return res.status(500).json({ success: false, error: "PROMPT_FAILED" });
@@ -1287,6 +1287,7 @@ app.post("/prompt-only", verifyFirebaseToken, async (req, res) => {
 app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (req, res) => {
   try {
     const uid = req.uid;
+    const hasFile = !!req.file;
 
     // In multipart, fields arrive as strings
     const body = req.body || {};
