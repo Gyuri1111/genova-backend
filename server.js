@@ -1434,10 +1434,10 @@ if (isProOrStudio) {
   const existingTplMs = toMsFromTimestampLike(ent0.templatesUntil);
   const existingProPromptMs = toMsFromTimestampLike(ent0.proPromptUntil);
 
-  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, 30));
-  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, 30));
-  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, 30));
-  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, 30));
+  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, days));
+  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, days));
+  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, days));
+  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, days));
             // Prompt Builder is ONLY available with the Studio plan.
 // - When Studio is active: it lasts exactly until planUntil
 // - When switching to any non-Studio plan: clear it (set to null in Firestore)
