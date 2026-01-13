@@ -99,6 +99,13 @@ if (Number.isFinite(sec) && sec > 0) {
 
 
 const app = express();
+
+function getPublicBaseUrl(req) {
+  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
+  const host = req.headers["x-forwarded-host"] || req.get("host");
+  return `${proto}://${host}`;
+}
+
 app.use(express.json({ limit: "10mb" }));
 
 console.log("🔥 RUNNING SERVER FILE:", __filename);
@@ -1139,8 +1146,7 @@ app.get("/my-latest-result", verifyFirebaseToken, async (req, res) => {
     if (!lr) return res.json({ success: true, result: null });
     if (lr.seenAt) return res.json({ success: true, result: null });
 
-    return res.json({
-      success: true,
+    return res.json({ success: true,
       result: {
         id: lr.id || null,
         status: lr.status || null,
@@ -1290,8 +1296,8 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const fps = Math.max(1, Math.min(120, Number(body.fps ?? 30)));
     const resolution = String(body.resolution || body.res || "720p").trim();
 
-    if (!prompt) {
-      return res.status(400).json({ success: false, error: "MISSING_PROMPT" });
+    if (!prompt && !hasFile) {
+      return res.status(400).json({ success: false, error: "MISSING_INPUT" });
     }
 
     // ✅ Billing + plan limits + credit debit (transaction)
@@ -1361,8 +1367,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       console.warn("⚠️ notifyUser failed:", e?.message || e);
     }
 
-    return res.json({
-      success: true,
+    return res.json({ success: true,
       result: { id, status: "ready", url, meta, createdAt },
       billing,
     });
@@ -1505,8 +1510,7 @@ app.post("/buy-addon", verifyFirebaseToken, async (req, res) => {
 
     const result = await buyAddon(uid, addon);
 
-    return res.json({
-      success: true,
+    return res.json({ success: true,
       addon: result.addon,
       cost: result.cost,
       creditsBefore: result.creditsBefore,
@@ -1549,8 +1553,7 @@ app.post("/buy-credits", verifyFirebaseToken, async (req, res) => {
 
     const result = await buyCredits(uid, pack);
 
-    return res.json({
-      success: true,
+    return res.json({ success: true,
       pack: result.pack,
       amount: result.amount,
       creditsBefore: result.creditsBefore,
@@ -1582,8 +1585,7 @@ app.post("/buy-pack", verifyFirebaseToken, async (req, res) => {
       return res.status(400).json({ success: false, error: r.error || "BUY_PACK_FAILED", credits: r.credits });
     }
 
-    return res.json({
-      success: true,
+    return res.json({ success: true,
       credits: r.credits,
       cost: r.cost || 0,
       alreadyOwned: !!r.alreadyOwned,
@@ -1717,8 +1719,7 @@ tx.set(
       return res.status(400).json({ success: false, error: r.error || "BUY_PLAN_FAILED" });
     }
 
-    return res.json({
-      success: true,
+    return res.json({ success: true,
       credits: r.credits,
       cost: r.cost,
       plan: r.plan,
