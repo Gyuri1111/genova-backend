@@ -1438,10 +1438,14 @@ if (isProOrStudio) {
   entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, 30));
   entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, 30));
   entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, 30));
-            // Prompt Builder is ONLY available with the Studio plan and should last exactly until the Studio plan expires.
-            if (planId === "studio") {
-              entUpdates.promptBuilderUntil = admin.firestore.Timestamp.fromMillis(planUntilMs);
-            }
+            // Prompt Builder is ONLY available with the Studio plan.
+// - When Studio is active: it lasts exactly until planUntil
+// - When switching to any non-Studio plan: clear it (set to null in Firestore)
+if (planId === "studio") {
+  entUpdates.promptBuilderUntil = admin.firestore.Timestamp.fromMillis(planUntilMs);
+} else {
+  entUpdates.promptBuilderUntil = null;
+}
 }
 
 tx.set(
