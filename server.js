@@ -192,6 +192,9 @@ const verifyFirebaseToken = async (req, res, next) => {
   try {
     const decoded = await admin.auth().verifyIdToken(token);
     req.uid = decoded.uid;
+      // Auto-expiry cleanup (best-effort) so expired entitlements are cleared ASAP
+      cleanupExpiredEntitlementsForUser(req.uid)
+        .catch((e) => console.log('⚠️ cleanupExpiredEntitlementsForUser failed:', e?.message || e));
     next();
   } catch {
     return res.status(403).json({ success: false, error: "Invalid token" });
