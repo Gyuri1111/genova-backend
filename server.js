@@ -97,6 +97,65 @@ if (Number.isFinite(sec) && sec > 0) {
   return null;
 }
 
+// ------------------------------------------------------------
+// Expiry cleanup helpers (server-side safety net)
+// - Clears expired entitlements and reverts expired plans to FREE
+// - Also ensures promptBuilderUntil is ONLY for Studio plan
+// ------------------------------------------------------------
+function buildExpiryCleanupPatch(userData, nowMs) {
+  const patch = {};
+  const currentPlan = (userData && userData.plan) ? String(userData.plan) : "free";
+  const planUntilMs = toMsFromTimestampLike(userData && userData.planUntil);
+
+  // Plan expiry -> revert to FREE (no time-bound FREE)
+  if (planUntilMs && planUntilMs <= nowMs) {
+    patch.plan = "free";
+    patch.planUntil = null;
+    patch.planPeriod = null;
+  }
+
+  const ent = (userData && userData.entitlements && typeof userData.entitlements === "object")
+    ? userData.entitlements
+    : {};
+
+  const entitlementKeys = [
+    "adFreeUntil",
+    "noWatermarkUntil",
+    "templatesUntil",
+    "proPromptUntil",
+    "promptBuilderUntil",
+  ];
+
+  for (const k of entitlementKeys) {
+    const ms = toMsFromTimestampLike(ent[k]);
+    if (ms && ms <= nowMs) {
+      patch[`entitlements.${k}`] = null;
+    }
+  }
+
+  const effectivePlan = patch.plan || currentPlan;
+  if (effectivePlan !== "studio") {
+    // Prompt Builder is Studio-only; always clear for non-studio
+    patch["entitlements.promptBuilderUntil"] = null;
+  }
+
+  return patch;
+}
+
+async function cleanupExpiredEntitlementsForUser(uid) {
+  const userRef = db.collection("users").doc(uid);
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    if (!snap.exists) return;
+    const userData = snap.data() || {};
+    const patch = buildExpiryCleanupPatch(userData, Date.now());
+    if (Object.keys(patch).length) {
+      tx.update(userRef, patch);
+    }
+  });
+}
+
+
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -138,6 +197,19 @@ const verifyFirebaseToken = async (req, res, next) => {
     return res.status(403).json({ success: false, error: "Invalid token" });
   }
 };
+
+// Manual trigger from the app (call on app start / Store open)
+// This is a safe no-op if nothing is expired.
+app.post("/cleanup-me", verifyFirebaseToken, async (req, res) => {
+  try {
+    await cleanupExpiredEntitlementsForUser(req.uid);
+    return res.json({ success: true });
+  } catch (e) {
+    console.log("❌ /cleanup-me error:", e);
+    return res.status(500).json({ success: false, error: "CLEANUP_FAILED" });
+  }
+});
+
 
 // ------------------------------------------------------------
 // Health + Version
@@ -281,11 +353,11 @@ const MONETIZATION = {
 
 
 // Templates access (time-based) — app may send 7d/30d ids; both grant 30 days by design
-templates_7d: { cost: 20, days: 7, entitlementKey: "templatesUntil" },
+templates_7d: { cost: 20, days: 30, entitlementKey: "templatesUntil" },
 templates_30d: { cost: 50, days: 30, entitlementKey: "templatesUntil" },
 
 // PRO Prompt Pack (time-based) — app may send 7d/30d ids; both grant 30 days by design
-pro_prompt_7d: { cost: 20, days: 7, entitlementKey: "proPromptUntil" },
+pro_prompt_7d: { cost: 20, days: 30, entitlementKey: "proPromptUntil" },
 pro_prompt_30d: { cost: 50, days: 30, entitlementKey: "proPromptUntil" },
   },
 };
@@ -1412,14 +1484,9 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
       
 const nowMs = Date.now();
 
-// ✅ Plan expiry rule:
-// - If the user is buying the SAME plan again (extension), stack from max(now, existingPlanUntil).
-// - If the user is SWITCHING to a DIFFERENT plan, the new plan starts from "now" (no stacking).
+// ✅ Stack planUntil (extend from existing if still active)
 const existingPlanUntilMs = toMsFromTimestampLike(user.planUntil);
-const isSamePlan = (user.plan || "free") === planId;
-const baseForPlanUntilMs = isSamePlan ? Math.max(nowMs, existingPlanUntilMs || 0) : nowMs;
-
-const planUntilMs = addDaysToExpiry(baseForPlanUntilMs, days);
+const planUntilMs = addDaysToExpiry(existingPlanUntilMs, days);
 
 // ✅ Plan-included add-ons:
 // - BASIC: none (do NOT overwrite purchases)
@@ -1434,21 +1501,11 @@ if (isProOrStudio) {
   const existingTplMs = toMsFromTimestampLike(ent0.templatesUntil);
   const existingProPromptMs = toMsFromTimestampLike(ent0.proPromptUntil);
 
-  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, days));
-  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, days));
-  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, days));
-  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, days));
-                  }
-
-      // Prompt Builder is ONLY available for STUDIO plan.
-      // We store it separately from planUntil so it doesn't get 'merged' by plan stacking logic.
-      // - When plan is STUDIO: promptBuilderUntil === planUntil (same expiry)
-      // - When plan is NOT STUDIO: promptBuilderUntil must be null (cleared)
-      if (planId === "studio") {
-        entUpdates.promptBuilderUntil = admin.firestore.Timestamp.fromMillis(planUntilMs);
-      } else {
-        entUpdates.promptBuilderUntil = null;
-      }
+  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, 30));
+  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, 30));
+  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, 30));
+  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, 30));
+}
 
 tx.set(
   userRef,
