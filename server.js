@@ -280,12 +280,12 @@ const MONETIZATION = {
     ad_free_30d: { cost: 50, days: 30, entitlementKey: "adFreeUntil" },
 
 
-// Templates access (time-based)
-templates_7d: { cost: 20, days: 7, entitlementKey: "templatesUntil" },
+// Templates access (time-based) — app may send 7d/30d ids; both grant 30 days by design
+templates_7d: { cost: 20, days: 30, entitlementKey: "templatesUntil" },
 templates_30d: { cost: 50, days: 30, entitlementKey: "templatesUntil" },
 
-// PRO Prompt Pack (time-based)
-pro_prompt_7d: { cost: 20, days: 7, entitlementKey: "proPromptUntil" },
+// PRO Prompt Pack (time-based) — app may send 7d/30d ids; both grant 30 days by design
+pro_prompt_7d: { cost: 20, days: 30, entitlementKey: "proPromptUntil" },
 pro_prompt_30d: { cost: 50, days: 30, entitlementKey: "proPromptUntil" },
   },
 };
@@ -1412,30 +1412,32 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
       
 const nowMs = Date.now();
 
-// ✅ Stack planUntil (extend from existing if still active)
+// ✅ Plan expiry rule:
+// - If the user is buying the SAME plan again (extension), stack from max(now, existingPlanUntil).
+// - If the user is SWITCHING to a DIFFERENT plan, the new plan starts from "now" (no stacking).
 const existingPlanUntilMs = toMsFromTimestampLike(user.planUntil);
-const planUntilMs = addDaysToExpiry(existingPlanUntilMs, days);
+const isSamePlan = (user.plan || "free") === planId;
+const baseForPlanUntilMs = isSamePlan ? Math.max(nowMs, existingPlanUntilMs || 0) : nowMs;
+
+const planUntilMs = addDaysToExpiry(baseForPlanUntilMs, days);
 
 // ✅ Plan-included add-ons:
 // - BASIC: none (do NOT overwrite purchases)
-// - PRO / STUDIO: ad-free + no-watermark + templates + pro prompt (each stacks purchased plan days)
+// - PRO / STUDIO: ad-free + no-watermark + templates + pro prompt (each stacks 30 days)
 const ent0 = (user.entitlements && typeof user.entitlements === "object") ? user.entitlements : {};
 const isProOrStudio = planId === "pro" || planId === "studio";
 
 const entUpdates = {};
-// If user switches away from Studio, Prompt Builder must turn off.
-entUpdates.promptBuilderUntil = planId === "studio" ? admin.firestore.Timestamp.fromMillis(planUntilMs) : null;
-
 if (isProOrStudio) {
   const existingAdFreeMs = toMsFromTimestampLike(ent0.adFreeUntil);
   const existingNoWmMs = toMsFromTimestampLike(ent0.noWatermarkUntil);
   const existingTplMs = toMsFromTimestampLike(ent0.templatesUntil);
   const existingProPromptMs = toMsFromTimestampLike(ent0.proPromptUntil);
 
-  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, days));
-  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, days));
-  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, days));
-  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, days));
+  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, 30));
+  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, 30));
+  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, 30));
+  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, 30));
 }
 
 tx.set(
