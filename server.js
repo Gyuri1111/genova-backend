@@ -1492,9 +1492,12 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
 const nowMs = Date.now();
 
 // ✅ Stack planUntil (extend from existing if still active)
-const existingPlanUntilMs = toMsFromTimestampLike(user.planUntil);
-const planUntilMs = addDaysToExpiry(existingPlanUntilMs, days);
+const nowMs = Date.now();
 
+      // ✅ Plan purchase rule (NO STACKING):
+      // - Plan change: reset to now + days
+      // - Same plan repurchase: reset to now + days
+      const planUntilMs = nowMs + days * 24 * 60 * 60 * 1000;
 // ✅ Plan-included add-ons:
 // - BASIC: none (do NOT overwrite purchases)
 // - PRO / STUDIO: ad-free + no-watermark + templates + pro prompt (each stacks 30 days)
