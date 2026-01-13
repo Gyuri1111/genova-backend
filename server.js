@@ -201,6 +201,15 @@ function buildExpiryCleanupPatch(userData, nowMs) {
   if (effectivePlan !== "studio") {
     // Prompt Builder is Studio-only; always clear for non-studio
     patch["entitlements.promptBuilderUntil"] = null;
+  } else {
+    // Studio plan active: keep Prompt Builder aligned with planUntil
+    const studioPlanUntilMs = toMsFromTimestampLike(userData?.planUntil);
+    if (studioPlanUntilMs) {
+      patch["entitlements.promptBuilderUntil"] = admin.firestore.Timestamp.fromMillis(studioPlanUntilMs);
+    } else {
+      // If somehow planUntil missing, be safe and clear
+      patch["entitlements.promptBuilderUntil"] = null;
+    }
   }
 
   return patch;
@@ -359,12 +368,12 @@ const MONETIZATION = {
     ad_free_30d: { cost: 50, days: 30, entitlementKey: "adFreeUntil" },
 
 
-// Templates access (time-based) — app may send 7d/30d ids; both grant 30 days by design
-templates_7d: { cost: 20, days: 30, entitlementKey: "templatesUntil" },
+// Templates access (time-based) — 7d and 30d grant their respective durations
+templates_7d: { cost: 20, days: 7, entitlementKey: "templatesUntil" },
 templates_30d: { cost: 50, days: 30, entitlementKey: "templatesUntil" },
 
-// PRO Prompt Pack (time-based) — app may send 7d/30d ids; both grant 30 days by design
-pro_prompt_7d: { cost: 20, days: 30, entitlementKey: "proPromptUntil" },
+// PRO Prompt Pack (time-based) — 7d and 30d grant their respective durations
+pro_prompt_7d: { cost: 20, days: 7, entitlementKey: "proPromptUntil" },
 pro_prompt_30d: { cost: 50, days: 30, entitlementKey: "proPromptUntil" },
   },
 };
@@ -1514,6 +1523,15 @@ if (isProOrStudio) {
   entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, 30));
   entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, 30));
   entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, 30));
+}
+
+// ✅ Prompt Builder: Studio-only AND duration must match Studio planUntil exactly
+// - If buying Studio: set promptBuilderUntil = planUntil (no stacking)
+// - If buying non-Studio: clear promptBuilderUntil immediately
+if (planId === "studio") {
+  entUpdates.promptBuilderUntil = admin.firestore.Timestamp.fromMillis(planUntilMs);
+} else {
+  entUpdates.promptBuilderUntil = null;
 }
 
 tx.set(
