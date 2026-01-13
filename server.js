@@ -1492,7 +1492,6 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
 const nowMs = Date.now();
 
 // ✅ Stack planUntil (extend from existing if still active)
-const nowMs = Date.now();
 
       // ✅ Plan purchase rule (NO STACKING):
       // - Plan change: reset to now + days
