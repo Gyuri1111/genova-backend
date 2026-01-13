@@ -281,11 +281,11 @@ const MONETIZATION = {
 
 
 // Templates access (time-based) — app may send 7d/30d ids; both grant 30 days by design
-templates_7d: { cost: 20, days: 30, entitlementKey: "templatesUntil" },
+templates_7d: { cost: 20, days: 7, entitlementKey: "templatesUntil" },
 templates_30d: { cost: 50, days: 30, entitlementKey: "templatesUntil" },
 
 // PRO Prompt Pack (time-based) — app may send 7d/30d ids; both grant 30 days by design
-pro_prompt_7d: { cost: 20, days: 30, entitlementKey: "proPromptUntil" },
+pro_prompt_7d: { cost: 20, days: 7, entitlementKey: "proPromptUntil" },
 pro_prompt_30d: { cost: 50, days: 30, entitlementKey: "proPromptUntil" },
   },
 };
