@@ -1403,6 +1403,7 @@ app.post("/buy-plan", verifyFirebaseToken, async (req, res) => {
       if (!snap.exists) return { ok: false, error: "USER_NOT_FOUND" };
 
       const user = snap.data() || {};
+      const userData = user;
       const credits = Number(user.credits || 0);
 
       if (credits < cost) {
