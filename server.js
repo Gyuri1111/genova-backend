@@ -1224,6 +1224,156 @@ async function genFromImage(inp, out) {
   fs.copyFileSync(inp, out);
 }
 
+
+// ----------------------------------------------------
+// Generation routes (video + prompt) — required by app
+// ----------------------------------------------------
+
+// Serve a tiny placeholder MP4 so the app always receives a playable URL
+app.get("/placeholder.mp4", (req, res) => {
+  try {
+    const buf = Buffer.from(PLACEHOLDER_MP4_BASE64, "base64");
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Length", String(buf.length));
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(buf);
+  } catch (e) {
+    return res.status(500).send("placeholder_error");
+  }
+});
+
+// Prompt-only (used by Prompt Builder / prompt enhancement flows)
+app.post("/generate-prompt", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const { prompt } = req.body || {};
+    const p = String(prompt || "").trim();
+    if (!p) return res.status(400).json({ success: false, error: "MISSING_PROMPT" });
+
+    // For now we keep it deterministic and safe:
+    // - normalize whitespace
+    // - return as "enhanced" prompt (you can swap in an LLM later)
+    const enhanced = p.replace(/\s+/g, " ").trim();
+
+    return res.json({ success: true, prompt: enhanced, uid });
+  } catch (e) {
+    console.error("❌ /generate-prompt error:", e);
+    return res.status(500).json({ success: false, error: "PROMPT_FAILED" });
+  }
+});
+
+// Backwards-compatible alias (if any older client calls it)
+app.post("/prompt-only", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const { prompt } = req.body || {};
+    const p = String(prompt || "").trim();
+    if (!p) return res.status(400).json({ success: false, error: "MISSING_PROMPT" });
+    const enhanced = p.replace(/\s+/g, " ").trim();
+    return res.json({ success: true, prompt: enhanced, uid });
+  } catch (e) {
+    console.error("❌ /prompt-only error:", e);
+    return res.status(500).json({ success: false, error: "PROMPT_FAILED" });
+  }
+});
+
+// Main video generation route (HomeScreen uses multipart FormData with optional file)
+app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (req, res) => {
+  try {
+    const uid = req.uid;
+
+    // In multipart, fields arrive as strings
+    const body = req.body || {};
+    const prompt = String(body.prompt || body.text || "").trim();
+    const model = String(body.model || "kling").trim();
+    const lengthSec = Math.max(1, Math.min(60, Number(body.lengthSec ?? body.length ?? 5)));
+    const fps = Math.max(1, Math.min(120, Number(body.fps ?? 30)));
+    const resolution = String(body.resolution || body.res || "720p").trim();
+
+    if (!prompt) {
+      return res.status(400).json({ success: false, error: "MISSING_PROMPT" });
+    }
+
+    // ✅ Billing + plan limits + credit debit (transaction)
+    const billing = await ensureTrialValidateAndDebit(uid, {
+      model,
+      lengthSec,
+      fps,
+      resolution,
+    });
+
+    // Build result skeleton
+    const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const createdAt = admin.firestore.Timestamp.now();
+
+    const meta = {
+      model,
+      lengthSec,
+      fps,
+      resolution,
+      watermarkApplied: !!billing?.watermarkApplied,
+      cost: billing?.cost ?? null,
+      breakdown: billing?.breakdown ?? {},
+      hasImage: !!req.file,
+    };
+
+    // Mark as processing first
+    await setLastResult(uid, {
+      id,
+      status: "processing",
+      title: "",
+      message: "",
+      url: "",
+      meta,
+      createdAt,
+    });
+
+    // --- Placeholder "generation" (replace with real provider call later) ---
+    // We serve a static placeholder mp4 from this server.
+    const baseUrl = `https://${req.get("host")}`;
+    const url = `${baseUrl}/placeholder.mp4`;
+
+    // Mark as ready
+    await setLastResult(uid, {
+      id,
+      status: "ready",
+      title: "",
+      message: "",
+      url,
+      meta,
+      createdAt,
+    });
+
+    // Send push/email if enabled
+    try {
+      await notifyUser({
+        uid,
+        type: "video",
+        data: {
+          url,
+          model,
+          lengthSec,
+          fps,
+          resolution,
+        },
+      });
+    } catch (e) {
+      console.warn("⚠️ notifyUser failed:", e?.message || e);
+    }
+
+    return res.json({
+      success: true,
+      result: { id, status: "ready", url, meta, createdAt },
+      billing,
+    });
+  } catch (e) {
+    console.error("❌ /generate-video error:", e);
+    const code = e?.code || e?.message || "GENERATE_FAILED";
+    return res.status(400).json({ success: false, error: code, meta: e?.meta || null });
+  }
+});
+
+
 // ------------------------------------------------------------
 // 🎬 MAIN ROUTE — prompt + image support + notifyUser (C1 + D)
 //          + lastResult write for offline recovery
