@@ -8,6 +8,7 @@ const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 
 // ===== Render key bootstrap (CommonJS safe) =====
 function writeJsonKeyFileIfMissing(relPath, envVarName) {
@@ -1218,6 +1219,43 @@ const storage = new Storage({
 const bucket = storage.bucket("genova-27d76.firebasestorage.app");
 
 // ------------------------------------------------------------
+// ✅ Firebase Storage upload helper (GCS bucket backing Firebase Storage)
+// - Uploads the generated MP4 to the bucket and returns a long-lived signed URL
+// ------------------------------------------------------------
+async function uploadMp4ToFirebaseStorage({ localPath, uid, id }) {
+  if (!localPath) throw new Error("MISSING_LOCAL_PATH");
+  if (!uid) throw new Error("MISSING_UID");
+  if (!id) throw new Error("MISSING_ID");
+
+  const dest = `videos/${uid}/${id}.mp4`;
+
+  await bucket.upload(localPath, {
+    destination: dest,
+    resumable: false,
+    metadata: {
+      contentType: "video/mp4",
+      cacheControl: "public,max-age=31536000",
+    },
+  });
+
+  const file = bucket.file(dest);
+
+  // Long-lived signed URL (10 years) so the app can always play it
+  const tenYearsMs = 10 * 365 * 24 * 60 * 60 * 1000;
+  const [signedUrl] = await file.getSignedUrl({
+    version: "v4",
+    action: "read",
+    expires: Date.now() + tenYearsMs,
+  });
+
+  return {
+    url: signedUrl,
+    path: dest,
+    gsPath: `gs://${bucket.name}/${dest}`,
+  };
+}
+
+// ------------------------------------------------------------
 // Dummy generators (placeholder)
 // ------------------------------------------------------------
 const PLACEHOLDER_MP4_BASE64 =
@@ -1313,6 +1351,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const createdAt = admin.firestore.Timestamp.now();
 
+    // We'll fill storage fields after upload
     const meta = {
       model,
       lengthSec,
@@ -1335,51 +1374,86 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       createdAt,
     });
 
-    // --- Placeholder "generation" (replace with real provider call later) ---
-    // We serve a static placeholder mp4 from this server.
-    const baseUrl = getPublicBaseUrl(req);
-    const url = `${baseUrl}/placeholder.mp4`;
+    // ------------------------------------------------------------
+    // ✅ Generate a local MP4 (placeholder pipeline for now),
+    // then upload it to Firebase Storage (GCS bucket)
+    // ------------------------------------------------------------
+    const tmpOut = path.join(os.tmpdir(), `${id}.mp4`);
 
-    // Mark as ready
-    await setLastResult(uid, {
-      id,
-      status: "ready",
-      title: "",
-      message: "",
-      url,
-      meta,
-      createdAt,
-    });
-
-    // Send push/email if enabled
     try {
-      await notifyUser({
-        uid,
-        type: "video",
-        data: {
-          url,
-          model,
-          lengthSec,
-          fps,
-          resolution,
-        },
-      });
-    } catch (e) {
-      console.warn("⚠️ notifyUser failed:", e?.message || e);
-    }
+      if (hasFile) {
+        await genFromImage(req.file.path, tmpOut);
+      } else {
+        await genFromPrompt(tmpOut);
+      }
 
-    return res.json({ success: true,
-      videoUrl: url,
-      resultId: id,
-      result: { id, status: "ready", url, meta, createdAt },
-      billing,
-    });
+      const uploaded = await uploadMp4ToFirebaseStorage({ localPath: tmpOut, uid, id });
+      const url = uploaded.url;
+
+      // Mark as ready with the REAL Storage URL
+      await setLastResult(uid, {
+        id,
+        status: "ready",
+        title: "",
+        message: "",
+        url,
+        meta: {
+          ...meta,
+          storagePath: uploaded.path,
+          gsPath: uploaded.gsPath,
+        },
+        createdAt,
+      });
+
+      // Send push/email if enabled
+      try {
+        await notifyUser({
+          uid,
+          type: "video",
+          data: {
+            videoUrl: url, // email template expects this
+            url,
+            model,
+            lengthSec,
+            fps,
+            resolution,
+          },
+        });
+      } catch (e) {
+        console.warn("⚠️ notifyUser failed:", e?.message || e);
+      }
+
+      return res.json({
+        success: true,
+        videoUrl: url,
+        resultId: id,
+        result: {
+          id,
+          status: "ready",
+          url,
+          meta: { ...meta, storagePath: uploaded.path, gsPath: uploaded.gsPath },
+          createdAt,
+        },
+        billing,
+      });
+    } finally {
+      // cleanup temp output
+      try {
+        if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut);
+      } catch (_) {}
+
+      // cleanup uploaded image temp (multer)
+      try {
+        if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      } catch (_) {}
+    }
   } catch (e) {
     console.error("❌ /generate-video error:", e);
     const code = e?.code || e?.message || "GENERATE_FAILED";
     return res.status(400).json({ success: false, error: code, meta: e?.meta || null });
   }
 });
+
 
 
 // ------------------------------------------------------------
