@@ -1287,7 +1287,6 @@ app.post("/prompt-only", verifyFirebaseToken, async (req, res) => {
 app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (req, res) => {
   try {
     const uid = req.uid;
-    const hasFile = !!req.file;
 
     // In multipart, fields arrive as strings
     const body = req.body || {};
@@ -1296,6 +1295,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const lengthSec = Math.max(1, Math.min(60, Number(body.lengthSec ?? body.length ?? 5)));
     const fps = Math.max(1, Math.min(120, Number(body.fps ?? 30)));
     const resolution = String(body.resolution || body.res || "720p").trim();
+    const hasFile = !!req.file;
 
     if (!prompt && !hasFile) {
       return res.status(400).json({ success: false, error: "MISSING_INPUT" });
@@ -1337,7 +1337,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
 
     // --- Placeholder "generation" (replace with real provider call later) ---
     // We serve a static placeholder mp4 from this server.
-    const baseUrl = `https://${req.get("host")}`;
+    const baseUrl = getPublicBaseUrl(req);
     const url = `${baseUrl}/placeholder.mp4`;
 
     // Mark as ready
@@ -1369,6 +1369,8 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     }
 
     return res.json({ success: true,
+      videoUrl: url,
+      resultId: id,
       result: { id, status: "ready", url, meta, createdAt },
       billing,
     });
