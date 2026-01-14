@@ -9,6 +9,7 @@ const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { v4: uuidv4 } = require("uuid");
 
 // ===== Render key bootstrap (CommonJS safe) =====
 function writeJsonKeyFileIfMissing(relPath, envVarName) {
@@ -1220,7 +1221,8 @@ const bucket = storage.bucket("genova-27d76.firebasestorage.app");
 
 // ------------------------------------------------------------
 // ✅ Firebase Storage upload helper (GCS bucket backing Firebase Storage)
-// - Uploads the generated MP4 to the bucket and returns a long-lived signed URL
+// - Uploads the generated MP4 to the bucket and returns a Firebase download URL (token-based, long-lived)
+//   NOTE: GCS V4 signed URLs are limited to max 7 days, so we use Firebase download tokens instead.
 // ------------------------------------------------------------
 async function uploadMp4ToFirebaseStorage({ localPath, uid, id }) {
   if (!localPath) throw new Error("MISSING_LOCAL_PATH");
@@ -1228,6 +1230,7 @@ async function uploadMp4ToFirebaseStorage({ localPath, uid, id }) {
   if (!id) throw new Error("MISSING_ID");
 
   const dest = `videos/${uid}/${id}.mp4`;
+  const token = uuidv4();
 
   await bucket.upload(localPath, {
     destination: dest,
@@ -1235,23 +1238,21 @@ async function uploadMp4ToFirebaseStorage({ localPath, uid, id }) {
     metadata: {
       contentType: "video/mp4",
       cacheControl: "public,max-age=31536000",
+      metadata: {
+        firebaseStorageDownloadTokens: token,
+      },
     },
   });
 
-  const file = bucket.file(dest);
-
-  // Long-lived signed URL (10 years) so the app can always play it
-  const tenYearsMs = 10 * 365 * 24 * 60 * 60 * 1000;
-  const [signedUrl] = await file.getSignedUrl({
-    version: "v4",
-    action: "read",
-    expires: Date.now() + tenYearsMs,
-  });
+  // Firebase token download URL (works for Firebase Storage-backed buckets)
+  const encoded = encodeURIComponent(dest);
+  const url = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encoded}?alt=media&token=${token}`;
 
   return {
-    url: signedUrl,
+    url,
     path: dest,
     gsPath: `gs://${bucket.name}/${dest}`,
+    token,
   };
 }
 
