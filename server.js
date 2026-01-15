@@ -8,6 +8,20 @@ const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const { v4: uuidv4 } = require("uuid");
+
+// Thumbnail extraction (first frame)
+let ffmpeg;
+let ffmpegPath;
+try {
+  ffmpeg = require("fluent-ffmpeg");
+  ffmpegPath = require("ffmpeg-static");
+  if (ffmpeg && ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
+} catch (e) {
+  console.warn("⚠️ ffmpeg not available (install fluent-ffmpeg + ffmpeg-static)");
+}
+
 
 // ===== Render key bootstrap (CommonJS safe) =====
 function writeJsonKeyFileIfMissing(relPath, envVarName) {
@@ -99,6 +113,12 @@ if (Number.isFinite(sec) && sec > 0) {
 
 
 const app = express();
+
+// ------------------------------------------------------------
+// ✅ Share host + OG image configuration
+// ------------------------------------------------------------
+const SHARE_HOST = process.env.SHARE_HOST || "https://genova-labs.hu";
+const OG_FALLBACK_IMAGE = process.env.OG_FALLBACK_IMAGE || "https://genova-labs.hu/assets/og/genova-og.jpg";
 
 function getPublicBaseUrl(req) {
   const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
@@ -1781,9 +1801,9 @@ app.get("/s/:id", async (req, res) => {
     const title = `GeNova AI Video (${model}${lengthSec ? ` • ${lengthSec}s` : ""})`;
 
     // Use a stable image for previews (you can replace with your own OG image later)
-    const ogImage = "https://genova-labs.hu/assets/og/genova-og.jpg";
+    const ogImage = String(data.thumbUrl || meta.thumbUrl || OG_FALLBACK_IMAGE);
 
-    const directUrl = `${req.protocol}://${req.get("host")}/v/${encodeURIComponent(id)}`;
+    const directUrl = `${SHARE_HOST}/v/${encodeURIComponent(id)}`;
 
     const descParts = [];
     if (resolution) descParts.push(`Resolution: ${resolution}`);
@@ -1800,7 +1820,7 @@ app.get("/s/:id", async (req, res) => {
   <meta property="og:description" content="${escapeHtml(desc)}" />
   <meta property="og:type" content="website" />
   <meta property="og:image" content="${escapeHtml(ogImage)}" />
-  <meta property="og:url" content="${escapeHtml(req.originalUrl)}" />
+  <meta property="og:url" content="${escapeHtml(`${SHARE_HOST}/s/${encodeURIComponent(id)}`)}" />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="robots" content="noindex" />
   <style>
