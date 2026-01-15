@@ -1205,6 +1205,23 @@ app.post("/mark-result-seen", verifyFirebaseToken, async (req, res) => {
   }
 });
 
+
+// ------------------------------------------------------------
+// ✅ Creations subcollection helpers
+// ------------------------------------------------------------
+async function setCreation(uid, id, payload) {
+  if (!uid || !id) return;
+  const ref = db.collection("users").doc(uid).collection("creations").doc(id);
+  await ref.set(
+    {
+      id,
+      ...payload,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+}
+
 // ------------------------------------------------------------
 // Upload (multer)
 // ------------------------------------------------------------
@@ -1375,6 +1392,14 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       createdAt,
     });
 
+    // Also write to creations list (processing)
+    await setCreation(uid, id, {
+      status: "processing",
+      createdAt,
+      prompt,
+      meta,
+    });
+
     // ------------------------------------------------------------
     // ✅ Generate a local MP4 (placeholder pipeline for now),
     // then upload it to Firebase Storage (GCS bucket)
@@ -1404,6 +1429,14 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
           gsPath: uploaded.gsPath,
         },
         createdAt,
+      });
+
+      // Update creations list (ready)
+      await setCreation(uid, id, {
+        status: "ready",
+        completedAt: admin.firestore.FieldValue.serverTimestamp(),
+        url,
+        meta: { ...meta, storagePath: uploaded.path, gsPath: uploaded.gsPath },
       });
 
       // Send push/email if enabled
