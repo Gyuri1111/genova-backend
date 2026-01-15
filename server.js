@@ -8,8 +8,6 @@ const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
-const { v4: uuidv4 } = require("uuid");
 
 // ===== Render key bootstrap (CommonJS safe) =====
 function writeJsonKeyFileIfMissing(relPath, envVarName) {
@@ -1205,23 +1203,6 @@ app.post("/mark-result-seen", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-
-// ------------------------------------------------------------
-// ✅ Creations subcollection helpers
-// ------------------------------------------------------------
-async function setCreation(uid, id, payload) {
-  if (!uid || !id) return;
-  const ref = db.collection("users").doc(uid).collection("creations").doc(id);
-  await ref.set(
-    {
-      id,
-      ...payload,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
-}
-
 // ------------------------------------------------------------
 // Upload (multer)
 // ------------------------------------------------------------
@@ -1235,43 +1216,6 @@ const storage = new Storage({
   keyFilename: "./google-cloud-key.json",
 });
 const bucket = storage.bucket("genova-27d76.firebasestorage.app");
-
-// ------------------------------------------------------------
-// ✅ Firebase Storage upload helper (GCS bucket backing Firebase Storage)
-// - Uploads the generated MP4 to the bucket and returns a Firebase download URL (token-based, long-lived)
-//   NOTE: GCS V4 signed URLs are limited to max 7 days, so we use Firebase download tokens instead.
-// ------------------------------------------------------------
-async function uploadMp4ToFirebaseStorage({ localPath, uid, id }) {
-  if (!localPath) throw new Error("MISSING_LOCAL_PATH");
-  if (!uid) throw new Error("MISSING_UID");
-  if (!id) throw new Error("MISSING_ID");
-
-  const dest = `videos/${uid}/${id}.mp4`;
-  const token = uuidv4();
-
-  await bucket.upload(localPath, {
-    destination: dest,
-    resumable: false,
-    metadata: {
-      contentType: "video/mp4",
-      cacheControl: "public,max-age=31536000",
-      metadata: {
-        firebaseStorageDownloadTokens: token,
-      },
-    },
-  });
-
-  // Firebase token download URL (works for Firebase Storage-backed buckets)
-  const encoded = encodeURIComponent(dest);
-  const url = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encoded}?alt=media&token=${token}`;
-
-  return {
-    url,
-    path: dest,
-    gsPath: `gs://${bucket.name}/${dest}`,
-    token,
-  };
-}
 
 // ------------------------------------------------------------
 // Dummy generators (placeholder)
@@ -1369,7 +1313,6 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const createdAt = admin.firestore.Timestamp.now();
 
-    // We'll fill storage fields after upload
     const meta = {
       model,
       lengthSec,
@@ -1392,102 +1335,51 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       createdAt,
     });
 
-    // Also write to creations list (processing)
-    await setCreation(uid, id, {
-      status: "processing",
-      createdAt,
-      prompt,
+    // --- Placeholder "generation" (replace with real provider call later) ---
+    // We serve a static placeholder mp4 from this server.
+    const baseUrl = getPublicBaseUrl(req);
+    const url = `${baseUrl}/placeholder.mp4`;
+
+    // Mark as ready
+    await setLastResult(uid, {
+      id,
+      status: "ready",
+      title: "",
+      message: "",
+      url,
       meta,
+      createdAt,
     });
 
-    // ------------------------------------------------------------
-    // ✅ Generate a local MP4 (placeholder pipeline for now),
-    // then upload it to Firebase Storage (GCS bucket)
-    // ------------------------------------------------------------
-    const tmpOut = path.join(os.tmpdir(), `${id}.mp4`);
-
+    // Send push/email if enabled
     try {
-      if (hasFile) {
-        await genFromImage(req.file.path, tmpOut);
-      } else {
-        await genFromPrompt(tmpOut);
-      }
-
-      const uploaded = await uploadMp4ToFirebaseStorage({ localPath: tmpOut, uid, id });
-      const url = uploaded.url;
-
-      // Mark as ready with the REAL Storage URL
-      await setLastResult(uid, {
-        id,
-        status: "ready",
-        title: "",
-        message: "",
-        url,
-        meta: {
-          ...meta,
-          storagePath: uploaded.path,
-          gsPath: uploaded.gsPath,
-        },
-        createdAt,
-      });
-
-      // Update creations list (ready)
-      await setCreation(uid, id, {
-        status: "ready",
-        completedAt: admin.firestore.FieldValue.serverTimestamp(),
-        url,
-        meta: { ...meta, storagePath: uploaded.path, gsPath: uploaded.gsPath },
-      });
-
-      // Send push/email if enabled
-      try {
-        await notifyUser({
-          uid,
-          type: "video",
-          data: {
-            videoUrl: url, // email template expects this
-            url,
-            model,
-            lengthSec,
-            fps,
-            resolution,
-          },
-        });
-      } catch (e) {
-        console.warn("⚠️ notifyUser failed:", e?.message || e);
-      }
-
-      return res.json({
-        success: true,
-        videoUrl: url,
-        resultId: id,
-        result: {
-          id,
-          status: "ready",
+      await notifyUser({
+        uid,
+        type: "video",
+        data: {
           url,
-          meta: { ...meta, storagePath: uploaded.path, gsPath: uploaded.gsPath },
-          createdAt,
+          model,
+          lengthSec,
+          fps,
+          resolution,
         },
-        billing,
       });
-    } finally {
-      // cleanup temp output
-      try {
-        if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut);
-      } catch (_) {}
-
-      // cleanup uploaded image temp (multer)
-      try {
-        if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-      } catch (_) {}
+    } catch (e) {
+      console.warn("⚠️ notifyUser failed:", e?.message || e);
     }
+
+    return res.json({ success: true,
+      videoUrl: url,
+      resultId: id,
+      result: { id, status: "ready", url, meta, createdAt },
+      billing,
+    });
   } catch (e) {
     console.error("❌ /generate-video error:", e);
     const code = e?.code || e?.message || "GENERATE_FAILED";
     return res.status(400).json({ success: false, error: code, meta: e?.meta || null });
   }
 });
-
 
 
 // ------------------------------------------------------------
@@ -1846,6 +1738,110 @@ tx.set(
 // START
 // ------------------------------------------------------------
 const PORT = process.env.PORT ? Number(process.env.PORT) : 5000;
+// ------------------------------------------------------------
+// ✅ Public share links (pretty URLs for Messenger/WhatsApp previews)
+// - /s/:id  -> HTML page with OG tags + button (best for sharing)
+// - /v/:id  -> 302 redirect to the real Firebase Storage URL (direct download/play)
+// Works without uid by using collectionGroup('creations') where field 'id' == :id
+// ------------------------------------------------------------
+app.get("/v/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).send("Missing id");
+
+    const q = await db.collectionGroup("creations").where("id", "==", id).limit(1).get();
+    if (q.empty) return res.status(404).send("Not found");
+
+    const data = q.docs[0].data() || {};
+    const url = String(data.url || "").trim();
+    if (!url) return res.status(404).send("No URL");
+
+    res.set("Cache-Control", "public, max-age=300");
+    return res.redirect(302, url);
+  } catch (e) {
+    console.error("❌ share redirect error:", e);
+    return res.status(500).send("Error");
+  }
+});
+
+app.get("/s/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).send("Missing id");
+
+    const q = await db.collectionGroup("creations").where("id", "==", id).limit(1).get();
+    if (q.empty) return res.status(404).send("Not found");
+
+    const data = q.docs[0].data() || {};
+    const meta = data.meta || {};
+    const model = String(meta.model || data.model || "GeNova");
+    const lengthSec = String(meta.lengthSec || data.lengthSec || data.length || data.videoLength || "");
+    const resolution = String(meta.resolution || data.resolution || "");
+    const fps = String(meta.fps || data.fps || "");
+    const title = `GeNova AI Video (${model}${lengthSec ? ` • ${lengthSec}s` : ""})`;
+
+    // Use a stable image for previews (you can replace with your own OG image later)
+    const ogImage = "https://genova-labs.hu/assets/og/genova-og.jpg";
+
+    const directUrl = `${req.protocol}://${req.get("host")}/v/${encodeURIComponent(id)}`;
+
+    const descParts = [];
+    if (resolution) descParts.push(`Resolution: ${resolution}`);
+    if (fps) descParts.push(`FPS: ${fps}`);
+    const desc = descParts.length ? descParts.join(" • ") : "Generated with GeNova";
+
+    const htmlDoc = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(title)}</title>
+  <meta property="og:title" content="${escapeHtml(title)}" />
+  <meta property="og:description" content="${escapeHtml(desc)}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:image" content="${escapeHtml(ogImage)}" />
+  <meta property="og:url" content="${escapeHtml(req.originalUrl)}" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="robots" content="noindex" />
+  <style>
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#05070D;color:#E5E7EB}
+    .wrap{max-width:740px;margin:0 auto;padding:28px}
+    .card{background:rgba(255,255,255,0.06);border:1px solid rgba(51,230,255,0.25);border-radius:18px;padding:18px}
+    .h{font-weight:700;font-size:18px;margin:0 0 10px}
+    .p{opacity:.82;margin:0 0 16px}
+    a.btn{display:inline-block;background:rgba(51,230,255,0.18);border:1px solid rgba(51,230,255,0.6);color:#E5E7EB;text-decoration:none;padding:10px 14px;border-radius:12px;font-weight:600}
+    .small{opacity:.7;font-size:12px;margin-top:10px;word-break:break-all}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <p class="h">${escapeHtml(title)}</p>
+      <p class="p">${escapeHtml(desc)}</p>
+      <a class="btn" href="${escapeHtml(directUrl)}">Download / Open</a>
+      <div class="small">${escapeHtml(directUrl)}</div>
+    </div>
+  </div>
+</body>
+</html>`;
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.set("Cache-Control", "public, max-age=300");
+    return res.status(200).send(htmlDoc);
+  } catch (e) {
+    console.error("❌ share page error:", e);
+    return res.status(500).send("Error");
+  }
+});
+
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
