@@ -1769,35 +1769,17 @@ app.get("/v/:id", async (req, res) => {
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).send("Missing id");
 
-    let docSnap = null;
+    const q = await db.collectionGroup("creations").where("id", "==", id).limit(1).get();
+    if (q.empty) return res.status(404).send("Not found");
 
-    try {
-      const q = await db.collectionGroup("creations").where("shareId", "==", id).limit(1).get();
-      if (!q.empty) docSnap = q.docs[0];
-    } catch (_) {}
-
-    if (!docSnap) {
-      try {
-        const q2 = await db
-          .collectionGroup("creations")
-          .where(admin.firestore.FieldPath.documentId(), "==", id)
-          .limit(1)
-          .get();
-        if (!q2.empty) docSnap = q2.docs[0];
-      } catch (_) {}
-    }
-
-    if (!docSnap) return res.status(404).send("Not found");
-
-    const data = docSnap.data() || {};
-    const meta = data.meta || {};
-    const url = String(data.videoUrl || data.url || data.resultUrl || meta.videoUrl || meta.url || "").trim();
+    const data = q.docs[0].data() || {};
+    const url = String(data.url || "").trim();
     if (!url) return res.status(404).send("No URL");
 
     res.set("Cache-Control", "public, max-age=300");
     return res.redirect(302, url);
   } catch (e) {
-    console.error("❌ /v/:id error:", e);
+    console.error("❌ share redirect error:", e);
     return res.status(500).send("Error");
   }
 });
@@ -1807,92 +1789,66 @@ app.get("/s/:id", async (req, res) => {
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).send("Missing id");
 
-    // Find by shareId OR docId across users: users/{uid}/creations/{cid}
-    let docSnap = null;
+    const q = await db.collectionGroup("creations").where("id", "==", id).limit(1).get();
+    if (q.empty) return res.status(404).send("Not found");
 
-    try {
-      const q = await db.collectionGroup("creations").where("shareId", "==", id).limit(1).get();
-      if (!q.empty) docSnap = q.docs[0];
-    } catch (_) {}
-
-    if (!docSnap) {
-      try {
-        const q2 = await db
-          .collectionGroup("creations")
-          .where(admin.firestore.FieldPath.documentId(), "==", id)
-          .limit(1)
-          .get();
-        if (!q2.empty) docSnap = q2.docs[0];
-      } catch (_) {}
-    }
-
-    if (!docSnap) return res.status(404).send("Not found");
-
-    const data = docSnap.data() || {};
+    const data = q.docs[0].data() || {};
     const meta = data.meta || {};
-
     const model = String(meta.model || data.model || "GeNova");
-    const lengthSec = meta.lengthSec ?? meta.length ?? data.lengthSec ?? data.length ?? data.videoLength ?? "";
+    const lengthSec = String(meta.lengthSec || data.lengthSec || data.length || data.videoLength || "");
     const resolution = String(meta.resolution || data.resolution || "");
-    const fps = meta.fps ?? data.fps ?? "";
+    const fps = String(meta.fps || data.fps || "");
+    const title = `GeNova AI Video (${model}${lengthSec ? ` • ${lengthSec}s` : ""})`;
 
-    const ogImage =
-      String(
-        meta.thumbUrl ||
-          data.thumbUrl ||
-          meta.thumbnailUrl ||
-          data.thumbnailUrl ||
-          data.sourceImageUrl ||
-          data.imageUrl ||
-          data.inputImageUrl ||
-          OG_FALLBACK_IMAGE
-      ) || OG_FALLBACK_IMAGE;
+    // Use a stable image for previews (you can replace with your own OG image later)
+    const ogImage = String(data.thumbUrl || meta.thumbUrl || OG_FALLBACK_IMAGE);
 
-    const shareUrl = `https://genova-labs.hu/s/${encodeURIComponent(id)}`;
-    const downloadUrl = `https://genova-labs.hu/v/${encodeURIComponent(id)}`;
+    const directUrl = `${SHARE_HOST}/v/${encodeURIComponent(id)}`;
 
-    const parts = [];
-    if (model) parts.push(`Motor: ${model}`);
-    if (lengthSec !== "" && lengthSec != null) parts.push(`Hossz: ${lengthSec}s`);
-    if (resolution) parts.push(`Felbontás: ${resolution}`);
-    if (fps !== "" && fps != null) parts.push(`FPS: ${fps}`);
-    const desc = parts.join(" • ") || "GeNova AI Video";
+    const descParts = [];
+    if (resolution) descParts.push(`Resolution: ${resolution}`);
+    if (fps) descParts.push(`FPS: ${fps}`);
+    const desc = descParts.length ? descParts.join(" • ") : "Generated with GeNova";
 
-    const fileName = String(data.fileName || data.filename || "").replace(/\.mp4$/i, "");
-    const title = fileName || "GeNova AI Videó";
-
-    res.set("Content-Type", "text/html; charset=utf-8");
-    return res.status(200).send(`<!doctype html>
-<html lang="hu">
+    const htmlDoc = `<!doctype html>
+<html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta property="og:type" content="video.other" />
-<meta property="og:title" content="${String(title).replace(/"/g, "&quot;")}" />
-<meta property="og:description" content="${String(desc).replace(/"/g, "&quot;")}" />
-<meta property="og:image" content="${String(ogImage).replace(/"/g, "&quot;")}" />
-<meta property="og:image:width" content="1200" />
-<meta property="og:image:height" content="630" />
-<meta property="og:image:alt" content="GeNova preview" />
-<meta property="og:url" content="${String(shareUrl).replace(/"/g, "&quot;")}" />
-<meta name="twitter:card" content="summary_large_image" />
-<meta name="twitter:title" content="${String(title).replace(/"/g, "&quot;")}" />
-<meta name="twitter:description" content="${String(desc).replace(/"/g, "&quot;")}" />
-<meta name="twitter:image" content="${String(ogImage).replace(/"/g, "&quot;")}" />
-<meta http-equiv="refresh" content="0; url=${downloadUrl}" />
-<title>${String(title).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(title)}</title>
+  <meta property="og:title" content="${escapeHtml(title)}" />
+  <meta property="og:description" content="${escapeHtml(desc)}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:image" content="${escapeHtml(ogImage)}" />
+  <meta property="og:url" content="${escapeHtml(`${SHARE_HOST}/s/${encodeURIComponent(id)}`)}" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="robots" content="noindex" />
+  <style>
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#05070D;color:#E5E7EB}
+    .wrap{max-width:740px;margin:0 auto;padding:28px}
+    .card{background:rgba(255,255,255,0.06);border:1px solid rgba(51,230,255,0.25);border-radius:18px;padding:18px}
+    .h{font-weight:700;font-size:18px;margin:0 0 10px}
+    .p{opacity:.82;margin:0 0 16px}
+    a.btn{display:inline-block;background:rgba(51,230,255,0.18);border:1px solid rgba(51,230,255,0.6);color:#E5E7EB;text-decoration:none;padding:10px 14px;border-radius:12px;font-weight:600}
+    .small{opacity:.7;font-size:12px;margin-top:10px;word-break:break-all}
+  </style>
 </head>
-<body style="margin:0;background:#0b0f16;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;">
-  <noscript>
-    <div style="padding:24px;">
-      <a href="${downloadUrl}" style="color:#33E6FF;">Letöltés</a>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <p class="h">${escapeHtml(title)}</p>
+      <p class="p">${escapeHtml(desc)}</p>
+      <a class="btn" href="${escapeHtml(directUrl)}">Download / Open</a>
+      <div class="small">${escapeHtml(directUrl)}</div>
     </div>
-  </noscript>
-  <script>window.location.replace(${json.dumps(downloadUrl)});</script>
+  </div>
 </body>
-</html>`);
+</html>`;
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.set("Cache-Control", "public, max-age=300");
+    return res.status(200).send(htmlDoc);
   } catch (e) {
-    console.error("❌ /s/:id error:", e);
+    console.error("❌ share page error:", e);
     return res.status(500).send("Error");
   }
 });
@@ -1905,6 +1861,95 @@ function escapeHtml(str) {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
 }
+
+
+// Pretty filename share/download route: /d/<fileName>.mp4
+// Serves OG HTML (for Messenger preview) and then redirects users to /v/<id>.
+app.get("/d/:filename", async (req, res) => {
+  try {
+    const filename = String(req.params.filename || "").trim();
+    if (!filename) return res.status(400).send("Missing filename");
+
+    // Firestore: users/{uid}/creations/{cid}
+    let docSnap = null;
+
+    try {
+      const q = await db.collectionGroup("creations").where("fileName", "==", filename).limit(1).get();
+      if (!q.empty) docSnap = q.docs[0];
+    } catch (_) {}
+
+    if (!docSnap) {
+      // Some older docs may store as "filename"
+      try {
+        const q2 = await db.collectionGroup("creations").where("filename", "==", filename).limit(1).get();
+        if (!q2.empty) docSnap = q2.docs[0];
+      } catch (_) {}
+    }
+
+    if (!docSnap) return res.status(404).send("Not found");
+
+    const data = docSnap.data() || {};
+    const meta = data.meta || {};
+
+    const model = String(meta.model || data.model || "GeNova");
+    const lengthSec = (meta.lengthSec ?? data.lengthSec ?? data.length ?? "");
+    const resolution = String(meta.resolution || data.resolution || "");
+    const fps = (meta.fps ?? data.fps ?? "");
+
+    const ogImage = String(
+      data.thumbUrl ||
+      meta.thumbUrl ||
+      data.thumbnailUrl ||
+      meta.thumbnailUrl ||
+      data.sourceImageUrl ||
+      data.imageUrl ||
+      data.inputImageUrl ||
+      OG_FALLBACK_IMAGE
+    );
+
+    const idForPath = String(data.shareId || docSnap.id);
+    const downloadUrl = `${SHARE_HOST}/v/${encodeURIComponent(idForPath)}`;
+    const selfUrl = `${SHARE_HOST}/d/${encodeURIComponent(filename)}`;
+
+    const parts = [];
+    parts.push(`Model: ${model}`);
+    if (lengthSec !== "" && lengthSec != null) parts.push(`Length: ${lengthSec}s`);
+    if (resolution) parts.push(`Res: ${resolution}`);
+    if (fps !== "" && fps != null) parts.push(`FPS: ${fps}`);
+    const desc = parts.join(" • ");
+
+    const safe = (s) => String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    return res.status(200).send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta property="og:type" content="video.other" />
+<meta property="og:title" content="${safe(filename.replace(/\.mp4$/i,''))}" />
+<meta property="og:description" content="${safe(desc)}" />
+<meta property="og:image" content="${safe(ogImage)}" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="GeNova preview" />
+<meta property="og:url" content="${safe(selfUrl)}" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="${safe(filename.replace(/\.mp4$/i,''))}" />
+<meta name="twitter:description" content="${safe(desc)}" />
+<meta name="twitter:image" content="${safe(ogImage)}" />
+<title>${safe(filename)}</title>
+<!-- Redirect humans quickly; crawlers will still read OG tags -->
+<meta http-equiv="refresh" content="0; url=${safe(downloadUrl)}" />
+</head>
+<body></body>
+</html>`);
+  } catch (e) {
+    console.error("❌ /d/:filename error:", e);
+    return res.status(500).send("Error");
+  }
+});
+
 
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
