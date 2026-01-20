@@ -115,7 +115,6 @@ if (Number.isFinite(sec) && sec > 0) {
 const app = express();
 
 
-// --- Share helpers (OG preview) ---
 function _firstDefined(...vals) {
   for (const v of vals) {
     if (v === undefined || v === null) continue;
@@ -128,58 +127,15 @@ function _firstDefined(...vals) {
 function _parseMetaFromFileName(fileName) {
   if (!fileName || typeof fileName !== "string") return {};
   const out = {};
-  const res = fileName.match(/(?:^|_)(720p|1080p|1440p|2160p|4k)(?:_|\.mp4$)/i);
-  if (res) out.resolution = res[1].toLowerCase() === "4k" ? "4K" : res[1];
-  const fps = fileName.match(/(?:^|_)(\d{2,3})fps(?:_|\.mp4$)/i);
-  if (fps) out.fps = Number(fps[1]);
-  const len = fileName.match(/(?:^|_)(\d{1,3})s(?:_|\.mp4$)/i);
-  if (len) out.lengthSec = Number(len[1]);
+  const mRes = fileName.match(/(?:^|_)(720p|1080p|1440p|2160p|4k)(?:_|\.mp4$)/i);
+  if (mRes) out.resolution = mRes[1].toLowerCase() === "4k" ? "4K" : mRes[1];
+  const mFps = fileName.match(/(?:^|_)(\d{2,3})fps(?:_|\.mp4$)/i);
+  if (mFps) out.fps = Number(mFps[1]);
+  const mLen = fileName.match(/(?:^|_)(\d{1,3})s(?:_|\.mp4$)/i);
+  if (mLen) out.lengthSec = Number(mLen[1]);
   return out;
 }
-
-function _safeText(s) {
-  return String(s || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function _buildShareHtml({ id, title, description, image, url }) {
-  const safeTitle = _safeText(title);
-  const safeDesc = _safeText(description);
-  const safeImg = _safeText(image);
-  const safeUrl = _safeText(url);
-
-  // NOTE: crawlers read the first response HTML; do not rely on client-side JS for OG.
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta property="og:type" content="video.other" />
-<meta property="og:title" content="${safeTitle}" />
-<meta property="og:description" content="${safeDesc}" />
-<meta property="og:image" content="${safeImg}" />
-<meta property="og:image:width" content="1200" />
-<meta property="og:image:height" content="630" />
-<meta property="og:image:alt" content="GeNova preview" />
-<meta property="og:url" content="${safeUrl}" />
-<meta name="twitter:card" content="summary_large_image" />
-<meta name="twitter:title" content="${safeTitle}" />
-<meta name="twitter:description" content="${safeDesc}" />
-<meta name="twitter:image" content="${safeImg}" />
-<title>${safeTitle}</title>
-</head>
-<body style="margin:0;background:#0b0f16;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;">
-<div style="max-width:900px;margin:0 auto;padding:24px;">
-  <h2 style="margin:0 0 12px 0;">${safeTitle}</h2>
-  <p style="margin:0 0 16px 0;opacity:.85;">${safeDesc}</p>
-  <a href="${safeUrl.replace('/s/','/v/')}" style="display:inline-block;background:#10b981;color:#fff;text-decoration:none;padding:12px 16px;border-radius:999px;font-weight:600;">Download</a>
-  <div style="margin-top:18px;opacity:.6;font-size:12px;">GeNova Labs</div>
-</div>
-</body>
-</html>`;
-}
 // ------------------------------------------------------------
-const DEFAULT_OG_IMAGE = "https://genova-labs.hu/assets/og/genova-og.png";
-
 // ✅ Share host + OG image configuration
 // ------------------------------------------------------------
 const SHARE_HOST = process.env.SHARE_HOST || "https://genova-labs.hu";
@@ -1834,14 +1790,13 @@ app.get("/v/:id", async (req, res) => {
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).send("Missing id");
 
-    const admin = require("firebase-admin");
-    const db = admin.firestore();
-
     let docSnap = null;
+
     try {
       const q = await db.collectionGroup("creations").where("shareId", "==", id).limit(1).get();
       if (!q.empty) docSnap = q.docs[0];
     } catch (_) {}
+
     if (!docSnap) {
       try {
         const q2 = await db.collectionGroup("creations").where(admin.firestore.FieldPath.documentId(), "==", id).limit(1).get();
@@ -1852,24 +1807,14 @@ app.get("/v/:id", async (req, res) => {
     if (!docSnap) return res.status(404).send("Not found");
 
     const data = docSnap.data() || {};
-    const fileName = _firstDefined(data.fileName, data.filename, "genova_video.mp4");
-    const videoUrl = _firstDefined(
-      data.videoUrl,
-      data.url,
-      data.resultUrl,
-      data.meta?.videoUrl,
-      data.meta?.url,
-      data.video?.url,
-      null
-    );
+    const meta = data.meta || {};
+    const url = String(_firstDefined(data.videoUrl, data.url, data.resultUrl, meta.videoUrl, meta.url, "") || "").trim();
+    if (!url) return res.status(404).send("No URL");
 
-    if (!videoUrl) return res.status(404).send("Video not ready");
-
-    // Redirect to the actual video
-    // (Filename for saving is handled in-app; external browsers may show the URL)
-    return res.redirect(302, videoUrl);
+    res.set("Cache-Control", "public, max-age=300");
+    return res.redirect(302, url);
   } catch (e) {
-    console.log("download /v/:id error:", e);
+    console.error("❌ /v/:id error:", e);
     return res.status(500).send("Error");
   }
 });
@@ -1879,20 +1824,14 @@ app.get("/s/:id", async (req, res) => {
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).send("Missing id");
 
-    // Find creation by shareId OR document id across users (collectionGroup)
-    // Expect: users/{uid}/creations/{cid}
-    const admin = require("firebase-admin");
-    const db = admin.firestore();
-
+    // Find by shareId OR docId across users (users/{uid}/creations/{cid})
     let docSnap = null;
 
-    // 1) Prefer: collectionGroup query on shareId
     try {
       const q = await db.collectionGroup("creations").where("shareId", "==", id).limit(1).get();
       if (!q.empty) docSnap = q.docs[0];
     } catch (_) {}
 
-    // 2) Fallback: collectionGroup docId equals id (if you use creationId as shareId)
     if (!docSnap) {
       try {
         const q2 = await db.collectionGroup("creations").where(admin.firestore.FieldPath.documentId(), "==", id).limit(1).get();
@@ -1900,74 +1839,78 @@ app.get("/s/:id", async (req, res) => {
       } catch (_) {}
     }
 
-    if (!docSnap) {
-      const url = `https://genova-labs.hu/s/${encodeURIComponent(id)}`;
-      const html = _buildShareHtml({
-        id,
-        title: "GeNova AI Video",
-        description: "View & download your generated video.",
-        image: DEFAULT_OG_IMAGE,
-        url,
-      });
-      res.set("Content-Type", "text/html; charset=utf-8");
-      return res.status(200).send(html);
-    }
+    if (!docSnap) return res.status(404).send("Not found");
 
     const data = docSnap.data() || {};
-    const fileName = _firstDefined(data.fileName, data.filename, data.name, null);
+    const meta = data.meta || {};
+    const fileName = _firstDefined(data.fileName, data.filename, data.name, "");
     const parsed = _parseMetaFromFileName(fileName);
 
-    const model = _firstDefined(data.model, data.meta?.model, data.generation?.model, "GeNova");
-    const lengthSec = _firstDefined(data.lengthSec, data.durationSec, data.duration, data.meta?.lengthSec, data.meta?.durationSec, parsed.lengthSec, null);
-    const resolution = _firstDefined(data.resolution, data.meta?.resolution, data.video?.resolution, data.generation?.resolution, parsed.resolution, null);
-    const fps = _firstDefined(data.fps, data.meta?.fps, data.video?.fps, data.generation?.fps, parsed.fps, null);
+    const model = String(_firstDefined(meta.model, data.model, "GeNova"));
+    const lengthSec = _firstDefined(meta.lengthSec, data.lengthSec, data.length, data.videoLength, parsed.lengthSec, "");
+    const resolution = _firstDefined(meta.resolution, data.resolution, data.video?.resolution, parsed.resolution, "");
+    const fps = _firstDefined(meta.fps, data.fps, data.video?.fps, parsed.fps, "");
 
-    // Prefer per-creation thumb:
+    const title = fileName
+      ? `${fileName.replace(/\.mp4$/i, "")}`
+      : `GeNova AI Video (${model}${lengthSec ? ` • ${lengthSec}s` : ""})`;
+
+    // Prefer per-creation image for previews:
     // - thumbUrl (best)
-    // - sourceImageUrl / imageUrl (good for image-to-video)
+    // - input/source image (great for image-to-video)
     // - fallback OG
-    const image = _firstDefined(
+    const ogImage = String(_firstDefined(
       data.thumbUrl,
+      meta.thumbUrl,
       data.thumbnailUrl,
-      data.thumb,
+      meta.thumbnailUrl,
       data.sourceImageUrl,
       data.imageUrl,
       data.inputImageUrl,
-      DEFAULT_OG_IMAGE
-    );
+      OG_FALLBACK_IMAGE
+    ));
 
-    const url = `https://genova-labs.hu/s/${encodeURIComponent(id)}`;
+    const shareUrl = `${SHARE_HOST}/s/${encodeURIComponent(id)}`;
+    const downloadUrl = `${SHARE_HOST}/v/${encodeURIComponent(id)}`;
 
-    // Build pretty description with no '-' placeholders
-    const parts = [];
-    if (model) parts.push(`Model: ${model}`);
-    if (lengthSec != null && lengthSec !== "") parts.push(`Length: ${lengthSec}s`);
-    if (resolution) parts.push(`Res: ${resolution}`);
-    if (fps != null && fps !== "") parts.push(`FPS: ${fps}`);
-
-    const description = parts.length ? parts.join(" • ") : "GeNova AI video";
-
-    const title = fileName ? fileName.replace(/\.mp4$/i, "") : "GeNova AI Video";
-
-    const html = _buildShareHtml({
-      id,
-      title,
-      description,
-      image,
-      url,
-    });
+    const descParts = [];
+    if (model) descParts.push(`Model: ${model}`);
+    if (lengthSec !== "" && lengthSec !== null && lengthSec !== undefined) descParts.push(`Length: ${lengthSec}s`);
+    if (resolution) descParts.push(`Res: ${resolution}`);
+    if (fps !== "" && fps !== null && fps !== undefined) descParts.push(`FPS: ${fps}`);
+    const desc = descParts.length ? descParts.join(" • ") : "GeNova AI video";
 
     res.set("Content-Type", "text/html; charset=utf-8");
-    return res.status(200).send(html);
+    return res.status(200).send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta property="og:type" content="video.other" />
+<meta property="og:title" content="${String(title).replace(/"/g, "&quot;")}" />
+<meta property="og:description" content="${String(desc).replace(/"/g, "&quot;")}" />
+<meta property="og:image" content="${String(ogImage).replace(/"/g, "&quot;")}" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="GeNova preview" />
+<meta property="og:url" content="${String(shareUrl).replace(/"/g, "&quot;")}" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="${String(title).replace(/"/g, "&quot;")}" />
+<meta name="twitter:description" content="${String(desc).replace(/"/g, "&quot;")}" />
+<meta name="twitter:image" content="${String(ogImage).replace(/"/g, "&quot;")}" />
+<title>${String(title).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</title>
+</head>
+<body style="margin:0;background:#0b0f16;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;">
+  <div style="max-width:900px;margin:0 auto;padding:24px;">
+    <h2 style="margin:0 0 12px 0;">${String(title).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</h2>
+    <p style="margin:0 0 16px 0;opacity:.85;">${String(desc).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>
+    <a href="${downloadUrl}" style="display:inline-block;background:#10b981;color:#fff;text-decoration:none;padding:12px 16px;border-radius:999px;font-weight:600;">Download</a>
+  </div>
+</body>
+</html>`);
   } catch (e) {
-    console.log("share /s/:id error:", e);
-    return res.status(200).send(_buildShareHtml({
-      id: "x",
-      title: "GeNova AI Video",
-      description: "View & download your generated video.",
-      image: DEFAULT_OG_IMAGE,
-      url: "https://genova-labs.hu",
-    }));
+    console.error("❌ /s/:id error:", e);
+    return res.status(500).send("Error");
   }
 });
 
