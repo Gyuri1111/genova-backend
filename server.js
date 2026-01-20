@@ -114,27 +114,6 @@ if (Number.isFinite(sec) && sec > 0) {
 
 const app = express();
 
-
-function _firstDefined(...vals) {
-  for (const v of vals) {
-    if (v === undefined || v === null) continue;
-    if (typeof v === "string" && v.trim() === "") continue;
-    return v;
-  }
-  return null;
-}
-
-function _parseMetaFromFileName(fileName) {
-  if (!fileName || typeof fileName !== "string") return {};
-  const out = {};
-  const mRes = fileName.match(/(?:^|_)(720p|1080p|1440p|2160p|4k)(?:_|\.mp4$)/i);
-  if (mRes) out.resolution = mRes[1].toLowerCase() === "4k" ? "4K" : mRes[1];
-  const mFps = fileName.match(/(?:^|_)(\d{2,3})fps(?:_|\.mp4$)/i);
-  if (mFps) out.fps = Number(mFps[1]);
-  const mLen = fileName.match(/(?:^|_)(\d{1,3})s(?:_|\.mp4$)/i);
-  if (mLen) out.lengthSec = Number(mLen[1]);
-  return out;
-}
 // ------------------------------------------------------------
 // ✅ Share host + OG image configuration
 // ------------------------------------------------------------
@@ -280,6 +259,28 @@ async function cleanupExpiredEntitlementsForUser(uid) {
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 app.get("/version", (_, res) => res.json({ ok: true, build: BUILD_TAG }));
+
+function _firstDefined(...vals) {
+  for (const v of vals) {
+    if (v === undefined || v === null) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    return v;
+  }
+  return null;
+}
+
+function _parseMetaFromFileName(fileName) {
+  if (!fileName || typeof fileName !== "string") return {};
+  const out = {};
+  const mRes = fileName.match(/(?:^|_)(720p|1080p|1440p|2160p|4k)(?:_|\.mp4$)/i);
+  if (mRes) out.resolution = mRes[1].toLowerCase() === "4k" ? "4K" : mRes[1];
+  const mFps = fileName.match(/(?:^|_)(\d{2,3})fps(?:_|\.mp4$)/i);
+  if (mFps) out.fps = Number(mFps[1]);
+  const mLen = fileName.match(/(?:^|_)(\d{1,3})s(?:_|\.mp4$)/i);
+  if (mLen) out.lengthSec = Number(mLen[1]);
+  return out;
+}
+
 
 // ------------------------------------------------------------
 // 🌍 i18n helpers (EN/HU/DE) for PUSH + lastResult
@@ -1799,7 +1800,11 @@ app.get("/v/:id", async (req, res) => {
 
     if (!docSnap) {
       try {
-        const q2 = await db.collectionGroup("creations").where(admin.firestore.FieldPath.documentId(), "==", id).limit(1).get();
+        const q2 = await db
+          .collectionGroup("creations")
+          .where(admin.firestore.FieldPath.documentId(), "==", id)
+          .limit(1)
+          .get();
         if (!q2.empty) docSnap = q2.docs[0];
       } catch (_) {}
     }
@@ -1808,7 +1813,17 @@ app.get("/v/:id", async (req, res) => {
 
     const data = docSnap.data() || {};
     const meta = data.meta || {};
-    const url = String(_firstDefined(data.videoUrl, data.url, data.resultUrl, meta.videoUrl, meta.url, "") || "").trim();
+
+    // Prefer saved public/signed URL if available.
+    const url = String(_firstDefined(
+      data.videoUrl,
+      data.url,
+      data.resultUrl,
+      meta.videoUrl,
+      meta.url,
+      ""
+    ) || "").trim();
+
     if (!url) return res.status(404).send("No URL");
 
     res.set("Cache-Control", "public, max-age=300");
@@ -1824,17 +1839,24 @@ app.get("/s/:id", async (req, res) => {
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).send("Missing id");
 
-    // Find by shareId OR docId across users (users/{uid}/creations/{cid})
+    // Find creation across users:
+    // users/{uid}/creations/{cid}
     let docSnap = null;
 
+    // 1) Prefer explicit shareId match
     try {
       const q = await db.collectionGroup("creations").where("shareId", "==", id).limit(1).get();
       if (!q.empty) docSnap = q.docs[0];
     } catch (_) {}
 
+    // 2) Fallback: share id is doc id
     if (!docSnap) {
       try {
-        const q2 = await db.collectionGroup("creations").where(admin.firestore.FieldPath.documentId(), "==", id).limit(1).get();
+        const q2 = await db
+          .collectionGroup("creations")
+          .where(admin.firestore.FieldPath.documentId(), "==", id)
+          .limit(1)
+          .get();
         if (!q2.empty) docSnap = q2.docs[0];
       } catch (_) {}
     }
@@ -1843,42 +1865,44 @@ app.get("/s/:id", async (req, res) => {
 
     const data = docSnap.data() || {};
     const meta = data.meta || {};
-    const fileName = _firstDefined(data.fileName, data.filename, data.name, "");
+    const fileName = _firstDefined(data.fileName, data.filename, meta.fileName, meta.filename, "");
     const parsed = _parseMetaFromFileName(fileName);
 
     const model = String(_firstDefined(meta.model, data.model, "GeNova"));
-    const lengthSec = _firstDefined(meta.lengthSec, data.lengthSec, data.length, data.videoLength, parsed.lengthSec, "");
-    const resolution = _firstDefined(meta.resolution, data.resolution, data.video?.resolution, parsed.resolution, "");
-    const fps = _firstDefined(meta.fps, data.fps, data.video?.fps, parsed.fps, "");
+    const lengthSec = _firstDefined(meta.lengthSec, meta.length, data.lengthSec, data.length, parsed.lengthSec, "");
+    const resolution = _firstDefined(meta.resolution, data.resolution, parsed.resolution, "");
+    const fps = _firstDefined(meta.fps, data.fps, parsed.fps, "");
 
     const title = fileName
-      ? `${fileName.replace(/\.mp4$/i, "")}`
+      ? String(fileName).replace(/\.mp4$/i, "")
       : `GeNova AI Video (${model}${lengthSec ? ` • ${lengthSec}s` : ""})`;
 
-    // Prefer per-creation image for previews:
-    // - thumbUrl (best)
-    // - input/source image (great for image-to-video)
-    // - fallback OG
+    // Preview image priority:
+    // 1) generated thumb
+    // 2) input/source image (image-to-video)
+    // 3) fallback OG image
     const ogImage = String(_firstDefined(
       data.thumbUrl,
-      meta.thumbUrl,
       data.thumbnailUrl,
+      meta.thumbUrl,
       meta.thumbnailUrl,
       data.sourceImageUrl,
-      data.imageUrl,
       data.inputImageUrl,
+      meta.sourceImageUrl,
+      meta.inputImageUrl,
       OG_FALLBACK_IMAGE
     ));
 
-    const shareUrl = `${SHARE_HOST}/s/${encodeURIComponent(id)}`;
-    const downloadUrl = `${SHARE_HOST}/v/${encodeURIComponent(id)}`;
+    const shareUrl = `https://genova-labs.hu/s/${encodeURIComponent(id)}`;
+    const downloadUrl = `https://genova-labs.hu/v/${encodeURIComponent(id)}`;
 
-    const descParts = [];
-    if (model) descParts.push(`Model: ${model}`);
-    if (lengthSec !== "" && lengthSec !== null && lengthSec !== undefined) descParts.push(`Length: ${lengthSec}s`);
-    if (resolution) descParts.push(`Res: ${resolution}`);
-    if (fps !== "" && fps !== null && fps !== undefined) descParts.push(`FPS: ${fps}`);
-    const desc = descParts.length ? descParts.join(" • ") : "GeNova AI video";
+    const parts = [];
+    if (model) parts.push(`Model: ${model}`);
+    if (lengthSec !== "" && lengthSec !== null && lengthSec !== undefined) parts.push(`Length: ${lengthSec}s`);
+    if (resolution) parts.push(`Res: ${resolution}`);
+    if (fps !== "" && fps !== null && fps !== undefined) parts.push(`FPS: ${fps}`);
+
+    const desc = parts.length ? parts.join(" • ") : "GeNova AI video";
 
     res.set("Content-Type", "text/html; charset=utf-8");
     return res.status(200).send(`<!doctype html>
