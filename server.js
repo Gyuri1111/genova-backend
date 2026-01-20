@@ -120,6 +120,25 @@ const app = express();
 const SHARE_HOST = process.env.SHARE_HOST || "https://genova-labs.hu";
 const OG_FALLBACK_IMAGE = process.env.OG_FALLBACK_IMAGE || "https://genova-labs.hu/assets/og/genova-og.png";
 
+
+function isCrawlerUserAgent(uaRaw) {
+  const ua = String(uaRaw || "").toLowerCase();
+  // Common social crawlers
+  return (
+    ua.includes("facebookexternalhit") ||
+    ua.includes("facebot") ||
+    ua.includes("twitterbot") ||
+    ua.includes("whatsapp") ||
+    ua.includes("telegrambot") ||
+    ua.includes("discordbot") ||
+    ua.includes("slackbot") ||
+    ua.includes("linkedinbot") ||
+    ua.includes("pinterest") ||
+    ua.includes("vkshare") ||
+    ua.includes("embedly")
+  );
+}
+
 function getPublicBaseUrl(req) {
   const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
   const host = req.headers["x-forwarded-host"] || req.get("host");
@@ -1862,39 +1881,27 @@ function escapeHtml(str) {
     .replace(/'/g, "&#039;");
 }
 
-
-// Pretty filename share/download route: /d/<fileName>.mp4
-// Serves OG HTML (for Messenger preview) and then redirects users to /v/<id>.
 app.get("/d/:filename", async (req, res) => {
   try {
-    const filename = String(req.params.filename || "").trim();
-    if (!filename) return res.status(400).send("Missing filename");
+    const filenameRaw = String(req.params.filename || "");
+    const fileName = decodeURIComponent(filenameRaw).trim();
+    if (!fileName) return res.status(400).send("Missing filename");
 
-    // Firestore: users/{uid}/creations/{cid}
-    let docSnap = null;
+    // Find creation doc by fileName across users
+    const q = await db.collectionGroup("creations").where("fileName", "==", fileName).limit(1).get();
+    if (q.empty) return res.status(404).send("Not found");
 
-    try {
-      const q = await db.collectionGroup("creations").where("fileName", "==", filename).limit(1).get();
-      if (!q.empty) docSnap = q.docs[0];
-    } catch (_) {}
-
-    if (!docSnap) {
-      // Some older docs may store as "filename"
-      try {
-        const q2 = await db.collectionGroup("creations").where("filename", "==", filename).limit(1).get();
-        if (!q2.empty) docSnap = q2.docs[0];
-      } catch (_) {}
-    }
-
-    if (!docSnap) return res.status(404).send("Not found");
-
+    const docSnap = q.docs[0];
     const data = docSnap.data() || {};
     const meta = data.meta || {};
 
+    // Prefer shareId if you store it; otherwise doc id works
+    const idForDownload = String(data.shareId || docSnap.id);
+
     const model = String(meta.model || data.model || "GeNova");
-    const lengthSec = (meta.lengthSec ?? data.lengthSec ?? data.length ?? "");
+    const lengthSec = meta.lengthSec ?? data.lengthSec ?? data.length ?? "";
     const resolution = String(meta.resolution || data.resolution || "");
-    const fps = (meta.fps ?? data.fps ?? "");
+    const fps = meta.fps ?? data.fps ?? "";
 
     const ogImage = String(
       data.thumbUrl ||
@@ -1907,18 +1914,20 @@ app.get("/d/:filename", async (req, res) => {
       OG_FALLBACK_IMAGE
     );
 
-    const idForPath = String(data.shareId || docSnap.id);
-    const downloadUrl = `${SHARE_HOST}/v/${encodeURIComponent(idForPath)}`;
-    const selfUrl = `${SHARE_HOST}/d/${encodeURIComponent(filename)}`;
+    const shareUrl = `${SHARE_HOST}/d/${encodeURIComponent(fileName)}`;
+    const downloadUrl = `${SHARE_HOST}/v/${encodeURIComponent(idForDownload)}`;
 
-    const parts = [];
-    parts.push(`Model: ${model}`);
-    if (lengthSec !== "" && lengthSec != null) parts.push(`Length: ${lengthSec}s`);
-    if (resolution) parts.push(`Res: ${resolution}`);
-    if (fps !== "" && fps != null) parts.push(`FPS: ${fps}`);
-    const desc = parts.join(" • ");
+    const descParts = [];
+    if (model) descParts.push(`Model: ${model}`);
+    if (lengthSec !== "" && lengthSec != null) descParts.push(`Length: ${lengthSec}s`);
+    if (resolution) descParts.push(`Res: ${resolution}`);
+    if (fps !== "" && fps != null) descParts.push(`FPS: ${fps}`);
+    const desc = descParts.length ? descParts.join(" • ") : "GeNova AI video";
 
-    const safe = (s) => String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    // ✅ Important: humans should go straight to the video, crawlers should see OG HTML
+    if (!isCrawlerUserAgent(req.headers["user-agent"])) {
+      return res.redirect(302, downloadUrl);
+    }
 
     res.set("Content-Type", "text/html; charset=utf-8");
     return res.status(200).send(`<!doctype html>
@@ -1927,22 +1936,26 @@ app.get("/d/:filename", async (req, res) => {
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta property="og:type" content="video.other" />
-<meta property="og:title" content="${safe(filename.replace(/\.mp4$/i,''))}" />
-<meta property="og:description" content="${safe(desc)}" />
-<meta property="og:image" content="${safe(ogImage)}" />
+<meta property="og:title" content="${String(fileName).replace(/"/g, "&quot;")}" />
+<meta property="og:description" content="${String(desc).replace(/"/g, "&quot;")}" />
+<meta property="og:image" content="${String(ogImage).replace(/"/g, "&quot;")}" />
 <meta property="og:image:width" content="1200" />
 <meta property="og:image:height" content="630" />
 <meta property="og:image:alt" content="GeNova preview" />
-<meta property="og:url" content="${safe(selfUrl)}" />
+<meta property="og:url" content="${String(shareUrl).replace(/"/g, "&quot;")}" />
 <meta name="twitter:card" content="summary_large_image" />
-<meta name="twitter:title" content="${safe(filename.replace(/\.mp4$/i,''))}" />
-<meta name="twitter:description" content="${safe(desc)}" />
-<meta name="twitter:image" content="${safe(ogImage)}" />
-<title>${safe(filename)}</title>
-<!-- Redirect humans quickly; crawlers will still read OG tags -->
-<meta http-equiv="refresh" content="0; url=${safe(downloadUrl)}" />
+<meta name="twitter:title" content="${String(fileName).replace(/"/g, "&quot;")}" />
+<meta name="twitter:description" content="${String(desc).replace(/"/g, "&quot;")}" />
+<meta name="twitter:image" content="${String(ogImage).replace(/"/g, "&quot;")}" />
+<title>${String(fileName).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</title>
 </head>
-<body></body>
+<body style="margin:0;background:#0b0f16;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;">
+  <div style="max-width:900px;margin:0 auto;padding:24px;">
+    <h2 style="margin:0 0 12px 0;">${String(fileName).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</h2>
+    <p style="margin:0 0 16px 0;opacity:.85;">${String(desc).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>
+    <a href="${downloadUrl}" style="display:inline-block;background:#10b981;color:#fff;text-decoration:none;padding:12px 16px;border-radius:999px;font-weight:600;">Download</a>
+  </div>
+</body>
 </html>`);
   } catch (e) {
     console.error("❌ /d/:filename error:", e);
