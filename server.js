@@ -1769,11 +1769,25 @@ app.get("/v/:id", async (req, res) => {
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).send("Missing id");
 
-    const q = await db.collectionGroup("creations").where("id", "==", id).limit(1).get();
+    const q = await db
+      .collectionGroup("creations")
+      .where("id", "==", id)
+      .limit(1)
+      .get();
+
     if (q.empty) return res.status(404).send("Not found");
 
     const data = q.docs[0].data() || {};
-    const url = String(data.url || "").trim();
+
+    // ✅ Robust URL pick (client writes videoUrl; older docs may use url/resultUrl)
+    const url = String(
+      data.videoUrl ||
+        data.url ||
+        data.resultUrl ||
+        (data.meta && (data.meta.videoUrl || data.meta.url || data.meta.resultUrl)) ||
+        ""
+    ).trim();
+
     if (!url) return res.status(404).send("No URL");
 
     res.set("Cache-Control", "public, max-age=300");
@@ -1783,6 +1797,7 @@ app.get("/v/:id", async (req, res) => {
     return res.status(500).send("Error");
   }
 });
+
 
 app.get("/s/:id", async (req, res) => {
   try {
