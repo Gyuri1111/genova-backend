@@ -114,11 +114,76 @@ if (Number.isFinite(sec) && sec > 0) {
 
 const app = express();
 
+
+// --- Share helpers (OG preview) ---
+function _firstDefined(...vals) {
+  for (const v of vals) {
+    if (v === undefined || v === null) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    return v;
+  }
+  return null;
+}
+
+function _parseMetaFromFileName(fileName) {
+  if (!fileName || typeof fileName !== "string") return {};
+  const out = {};
+  const res = fileName.match(/(?:^|_)(720p|1080p|1440p|2160p|4k)(?:_|\.mp4$)/i);
+  if (res) out.resolution = res[1].toLowerCase() === "4k" ? "4K" : res[1];
+  const fps = fileName.match(/(?:^|_)(\d{2,3})fps(?:_|\.mp4$)/i);
+  if (fps) out.fps = Number(fps[1]);
+  const len = fileName.match(/(?:^|_)(\d{1,3})s(?:_|\.mp4$)/i);
+  if (len) out.lengthSec = Number(len[1]);
+  return out;
+}
+
+function _safeText(s) {
+  return String(s || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function _buildShareHtml({ id, title, description, image, url }) {
+  const safeTitle = _safeText(title);
+  const safeDesc = _safeText(description);
+  const safeImg = _safeText(image);
+  const safeUrl = _safeText(url);
+
+  // NOTE: crawlers read the first response HTML; do not rely on client-side JS for OG.
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta property="og:type" content="video.other" />
+<meta property="og:title" content="${safeTitle}" />
+<meta property="og:description" content="${safeDesc}" />
+<meta property="og:image" content="${safeImg}" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="GeNova preview" />
+<meta property="og:url" content="${safeUrl}" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="${safeTitle}" />
+<meta name="twitter:description" content="${safeDesc}" />
+<meta name="twitter:image" content="${safeImg}" />
+<title>${safeTitle}</title>
+</head>
+<body style="margin:0;background:#0b0f16;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;">
+<div style="max-width:900px;margin:0 auto;padding:24px;">
+  <h2 style="margin:0 0 12px 0;">${safeTitle}</h2>
+  <p style="margin:0 0 16px 0;opacity:.85;">${safeDesc}</p>
+  <a href="${safeUrl.replace('/s/','/v/')}" style="display:inline-block;background:#10b981;color:#fff;text-decoration:none;padding:12px 16px;border-radius:999px;font-weight:600;">Download</a>
+  <div style="margin-top:18px;opacity:.6;font-size:12px;">GeNova Labs</div>
+</div>
+</body>
+</html>`;
+}
 // ------------------------------------------------------------
+const DEFAULT_OG_IMAGE = "https://genova-labs.hu/assets/og/genova-og.png";
+
 // ✅ Share host + OG image configuration
 // ------------------------------------------------------------
 const SHARE_HOST = process.env.SHARE_HOST || "https://genova-labs.hu";
-const OG_FALLBACK_IMAGE = process.env.OG_FALLBACK_IMAGE || "https://genova-labs.hu/assets/og/genova-og.jpg";
+const OG_FALLBACK_IMAGE = process.env.OG_FALLBACK_IMAGE || "https://genova-labs.hu/assets/og/genova-og.png";
 
 function getPublicBaseUrl(req) {
   const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
@@ -1769,102 +1834,140 @@ app.get("/v/:id", async (req, res) => {
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).send("Missing id");
 
-    const q = await db
-      .collectionGroup("creations")
-      .where("id", "==", id)
-      .limit(1)
-      .get();
+    const admin = require("firebase-admin");
+    const db = admin.firestore();
 
-    if (q.empty) return res.status(404).send("Not found");
+    let docSnap = null;
+    try {
+      const q = await db.collectionGroup("creations").where("shareId", "==", id).limit(1).get();
+      if (!q.empty) docSnap = q.docs[0];
+    } catch (_) {}
+    if (!docSnap) {
+      try {
+        const q2 = await db.collectionGroup("creations").where(admin.firestore.FieldPath.documentId(), "==", id).limit(1).get();
+        if (!q2.empty) docSnap = q2.docs[0];
+      } catch (_) {}
+    }
 
-    const data = q.docs[0].data() || {};
+    if (!docSnap) return res.status(404).send("Not found");
 
-    // ✅ Robust URL pick (client writes videoUrl; older docs may use url/resultUrl)
-    const url = String(
-      data.videoUrl ||
-        data.url ||
-        data.resultUrl ||
-        (data.meta && (data.meta.videoUrl || data.meta.url || data.meta.resultUrl)) ||
-        ""
-    ).trim();
+    const data = docSnap.data() || {};
+    const fileName = _firstDefined(data.fileName, data.filename, "genova_video.mp4");
+    const videoUrl = _firstDefined(
+      data.videoUrl,
+      data.url,
+      data.resultUrl,
+      data.meta?.videoUrl,
+      data.meta?.url,
+      data.video?.url,
+      null
+    );
 
-    if (!url) return res.status(404).send("No URL");
+    if (!videoUrl) return res.status(404).send("Video not ready");
 
-    res.set("Cache-Control", "public, max-age=300");
-    return res.redirect(302, url);
+    // Redirect to the actual video
+    // (Filename for saving is handled in-app; external browsers may show the URL)
+    return res.redirect(302, videoUrl);
   } catch (e) {
-    console.error("❌ share redirect error:", e);
+    console.log("download /v/:id error:", e);
     return res.status(500).send("Error");
   }
 });
-
 
 app.get("/s/:id", async (req, res) => {
   try {
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).send("Missing id");
 
-    const q = await db.collectionGroup("creations").where("id", "==", id).limit(1).get();
-    if (q.empty) return res.status(404).send("Not found");
+    // Find creation by shareId OR document id across users (collectionGroup)
+    // Expect: users/{uid}/creations/{cid}
+    const admin = require("firebase-admin");
+    const db = admin.firestore();
 
-    const data = q.docs[0].data() || {};
-    const meta = data.meta || {};
-    const model = String(meta.model || data.model || "GeNova");
-    const lengthSec = String(meta.lengthSec || data.lengthSec || data.length || data.videoLength || "");
-    const resolution = String(meta.resolution || data.resolution || "");
-    const fps = String(meta.fps || data.fps || "");
-    const title = `GeNova AI Video (${model}${lengthSec ? ` • ${lengthSec}s` : ""})`;
+    let docSnap = null;
 
-    // Use a stable image for previews (you can replace with your own OG image later)
-    const ogImage = String(data.thumbUrl || meta.thumbUrl || OG_FALLBACK_IMAGE);
+    // 1) Prefer: collectionGroup query on shareId
+    try {
+      const q = await db.collectionGroup("creations").where("shareId", "==", id).limit(1).get();
+      if (!q.empty) docSnap = q.docs[0];
+    } catch (_) {}
 
-    const directUrl = `${SHARE_HOST}/v/${encodeURIComponent(id)}`;
+    // 2) Fallback: collectionGroup docId equals id (if you use creationId as shareId)
+    if (!docSnap) {
+      try {
+        const q2 = await db.collectionGroup("creations").where(admin.firestore.FieldPath.documentId(), "==", id).limit(1).get();
+        if (!q2.empty) docSnap = q2.docs[0];
+      } catch (_) {}
+    }
 
-    const descParts = [];
-    if (resolution) descParts.push(`Resolution: ${resolution}`);
-    if (fps) descParts.push(`FPS: ${fps}`);
-    const desc = descParts.length ? descParts.join(" • ") : "Generated with GeNova";
+    if (!docSnap) {
+      const url = `https://genova-labs.hu/s/${encodeURIComponent(id)}`;
+      const html = _buildShareHtml({
+        id,
+        title: "GeNova AI Video",
+        description: "View & download your generated video.",
+        image: DEFAULT_OG_IMAGE,
+        url,
+      });
+      res.set("Content-Type", "text/html; charset=utf-8");
+      return res.status(200).send(html);
+    }
 
-    const htmlDoc = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${escapeHtml(title)}</title>
-  <meta property="og:title" content="${escapeHtml(title)}" />
-  <meta property="og:description" content="${escapeHtml(desc)}" />
-  <meta property="og:type" content="website" />
-  <meta property="og:image" content="${escapeHtml(ogImage)}" />
-  <meta property="og:url" content="${escapeHtml(`${SHARE_HOST}/s/${encodeURIComponent(id)}`)}" />
-  <meta name="twitter:card" content="summary_large_image" />
-  <meta name="robots" content="noindex" />
-  <style>
-    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#05070D;color:#E5E7EB}
-    .wrap{max-width:740px;margin:0 auto;padding:28px}
-    .card{background:rgba(255,255,255,0.06);border:1px solid rgba(51,230,255,0.25);border-radius:18px;padding:18px}
-    .h{font-weight:700;font-size:18px;margin:0 0 10px}
-    .p{opacity:.82;margin:0 0 16px}
-    a.btn{display:inline-block;background:rgba(51,230,255,0.18);border:1px solid rgba(51,230,255,0.6);color:#E5E7EB;text-decoration:none;padding:10px 14px;border-radius:12px;font-weight:600}
-    .small{opacity:.7;font-size:12px;margin-top:10px;word-break:break-all}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <p class="h">${escapeHtml(title)}</p>
-      <p class="p">${escapeHtml(desc)}</p>
-      <a class="btn" href="${escapeHtml(directUrl)}">Download / Open</a>
-      <div class="small">${escapeHtml(directUrl)}</div>
-    </div>
-  </div>
-</body>
-</html>`;
+    const data = docSnap.data() || {};
+    const fileName = _firstDefined(data.fileName, data.filename, data.name, null);
+    const parsed = _parseMetaFromFileName(fileName);
+
+    const model = _firstDefined(data.model, data.meta?.model, data.generation?.model, "GeNova");
+    const lengthSec = _firstDefined(data.lengthSec, data.durationSec, data.duration, data.meta?.lengthSec, data.meta?.durationSec, parsed.lengthSec, null);
+    const resolution = _firstDefined(data.resolution, data.meta?.resolution, data.video?.resolution, data.generation?.resolution, parsed.resolution, null);
+    const fps = _firstDefined(data.fps, data.meta?.fps, data.video?.fps, data.generation?.fps, parsed.fps, null);
+
+    // Prefer per-creation thumb:
+    // - thumbUrl (best)
+    // - sourceImageUrl / imageUrl (good for image-to-video)
+    // - fallback OG
+    const image = _firstDefined(
+      data.thumbUrl,
+      data.thumbnailUrl,
+      data.thumb,
+      data.sourceImageUrl,
+      data.imageUrl,
+      data.inputImageUrl,
+      DEFAULT_OG_IMAGE
+    );
+
+    const url = `https://genova-labs.hu/s/${encodeURIComponent(id)}`;
+
+    // Build pretty description with no '-' placeholders
+    const parts = [];
+    if (model) parts.push(`Model: ${model}`);
+    if (lengthSec != null && lengthSec !== "") parts.push(`Length: ${lengthSec}s`);
+    if (resolution) parts.push(`Res: ${resolution}`);
+    if (fps != null && fps !== "") parts.push(`FPS: ${fps}`);
+
+    const description = parts.length ? parts.join(" • ") : "GeNova AI video";
+
+    const title = fileName ? fileName.replace(/\.mp4$/i, "") : "GeNova AI Video";
+
+    const html = _buildShareHtml({
+      id,
+      title,
+      description,
+      image,
+      url,
+    });
+
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.set("Cache-Control", "public, max-age=300");
-    return res.status(200).send(htmlDoc);
+    return res.status(200).send(html);
   } catch (e) {
-    console.error("❌ share page error:", e);
-    return res.status(500).send("Error");
+    console.log("share /s/:id error:", e);
+    return res.status(200).send(_buildShareHtml({
+      id: "x",
+      title: "GeNova AI Video",
+      description: "View & download your generated video.",
+      image: DEFAULT_OG_IMAGE,
+      url: "https://genova-labs.hu",
+    }));
   }
 });
 
