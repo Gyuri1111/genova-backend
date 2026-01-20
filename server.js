@@ -260,28 +260,6 @@ async function cleanupExpiredEntitlementsForUser(uid) {
 app.get("/health", (_, res) => res.json({ ok: true }));
 app.get("/version", (_, res) => res.json({ ok: true, build: BUILD_TAG }));
 
-function _firstDefined(...vals) {
-  for (const v of vals) {
-    if (v === undefined || v === null) continue;
-    if (typeof v === "string" && v.trim() === "") continue;
-    return v;
-  }
-  return null;
-}
-
-function _parseMetaFromFileName(fileName) {
-  if (!fileName || typeof fileName !== "string") return {};
-  const out = {};
-  const mRes = fileName.match(/(?:^|_)(720p|1080p|1440p|2160p|4k)(?:_|\.mp4$)/i);
-  if (mRes) out.resolution = mRes[1].toLowerCase() === "4k" ? "4K" : mRes[1];
-  const mFps = fileName.match(/(?:^|_)(\d{2,3})fps(?:_|\.mp4$)/i);
-  if (mFps) out.fps = Number(mFps[1]);
-  const mLen = fileName.match(/(?:^|_)(\d{1,3})s(?:_|\.mp4$)/i);
-  if (mLen) out.lengthSec = Number(mLen[1]);
-  return out;
-}
-
-
 // ------------------------------------------------------------
 // 🌍 i18n helpers (EN/HU/DE) for PUSH + lastResult
 // ------------------------------------------------------------
@@ -1813,17 +1791,7 @@ app.get("/v/:id", async (req, res) => {
 
     const data = docSnap.data() || {};
     const meta = data.meta || {};
-
-    // Prefer saved public/signed URL if available.
-    const url = String(_firstDefined(
-      data.videoUrl,
-      data.url,
-      data.resultUrl,
-      meta.videoUrl,
-      meta.url,
-      ""
-    ) || "").trim();
-
+    const url = String(data.videoUrl || data.url || data.resultUrl || meta.videoUrl || meta.url || "").trim();
     if (!url) return res.status(404).send("No URL");
 
     res.set("Cache-Control", "public, max-age=300");
@@ -1839,17 +1807,14 @@ app.get("/s/:id", async (req, res) => {
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).send("Missing id");
 
-    // Find creation across users:
-    // users/{uid}/creations/{cid}
+    // Find by shareId OR docId across users: users/{uid}/creations/{cid}
     let docSnap = null;
 
-    // 1) Prefer explicit shareId match
     try {
       const q = await db.collectionGroup("creations").where("shareId", "==", id).limit(1).get();
       if (!q.empty) docSnap = q.docs[0];
     } catch (_) {}
 
-    // 2) Fallback: share id is doc id
     if (!docSnap) {
       try {
         const q2 = await db
@@ -1865,48 +1830,40 @@ app.get("/s/:id", async (req, res) => {
 
     const data = docSnap.data() || {};
     const meta = data.meta || {};
-    const fileName = _firstDefined(data.fileName, data.filename, meta.fileName, meta.filename, "");
-    const parsed = _parseMetaFromFileName(fileName);
 
-    const model = String(_firstDefined(meta.model, data.model, "GeNova"));
-    const lengthSec = _firstDefined(meta.lengthSec, meta.length, data.lengthSec, data.length, parsed.lengthSec, "");
-    const resolution = _firstDefined(meta.resolution, data.resolution, parsed.resolution, "");
-    const fps = _firstDefined(meta.fps, data.fps, parsed.fps, "");
+    const model = String(meta.model || data.model || "GeNova");
+    const lengthSec = meta.lengthSec ?? meta.length ?? data.lengthSec ?? data.length ?? data.videoLength ?? "";
+    const resolution = String(meta.resolution || data.resolution || "");
+    const fps = meta.fps ?? data.fps ?? "";
 
-    const title = fileName
-      ? String(fileName).replace(/\.mp4$/i, "")
-      : `GeNova AI Video (${model}${lengthSec ? ` • ${lengthSec}s` : ""})`;
-
-    // Preview image priority:
-    // 1) generated thumb
-    // 2) input/source image (image-to-video)
-    // 3) fallback OG image
-    const ogImage = String(_firstDefined(
-      data.thumbUrl,
-      data.thumbnailUrl,
-      meta.thumbUrl,
-      meta.thumbnailUrl,
-      data.sourceImageUrl,
-      data.inputImageUrl,
-      meta.sourceImageUrl,
-      meta.inputImageUrl,
-      OG_FALLBACK_IMAGE
-    ));
+    const ogImage =
+      String(
+        meta.thumbUrl ||
+          data.thumbUrl ||
+          meta.thumbnailUrl ||
+          data.thumbnailUrl ||
+          data.sourceImageUrl ||
+          data.imageUrl ||
+          data.inputImageUrl ||
+          OG_FALLBACK_IMAGE
+      ) || OG_FALLBACK_IMAGE;
 
     const shareUrl = `https://genova-labs.hu/s/${encodeURIComponent(id)}`;
     const downloadUrl = `https://genova-labs.hu/v/${encodeURIComponent(id)}`;
 
     const parts = [];
-    if (model) parts.push(`Model: ${model}`);
-    if (lengthSec !== "" && lengthSec !== null && lengthSec !== undefined) parts.push(`Length: ${lengthSec}s`);
-    if (resolution) parts.push(`Res: ${resolution}`);
-    if (fps !== "" && fps !== null && fps !== undefined) parts.push(`FPS: ${fps}`);
+    if (model) parts.push(`Motor: ${model}`);
+    if (lengthSec !== "" && lengthSec != null) parts.push(`Hossz: ${lengthSec}s`);
+    if (resolution) parts.push(`Felbontás: ${resolution}`);
+    if (fps !== "" && fps != null) parts.push(`FPS: ${fps}`);
+    const desc = parts.join(" • ") || "GeNova AI Video";
 
-    const desc = parts.length ? parts.join(" • ") : "GeNova AI video";
+    const fileName = String(data.fileName || data.filename || "").replace(/\.mp4$/i, "");
+    const title = fileName || "GeNova AI Videó";
 
     res.set("Content-Type", "text/html; charset=utf-8");
     return res.status(200).send(`<!doctype html>
-<html lang="en">
+<html lang="hu">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -1922,14 +1879,16 @@ app.get("/s/:id", async (req, res) => {
 <meta name="twitter:title" content="${String(title).replace(/"/g, "&quot;")}" />
 <meta name="twitter:description" content="${String(desc).replace(/"/g, "&quot;")}" />
 <meta name="twitter:image" content="${String(ogImage).replace(/"/g, "&quot;")}" />
+<meta http-equiv="refresh" content="0; url=${downloadUrl}" />
 <title>${String(title).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</title>
 </head>
 <body style="margin:0;background:#0b0f16;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;">
-  <div style="max-width:900px;margin:0 auto;padding:24px;">
-    <h2 style="margin:0 0 12px 0;">${String(title).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</h2>
-    <p style="margin:0 0 16px 0;opacity:.85;">${String(desc).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>
-    <a href="${downloadUrl}" style="display:inline-block;background:#10b981;color:#fff;text-decoration:none;padding:12px 16px;border-radius:999px;font-weight:600;">Download</a>
-  </div>
+  <noscript>
+    <div style="padding:24px;">
+      <a href="${downloadUrl}" style="color:#33E6FF;">Letöltés</a>
+    </div>
+  </noscript>
+  <script>window.location.replace(${json.dumps(downloadUrl)});</script>
 </body>
 </html>`);
   } catch (e) {
