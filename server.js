@@ -387,8 +387,8 @@ const MONETIZATION = {
   GENERATION_COST: 1, // credits per generation
   ADDONS: {
     // Watermark removal (time-based)
-    no_watermark_7d: { cost: 50, days: 7, entitlementKey: "noWatermarkUntil" },
-    no_watermark_30d: { cost: 150, days: 30, entitlementKey: "noWatermarkUntil" },
+    no_watermark_7d: { cost: 20, days: 7, entitlementKey: "noWatermarkUntil" },
+    no_watermark_30d: { cost: 50, days: 30, entitlementKey: "noWatermarkUntil" },
 
     // Ad-free (time-based) — for future UI/ads
     ad_free_7d: { cost: 20, days: 7, entitlementKey: "adFreeUntil" },
