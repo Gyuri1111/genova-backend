@@ -1734,6 +1734,52 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
           { merge: true }
         );
         console.log("✅ Firestore creation updated:", `users/${uid}/creations/${creationId}`);
+
+        // ✅ Backfill duplicates (if client pre-created a different docId)
+        // Some clients may create a "processing" doc with a different docId before calling /generate-video.
+        // If we detect other docs with the same fileName, we update them too so thumbnails/OG never miss.
+        try {
+          if (fileName) {
+            const dupSnap = await db
+              .collection("users")
+              .doc(uid)
+              .collection("creations")
+              .where("fileName", "==", String(fileName))
+              .limit(10)
+              .get();
+
+            const updates = [];
+            dupSnap.forEach((d) => {
+              if (d.id !== creationId) updates.push(d.ref);
+            });
+
+            if (updates.length) {
+              const batch = db.batch();
+              const nowTs = admin.firestore.Timestamp.now();
+              updates.forEach((ref) => {
+                batch.set(
+                  ref,
+                  {
+                    uid,
+                    status: "ready",
+                    videoUrl: finalized?.videoUrl || null,
+                    thumbUrl: finalized?.thumbUrl || null,
+                    thumbnailUrl: finalized?.thumbUrl || null,
+                    storage: finalized?.storage || null,
+                    watermarkApplied: !!watermarkApplied,
+                    updatedAt: nowTs,
+                    duplicateOf: creationId,
+                  },
+                  { merge: true }
+                );
+              });
+              await batch.commit();
+              console.log("✅ Firestore duplicates backfilled:", updates.length);
+            }
+          }
+        } catch (e2) {
+          console.warn("⚠️ duplicate backfill failed:", e2?.message || e2);
+        }
       }
     } catch (e) {
       console.warn("⚠️ creation doc update failed:", e?.message || e);
