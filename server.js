@@ -68,7 +68,7 @@ require("dotenv").config();
 const { emailTemplate } = require("./src/utils/emailTemplate");
 
 const BUILD_TAG =
-  "WATERMARK_THUMB_STORAGE_UPLOAD_2026-01-22_v3_thumbfix_ffmpeglog";
+  "WATERMARK_THUMB_STORAGE_UPLOAD_2026-01-22_v5_local_placeholder_and_mp4_validation";
 
 
 /* =========================
@@ -1277,6 +1277,51 @@ function buildStorageDownloadUrl(bucketName, objectPath, token) {
   return `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encoded}?alt=media&token=${token}`;
 }
 
+function isProbablyMp4Header(buf) {
+  try {
+    const slice = buf.slice(0, 1024);
+    return slice.includes("ftyp") || slice.includes("isom") || slice.includes("mp42");
+  } catch (_) {
+    return false;
+  }
+}
+
+function validateLocalMp4(filePath, label) {
+  try {
+    const st = fs.statSync(filePath);
+    const size = st.size || 0;
+    const head = fs.readFileSync(filePath, { encoding: "latin1", flag: "r" }).slice(0, 1024);
+    const ok = size > 50 * 1024 && isProbablyMp4Header(head);
+    console.log("🎞️ mp4 validation:", { label, filePath, size, ok });
+    return ok;
+  } catch (e) {
+    console.log("⚠️ mp4 validation failed:", { label, filePath, err: e?.message || e });
+    return false;
+  }
+}
+
+function tryCopyLocalPlaceholder(outPath) {
+  const candidates = [
+    path.join(process.cwd(), "placeholder.mp4"),
+    path.join(process.cwd(), "public", "placeholder.mp4"),
+    path.join(__dirname, "placeholder.mp4"),
+    path.join(__dirname, "public", "placeholder.mp4"),
+    path.join(process.cwd(), "assets", "placeholder.mp4"),
+  ];
+
+  for (const cand of candidates) {
+    try {
+      if (fs.existsSync(cand)) {
+        fs.copyFileSync(cand, outPath);
+        console.log("🎬 using local placeholder.mp4:", cand);
+        return true;
+      }
+    } catch (_) {}
+  }
+  console.log("⚠️ local placeholder.mp4 not found in candidates");
+  return false;
+}
+
 function ensureFfmpegAvailable() {
   if (!ffmpeg || !ffmpegPath) {
     const err = new Error("FFMPEG_NOT_AVAILABLE");
@@ -1439,8 +1484,24 @@ async function finalizeGeneratedVideo({
   const localFinal = watermarkApplied ? localWm : localSrc;
   const localThumb = path.join(tmpDir, `genova_thumb_${safeId}.jpg`);
 
-  // Download source
-  await downloadToFile(sourceUrl, localSrc);
+  // Acquire source
+  const isPlaceholder = String(sourceUrl || "").includes("/placeholder.mp4");
+  if (isPlaceholder) {
+    const copied = tryCopyLocalPlaceholder(localSrc);
+    if (!copied) {
+      await downloadToFile(sourceUrl, localSrc);
+    }
+  } else {
+    await downloadToFile(sourceUrl, localSrc);
+  }
+
+  // Validate we really got an mp4 (prevents saving HTML/redirect pages)
+  const validMp4 = validateLocalMp4(localSrc, isPlaceholder ? "placeholder" : "sourceUrl");
+  if (!validMp4) {
+    const err = new Error("SOURCE_NOT_MP4");
+    err.code = "SOURCE_NOT_MP4";
+    throw err;
+  }
 
   // Watermark if needed
   if (watermarkApplied) {
@@ -1613,8 +1674,16 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
 
     // Client may send creationId + fileName (recommended)
     const creationId = String(body.creationId || body.creationDocId || body.docId || "").trim() || id;
-    const fileName = String(body.fileName || "").trim() || "";
+    let fileName = String(body.fileName || "").trim() || "";
     const watermarkApplied = !!billing?.watermarkApplied;
+    // ✅ If client did not send fileName, generate a stable one (needed for Firestore + share)
+    if (!fileName) {
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
+      fileName = `GeNova_${model}_${lengthSec}s_${resolution}_${fps}fps_${stamp}.mp4`;
+    }
+
 
     const finalized = await finalizeGeneratedVideo({
       uid,
@@ -1642,43 +1711,29 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     try {
       if (creationId) {
         const creationRef = db.collection("users").doc(uid).collection("creations").doc(creationId);
-        const snap = await creationRef.get();
-        if (snap.exists) {
-          await creationRef.set(
-            {
-              videoUrl: url,
-              thumbUrl: finalized.thumbUrl || null,
-              storage: finalized.storage || null,
-              fileName: fileName || snap.data()?.fileName || null,
-              watermarkApplied: !!watermarkApplied,
-              status: "ready",
-              updatedAt: admin.firestore.Timestamp.now(),
-            },
-            { merge: true }
-          );
-        } else if (fileName) {
-          // fallback: find by fileName within this user's creations (subcollection query)
-          const q = await db
-            .collection("users")
-            .doc(uid)
-            .collection("creations")
-            .where("fileName", "==", fileName)
-            .limit(1)
-            .get();
-          if (!q.empty) {
-            await q.docs[0].ref.set(
-              {
-                videoUrl: url,
-                thumbUrl: finalized.thumbUrl || null,
-                storage: finalized.storage || null,
-                watermarkApplied: !!watermarkApplied,
-                status: "ready",
-                updatedAt: admin.firestore.Timestamp.now(),
-              },
-              { merge: true }
-            );
-          }
-        }
+        // ✅ Always create/update the creation doc (client might not pre-create it)
+        await creationRef.set(
+          {
+            uid,
+            createdAt: admin.firestore.Timestamp.now(),
+            model,
+            prompt: String(prompt || ""),
+            length: Number(lengthSec),
+            fps: Number(fps),
+            resolution: String(resolution),
+            hasImage: !!req.file,
+            fileName: String(fileName || ""),
+            status: "ready",
+            videoUrl: finalized?.videoUrl || null,
+            thumbUrl: finalized?.thumbUrl || null,
+            thumbnailUrl: finalized?.thumbUrl || null,
+            storage: finalized?.storage || null,
+            watermarkApplied: !!watermarkApplied,
+            updatedAt: admin.firestore.Timestamp.now(),
+          },
+          { merge: true }
+        );
+        console.log("✅ Firestore creation updated:", `users/${uid}/creations/${creationId}`);
       }
     } catch (e) {
       console.warn("⚠️ creation doc update failed:", e?.message || e);
