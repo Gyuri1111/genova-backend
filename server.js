@@ -12,27 +12,14 @@ const os = require("os");
 const { v4: uuidv4 } = require("uuid");
 
 // Thumbnail extraction (first frame)
-// - Requires: fluent-ffmpeg + ffmpeg-static (MUST be in dependencies, not devDependencies)
 let ffmpeg;
 let ffmpegPath;
 try {
   ffmpeg = require("fluent-ffmpeg");
-  // ffmpeg-static returns a full path to the bundled ffmpeg binary
   ffmpegPath = require("ffmpeg-static");
-
-  if (ffmpeg && ffmpegPath) {
-    // Allow override via env if ever needed
-    const forced = process.env.FFMPEG_PATH ? String(process.env.FFMPEG_PATH).trim() : "";
-    const p = forced || ffmpegPath;
-
-    ffmpeg.setFfmpegPath(p);
-    console.log("✅ ffmpeg available:", p);
-  } else {
-    console.warn("⚠️ ffmpeg modules loaded, but ffmpegPath missing");
-  }
+  if (ffmpeg && ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 } catch (e) {
   console.warn("⚠️ ffmpeg not available (install fluent-ffmpeg + ffmpeg-static)");
-  console.warn("⚠️ ffmpeg init error:", e?.message || e);
 }
 
 
@@ -73,7 +60,7 @@ require("dotenv").config();
 const { emailTemplate } = require("./src/utils/emailTemplate");
 
 const BUILD_TAG =
-  "WATERMARK_THUMB_STORAGE_UPLOAD_2026-01-22_v1";
+  "WATERMARK_THUMB_STORAGE_UPLOAD_2026-01-22_v2_thumbfix";
 
 
 /* =========================
@@ -1286,7 +1273,6 @@ function ensureFfmpegAvailable() {
   if (!ffmpeg || !ffmpegPath) {
     const err = new Error("FFMPEG_NOT_AVAILABLE");
     err.code = "FFMPEG_NOT_AVAILABLE";
-    err.meta = { ffmpeg: !!ffmpeg, ffmpegPath: ffmpegPath || null };
     throw err;
   }
 }
@@ -1342,18 +1328,36 @@ async function uploadFileToFirebaseStorage(localPath, destPath, contentType) {
 
 async function extractThumbnailJpg(videoPath, thumbPath) {
   ensureFfmpegAvailable();
+
+  // Make sure output folder exists
+  try {
+    fs.mkdirSync(path.dirname(thumbPath), { recursive: true });
+  } catch (_) {}
+
+  // More reliable than .screenshots() in some container environments:
+  //  - take 1 frame at 0.15s
+  //  - write directly to the requested path
   await new Promise((resolve, reject) => {
     ffmpeg(videoPath)
+      .on("start", (cmd) => console.log("🖼️ ffmpeg thumb cmd:", cmd))
       .on("end", resolve)
       .on("error", reject)
-      .screenshots({
-        count: 1,
-        timemarks: ["0.1"],
-        filename: path.basename(thumbPath),
-        folder: path.dirname(thumbPath),
-        size: "1280x720",
-      });
+      .outputOptions([
+        "-ss 0.15",
+        "-frames:v 1",
+        "-vf scale=1280:-2",
+        "-q:v 3",
+      ])
+      .output(thumbPath)
+      .run();
   });
+
+  if (!fs.existsSync(thumbPath)) {
+    const err = new Error("THUMB_OUTPUT_MISSING");
+    err.code = "THUMB_OUTPUT_MISSING";
+    throw err;
+  }
+
   return thumbPath;
 }
 
@@ -1440,18 +1444,23 @@ async function finalizeGeneratedVideo({
   try {
     await extractThumbnailJpg(localFinal, localThumb);
     thumbOk = fs.existsSync(localThumb);
+    console.log("🖼️ thumb generated:", { thumbOk, localThumb });
   } catch (e) {
     console.warn("⚠️ thumbnail extract failed:", e?.message || e);
   }
 
   // Upload
   const videoDest = `videos/${safeUid}/${safeId}.mp4`;
+  console.log("⬆️ uploading video to Storage:", { videoDest });
   const videoUp = await uploadFileToFirebaseStorage(localFinal, videoDest, "video/mp4");
+  console.log("✅ video uploaded:", { url: videoUp.url, path: videoUp.path });
 
   let thumbUp = null;
   if (thumbOk) {
     const thumbDest = `thumbs/${safeUid}/${safeId}.jpg`;
+    console.log("⬆️ uploading thumb to Storage:", { thumbDest });
     thumbUp = await uploadFileToFirebaseStorage(localThumb, thumbDest, "image/jpeg");
+    console.log("✅ thumb uploaded:", { url: thumbUp.url, path: thumbUp.path });
   }
 
   // Cleanup best-effort
