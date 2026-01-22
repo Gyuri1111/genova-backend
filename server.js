@@ -1619,16 +1619,6 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
   try {
     const uid = req.uid;
 
-    // 🔎 DEBUG (creationId / fileName / thumbUrl pipeline)
-    try {
-      const ua = String(req.headers?.["user-agent"] || "");
-      console.log("🎯 /generate-video ua:", ua.slice(0, 120));
-      console.log("🎯 /generate-video body keys:", Object.keys(req.body || {}));
-      console.log("🎯 /generate-video raw body:", req.body || {});
-      console.log("🎯 /generate-video hasFile:", !!req.file, "file:", req.file ? { fieldname: req.file.fieldname, mimetype: req.file.mimetype, size: req.file.size, originalname: req.file.originalname } : null);
-    } catch (_) {}
-
-
     // In multipart, fields arrive as strings
     const body = req.body || {};
     const prompt = String(body.prompt || body.text || "").trim();
@@ -1684,10 +1674,16 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
 
     // Client may send creationId + fileName (recommended)
     const creationId = String(body.creationId || body.creationDocId || body.docId || "").trim() || id;
-    const fileName = String(body.fileName || "").trim() || "";
+    let fileName = String(body.fileName || "").trim() || "";
     const watermarkApplied = !!billing?.watermarkApplied;
+    // ✅ If client did not send fileName, generate a stable one (needed for Firestore + share)
+    if (!fileName) {
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
+      fileName = `GeNova_${model}_${lengthSec}s_${resolution}_${fps}fps_${stamp}.mp4`;
+    }
 
-    console.log("🎯 /generate-video resolved:", { id, creationId, fileName, model, lengthSec, fps, resolution, watermarkApplied });
 
     const finalized = await finalizeGeneratedVideo({
       uid,
@@ -1695,12 +1691,6 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       sourceUrl,
       fileName,
       watermarkApplied,
-    });
-
-    console.log("🎯 finalizeGeneratedVideo result:", {
-      videoUrl: finalized?.videoUrl || null,
-      thumbUrl: finalized?.thumbUrl || null,
-      storage: finalized?.storage || null,
     });
 
     const url = finalized.videoUrl;// Mark as ready
@@ -1721,42 +1711,30 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     try {
       if (creationId) {
         const creationRef = db.collection("users").doc(uid).collection("creations").doc(creationId);
-        console.log("🎯 Firestore target:", `users/${uid}/creations/${creationId}`);
-        const snap = await creationRef.get();
-        console.log("🎯 Firestore exists?", snap.exists);
-        if (snap.exists) {
-          await creationRef.set(
-            {
-              videoUrl: url,
-              thumbUrl: finalized.thumbUrl || null,
-              storage: finalized.storage || null,
-              fileName: fileName || snap.data()?.fileName || null,
-              watermarkApplied: !!watermarkApplied,
-              status: "ready",
-              updatedAt: admin.firestore.Timestamp.now(),
-            },
-            { merge: true }
-          );
-        } else if (fileName) {
-          // fallback: find by fileName within this user's creations (subcollection query)
-          const q = await db
-            .collection("users")
-            .doc(uid)
-            .collection("creations")
-            .where("fileName", "==", fileName)
-            .limit(1)
-            .get();
-          console.log("🎯 Firestore fallback by fileName:", { fileName, empty: q.empty, size: q.size });
-          if (!q.empty) {
-            await q.docs[0].ref.set(
-              {
-                videoUrl: url,
-                thumbUrl: finalized.thumbUrl || null,
-                storage: finalized.storage || null,
-                watermarkApplied: !!watermarkApplied,
-                status: "ready",
-                updatedAt: admin.firestore.Timestamp.now(),
-              },
+        // ✅ Always create/update the creation doc (client might not pre-create it)
+        await creationRef.set(
+          {
+            uid,
+            createdAt: admin.firestore.Timestamp.now(),
+            model,
+            prompt: String(prompt || ""),
+            length: Number(lengthSec),
+            fps: Number(fps),
+            resolution: String(resolution),
+            hasImage: !!req.file,
+            fileName: String(fileName || ""),
+            status: "ready",
+            videoUrl: finalized?.videoUrl || null,
+            thumbUrl: finalized?.thumbUrl || null,
+            thumbnailUrl: finalized?.thumbUrl || null,
+            storage: finalized?.storage || null,
+            watermarkApplied: !!watermarkApplied,
+            updatedAt: admin.firestore.Timestamp.now(),
+          },
+          { merge: true }
+        );
+        console.log("✅ Firestore creation updated:", `users/${uid}/creations/${creationId}`);
+,
               { merge: true }
             );
           }
