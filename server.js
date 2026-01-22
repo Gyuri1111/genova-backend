@@ -1734,6 +1734,11 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
           { merge: true }
         );
         console.log("✅ Firestore creation updated:", `users/${uid}/creations/${creationId}`);
+,
+              { merge: true }
+            );
+          }
+        }
       }
     } catch (e) {
       console.warn("⚠️ creation doc update failed:", e?.message || e);
