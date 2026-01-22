@@ -1734,7 +1734,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
           { merge: true }
         );
         console.log("✅ Firestore creation updated:", `users/${uid}/creations/${creationId}`);
-,
+
               { merge: true }
             );
           }
@@ -2322,3 +2322,4 @@ app.get("/d/:filename", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
+
