@@ -1714,9 +1714,9 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
         // ✅ Always create/update the creation doc (client might not pre-create it)
         await creationRef.set(
           {
-            uid,
+            uid: uid,
             createdAt: admin.firestore.Timestamp.now(),
-            model,
+            model: model,
             prompt: String(prompt || ""),
             length: Number(lengthSec),
             fps: Number(fps),
@@ -1724,12 +1724,12 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
             hasImage: !!req.file,
             fileName: String(fileName || ""),
             status: "ready",
-            videoUrl: finalized?.videoUrl || null,
-            thumbUrl: finalized?.thumbUrl || null,
-            thumbnailUrl: finalized?.thumbUrl || null,
-            storage: finalized?.storage || null,
+            videoUrl: finalized && finalized.videoUrl ? finalized.videoUrl : null,
+            thumbUrl: finalized && finalized.thumbUrl ? finalized.thumbUrl : null,
+            thumbnailUrl: finalized && finalized.thumbUrl ? finalized.thumbUrl : null,
+            storage: finalized && finalized.storage ? finalized.storage : null,
             watermarkApplied: !!watermarkApplied,
-            updatedAt: admin.firestore.Timestamp.now(),
+            updatedAt: admin.firestore.Timestamp.now()
           },
           { merge: true }
         );
