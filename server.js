@@ -68,7 +68,7 @@ require("dotenv").config();
 const { emailTemplate } = require("./src/utils/emailTemplate");
 
 const BUILD_TAG =
-  "WATERMARK_THUMB_STORAGE_UPLOAD_2026-01-22_v3_thumbfix_ffmpeglog";
+  "WATERMARK_THUMB_STORAGE_UPLOAD_2026-01-22_v5_local_placeholder_and_mp4_validation";
 
 
 /* =========================
@@ -1277,6 +1277,51 @@ function buildStorageDownloadUrl(bucketName, objectPath, token) {
   return `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encoded}?alt=media&token=${token}`;
 }
 
+function isProbablyMp4Header(buf) {
+  try {
+    const slice = buf.slice(0, 1024);
+    return slice.includes("ftyp") || slice.includes("isom") || slice.includes("mp42");
+  } catch (_) {
+    return false;
+  }
+}
+
+function validateLocalMp4(filePath, label) {
+  try {
+    const st = fs.statSync(filePath);
+    const size = st.size || 0;
+    const head = fs.readFileSync(filePath, { encoding: "latin1", flag: "r" }).slice(0, 1024);
+    const ok = size > 50 * 1024 && isProbablyMp4Header(head);
+    console.log("🎞️ mp4 validation:", { label, filePath, size, ok });
+    return ok;
+  } catch (e) {
+    console.log("⚠️ mp4 validation failed:", { label, filePath, err: e?.message || e });
+    return false;
+  }
+}
+
+function tryCopyLocalPlaceholder(outPath) {
+  const candidates = [
+    path.join(process.cwd(), "placeholder.mp4"),
+    path.join(process.cwd(), "public", "placeholder.mp4"),
+    path.join(__dirname, "placeholder.mp4"),
+    path.join(__dirname, "public", "placeholder.mp4"),
+    path.join(process.cwd(), "assets", "placeholder.mp4"),
+  ];
+
+  for (const cand of candidates) {
+    try {
+      if (fs.existsSync(cand)) {
+        fs.copyFileSync(cand, outPath);
+        console.log("🎬 using local placeholder.mp4:", cand);
+        return true;
+      }
+    } catch (_) {}
+  }
+  console.log("⚠️ local placeholder.mp4 not found in candidates");
+  return false;
+}
+
 function ensureFfmpegAvailable() {
   if (!ffmpeg || !ffmpegPath) {
     const err = new Error("FFMPEG_NOT_AVAILABLE");
@@ -1439,8 +1484,24 @@ async function finalizeGeneratedVideo({
   const localFinal = watermarkApplied ? localWm : localSrc;
   const localThumb = path.join(tmpDir, `genova_thumb_${safeId}.jpg`);
 
-  // Download source
-  await downloadToFile(sourceUrl, localSrc);
+  // Acquire source
+  const isPlaceholder = String(sourceUrl || "").includes("/placeholder.mp4");
+  if (isPlaceholder) {
+    const copied = tryCopyLocalPlaceholder(localSrc);
+    if (!copied) {
+      await downloadToFile(sourceUrl, localSrc);
+    }
+  } else {
+    await downloadToFile(sourceUrl, localSrc);
+  }
+
+  // Validate we really got an mp4 (prevents saving HTML/redirect pages)
+  const validMp4 = validateLocalMp4(localSrc, isPlaceholder ? "placeholder" : "sourceUrl");
+  if (!validMp4) {
+    const err = new Error("SOURCE_NOT_MP4");
+    err.code = "SOURCE_NOT_MP4";
+    throw err;
+  }
 
   // Watermark if needed
   if (watermarkApplied) {
