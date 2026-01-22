@@ -60,7 +60,7 @@ require("dotenv").config();
 const { emailTemplate } = require("./src/utils/emailTemplate");
 
 const BUILD_TAG =
-  "PROMPT_IMAGE_NOTIFYUSER_EMAIL_TEMPLATE_FIXED_2025-12-21__LASTRESULT_2025-12-21__PUSH_I18N_2025-12-26";
+  "WATERMARK_THUMB_STORAGE_UPLOAD_2026-01-22_v1";
 
 
 /* =========================
@@ -1257,6 +1257,206 @@ const storage = new Storage({
 const bucket = storage.bucket("genova-27d76.firebasestorage.app");
 
 // ------------------------------------------------------------
+// ✅ Video finalization helpers: watermark + thumbnail + upload
+// ------------------------------------------------------------
+
+function safeEncodePath(p) {
+  return encodeURIComponent(String(p).replace(/^\//, "")).replace(/%2F/g, "%2F");
+}
+
+function buildStorageDownloadUrl(bucketName, objectPath, token) {
+  const encoded = encodeURIComponent(objectPath).replace(/%2F/g, "%2F");
+  return `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encoded}?alt=media&token=${token}`;
+}
+
+function ensureFfmpegAvailable() {
+  if (!ffmpeg || !ffmpegPath) {
+    const err = new Error("FFMPEG_NOT_AVAILABLE");
+    err.code = "FFMPEG_NOT_AVAILABLE";
+    throw err;
+  }
+}
+
+async function downloadToFile(url, outPath) {
+  const https = require("https");
+  const http = require("http");
+  const proto = String(url).startsWith("https") ? https : http;
+
+  await new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(outPath);
+    const req = proto.get(url, (res) => {
+      // follow redirects
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        file.close(() => fs.unlink(outPath, () => resolve(downloadToFile(res.headers.location, outPath))));
+        return;
+      }
+      if (res.statusCode !== 200) {
+        file.close(() => fs.unlink(outPath, () => reject(new Error(`DOWNLOAD_FAILED_${res.statusCode}`))));
+        return;
+      }
+      res.pipe(file);
+      file.on("finish", () => file.close(resolve));
+    });
+    req.on("error", (e) => {
+      try { file.close(() => fs.unlink(outPath, () => reject(e))); } catch (_) { reject(e); }
+    });
+  });
+}
+
+async function uploadFileToFirebaseStorage(localPath, destPath, contentType) {
+  const token = uuidv4();
+  const buf = fs.readFileSync(localPath);
+
+  await bucket.file(destPath).save(buf, {
+    resumable: false,
+    contentType: contentType || "application/octet-stream",
+    metadata: {
+      metadata: {
+        firebaseStorageDownloadTokens: token,
+      },
+      cacheControl: "public, max-age=31536000",
+    },
+  });
+
+  return {
+    bucket: bucket.name,
+    path: destPath,
+    token,
+    url: buildStorageDownloadUrl(bucket.name, destPath, token),
+  };
+}
+
+async function extractThumbnailJpg(videoPath, thumbPath) {
+  ensureFfmpegAvailable();
+  await new Promise((resolve, reject) => {
+    ffmpeg(videoPath)
+      .on("end", resolve)
+      .on("error", reject)
+      .screenshots({
+        count: 1,
+        timemarks: ["0.1"],
+        filename: path.basename(thumbPath),
+        folder: path.dirname(thumbPath),
+        size: "1280x720",
+      });
+  });
+  return thumbPath;
+}
+
+async function applyWatermark(videoPath, outPath) {
+  ensureFfmpegAvailable();
+
+  // Prefer image watermark if provided
+  const wmImage = process.env.WATERMARK_IMAGE_PATH || "";
+  const wmAbs = wmImage ? path.resolve(process.cwd(), wmImage) : "";
+
+  // fallback drawtext if watermark image is missing
+  const hasImage = !!wmAbs && fs.existsSync(wmAbs);
+
+  await new Promise((resolve, reject) => {
+    let cmd = ffmpeg(videoPath);
+
+    if (hasImage) {
+      cmd = cmd
+        .input(wmAbs)
+        .complexFilter([
+          // scale watermark relative to video width (approx 18%)
+          "[1]scale=iw*0.18:-1[wm]",
+          "[0][wm]overlay=W-w-24:H-h-24:format=auto",
+        ])
+        .outputOptions(["-c:v libx264", "-preset veryfast", "-crf 22", "-c:a copy"]);
+    } else {
+      // drawtext watermark (semi-transparent). This is a safe fallback if no logo file exists.
+      // NOTE: font selection is platform-dependent; default font should work on most Linux images.
+      const text = (process.env.WATERMARK_TEXT || "GeNova").replace(/:/g, "\\:");
+      cmd = cmd
+        .videoFilters(
+          `drawtext=text='${text}':x=w-tw-24:y=h-th-24:fontsize=24:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=10`
+        )
+        .outputOptions(["-c:v libx264", "-preset veryfast", "-crf 22", "-c:a copy"]);
+    }
+
+    cmd
+      .on("end", resolve)
+      .on("error", reject)
+      .save(outPath);
+  });
+
+  return outPath;
+}
+
+/**
+ * Finalize a generated video URL:
+ * - downloads source (or uses local file if already local)
+ * - applies watermark conditionally
+ * - extracts thumbnail
+ * - uploads both to Firebase Storage
+ * - returns { videoUrl, thumbUrl, storage: {videoPath, thumbPath} }
+ */
+async function finalizeGeneratedVideo({
+  uid,
+  creationId,
+  sourceUrl,
+  fileName,
+  watermarkApplied,
+}) {
+  const tmpDir = os.tmpdir();
+  const safeUid = String(uid || "anon").replace(/[^a-zA-Z0-9_-]/g, "");
+  const safeId = String(creationId || uuidv4()).replace(/[^a-zA-Z0-9_-]/g, "");
+
+  const baseName = (fileName && String(fileName).endsWith(".mp4"))
+    ? String(fileName)
+    : `${safeId}.mp4`;
+
+  const localSrc = path.join(tmpDir, `genova_src_${safeId}.mp4`);
+  const localWm = path.join(tmpDir, `genova_wm_${safeId}.mp4`);
+  const localFinal = watermarkApplied ? localWm : localSrc;
+  const localThumb = path.join(tmpDir, `genova_thumb_${safeId}.jpg`);
+
+  // Download source
+  await downloadToFile(sourceUrl, localSrc);
+
+  // Watermark if needed
+  if (watermarkApplied) {
+    await applyWatermark(localSrc, localWm);
+  }
+
+  // Thumbnail (best-effort)
+  let thumbOk = false;
+  try {
+    await extractThumbnailJpg(localFinal, localThumb);
+    thumbOk = fs.existsSync(localThumb);
+  } catch (e) {
+    console.warn("⚠️ thumbnail extract failed:", e?.message || e);
+  }
+
+  // Upload
+  const videoDest = `videos/${safeUid}/${safeId}.mp4`;
+  const videoUp = await uploadFileToFirebaseStorage(localFinal, videoDest, "video/mp4");
+
+  let thumbUp = null;
+  if (thumbOk) {
+    const thumbDest = `thumbs/${safeUid}/${safeId}.jpg`;
+    thumbUp = await uploadFileToFirebaseStorage(localThumb, thumbDest, "image/jpeg");
+  }
+
+  // Cleanup best-effort
+  for (const f of [localSrc, localWm, localThumb]) {
+    try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch (_) {}
+  }
+
+  return {
+    videoUrl: videoUp.url,
+    thumbUrl: thumbUp?.url || null,
+    storage: {
+      videoPath: videoUp.path,
+      thumbPath: thumbUp?.path || null,
+      bucket: videoUp.bucket,
+    },
+  };
+}
+
+// ------------------------------------------------------------
 // Dummy generators (placeholder)
 // ------------------------------------------------------------
 const PLACEHOLDER_MP4_BASE64 =
@@ -1376,10 +1576,24 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
 
     // --- Placeholder "generation" (replace with real provider call later) ---
     // We serve a static placeholder mp4 from this server.
+    // ✅ Finalization pipeline already runs (watermark + thumbnail + Storage upload).
     const baseUrl = getPublicBaseUrl(req);
-    const url = `${baseUrl}/placeholder.mp4`;
+    const sourceUrl = `${baseUrl}/placeholder.mp4`;
 
-    // Mark as ready
+    // Client may send creationId + fileName (recommended)
+    const creationId = String(body.creationId || body.creationDocId || body.docId || "").trim() || id;
+    const fileName = String(body.fileName || "").trim() || "";
+    const watermarkApplied = !!billing?.watermarkApplied;
+
+    const finalized = await finalizeGeneratedVideo({
+      uid,
+      creationId,
+      sourceUrl,
+      fileName,
+      watermarkApplied,
+    });
+
+    const url = finalized.videoUrl;// Mark as ready
     await setLastResult(uid, {
       id,
       status: "ready",
@@ -1390,13 +1604,63 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       createdAt,
     });
 
-    // Send push/email if enabled
+    
+
+    // ✅ Update the user's creation doc if it exists (preferred direct path)
+    // users/{uid}/creations/{creationId}
+    try {
+      if (creationId) {
+        const creationRef = db.collection("users").doc(uid).collection("creations").doc(creationId);
+        const snap = await creationRef.get();
+        if (snap.exists) {
+          await creationRef.set(
+            {
+              videoUrl: url,
+              thumbUrl: finalized.thumbUrl || null,
+              storage: finalized.storage || null,
+              fileName: fileName || snap.data()?.fileName || null,
+              watermarkApplied: !!watermarkApplied,
+              status: "ready",
+              updatedAt: admin.firestore.Timestamp.now(),
+            },
+            { merge: true }
+          );
+        } else if (fileName) {
+          // fallback: find by fileName within this user's creations (subcollection query)
+          const q = await db
+            .collection("users")
+            .doc(uid)
+            .collection("creations")
+            .where("fileName", "==", fileName)
+            .limit(1)
+            .get();
+          if (!q.empty) {
+            await q.docs[0].ref.set(
+              {
+                videoUrl: url,
+                thumbUrl: finalized.thumbUrl || null,
+                storage: finalized.storage || null,
+                watermarkApplied: !!watermarkApplied,
+                status: "ready",
+                updatedAt: admin.firestore.Timestamp.now(),
+              },
+              { merge: true }
+            );
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("⚠️ creation doc update failed:", e?.message || e);
+    }
+// Send push/email if enabled
     try {
       await notifyUser({
         uid,
         type: "video",
         data: {
           url,
+          thumbUrl: finalized?.thumbUrl || null,
+          shareUrl: fileName ? `${SHARE_HOST}/d/${encodeURIComponent(fileName)}` : null,
           model,
           lengthSec,
           fps,
