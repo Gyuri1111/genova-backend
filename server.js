@@ -18,6 +18,14 @@ try {
   ffmpeg = require("fluent-ffmpeg");
   ffmpegPath = require("ffmpeg-static");
   if (ffmpeg && ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
+
+// 🔎 ffmpeg availability log (Render debug)
+try {
+  console.log("✅ ffmpeg available:", ffmpegPath);
+} catch (e) {
+  console.log("⚠️ ffmpeg path log failed:", e?.message || e);
+}
+
 } catch (e) {
   console.warn("⚠️ ffmpeg not available (install fluent-ffmpeg + ffmpeg-static)");
 }
@@ -60,7 +68,7 @@ require("dotenv").config();
 const { emailTemplate } = require("./src/utils/emailTemplate");
 
 const BUILD_TAG =
-  "WATERMARK_THUMB_STORAGE_UPLOAD_2026-01-22_v2_thumbfix";
+  "WATERMARK_THUMB_STORAGE_UPLOAD_2026-01-22_v3_thumbfix_ffmpeglog";
 
 
 /* =========================
