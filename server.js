@@ -12,14 +12,27 @@ const os = require("os");
 const { v4: uuidv4 } = require("uuid");
 
 // Thumbnail extraction (first frame)
+// - Requires: fluent-ffmpeg + ffmpeg-static (MUST be in dependencies, not devDependencies)
 let ffmpeg;
 let ffmpegPath;
 try {
   ffmpeg = require("fluent-ffmpeg");
+  // ffmpeg-static returns a full path to the bundled ffmpeg binary
   ffmpegPath = require("ffmpeg-static");
-  if (ffmpeg && ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
+
+  if (ffmpeg && ffmpegPath) {
+    // Allow override via env if ever needed
+    const forced = process.env.FFMPEG_PATH ? String(process.env.FFMPEG_PATH).trim() : "";
+    const p = forced || ffmpegPath;
+
+    ffmpeg.setFfmpegPath(p);
+    console.log("✅ ffmpeg available:", p);
+  } else {
+    console.warn("⚠️ ffmpeg modules loaded, but ffmpegPath missing");
+  }
 } catch (e) {
   console.warn("⚠️ ffmpeg not available (install fluent-ffmpeg + ffmpeg-static)");
+  console.warn("⚠️ ffmpeg init error:", e?.message || e);
 }
 
 
@@ -1273,6 +1286,7 @@ function ensureFfmpegAvailable() {
   if (!ffmpeg || !ffmpegPath) {
     const err = new Error("FFMPEG_NOT_AVAILABLE");
     err.code = "FFMPEG_NOT_AVAILABLE";
+    err.meta = { ffmpeg: !!ffmpeg, ffmpegPath: ffmpegPath || null };
     throw err;
   }
 }
