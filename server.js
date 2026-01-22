@@ -1674,16 +1674,8 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
 
     // Client may send creationId + fileName (recommended)
     const creationId = String(body.creationId || body.creationDocId || body.docId || "").trim() || id;
-    let fileName = String(body.fileName || "").trim() || "";
+    const fileName = String(body.fileName || "").trim() || "";
     const watermarkApplied = !!billing?.watermarkApplied;
-    // ✅ If client did not send fileName, generate a stable one (needed for Firestore + share)
-    if (!fileName) {
-      const now = new Date();
-      const pad = (n) => String(n).padStart(2, "0");
-      const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
-      fileName = `GeNova_${model}_${lengthSec}s_${resolution}_${fps}fps_${stamp}.mp4`;
-    }
-
 
     const finalized = await finalizeGeneratedVideo({
       uid,
@@ -1711,30 +1703,39 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     try {
       if (creationId) {
         const creationRef = db.collection("users").doc(uid).collection("creations").doc(creationId);
-        // ✅ Always create/update the creation doc (client might not pre-create it)
-        await creationRef.set(
-          {
-            uid,
-            createdAt: admin.firestore.Timestamp.now(),
-            model,
-            prompt: String(prompt || ""),
-            length: Number(lengthSec),
-            fps: Number(fps),
-            resolution: String(resolution),
-            hasImage: !!req.file,
-            fileName: String(fileName || ""),
-            status: "ready",
-            videoUrl: finalized?.videoUrl || null,
-            thumbUrl: finalized?.thumbUrl || null,
-            thumbnailUrl: finalized?.thumbUrl || null,
-            storage: finalized?.storage || null,
-            watermarkApplied: !!watermarkApplied,
-            updatedAt: admin.firestore.Timestamp.now(),
-          },
-          { merge: true }
-        );
-        console.log("✅ Firestore creation updated:", `users/${uid}/creations/${creationId}`);
-,
+        const snap = await creationRef.get();
+        if (snap.exists) {
+          await creationRef.set(
+            {
+              videoUrl: url,
+              thumbUrl: finalized.thumbUrl || null,
+              storage: finalized.storage || null,
+              fileName: fileName || snap.data()?.fileName || null,
+              watermarkApplied: !!watermarkApplied,
+              status: "ready",
+              updatedAt: admin.firestore.Timestamp.now(),
+            },
+            { merge: true }
+          );
+        } else if (fileName) {
+          // fallback: find by fileName within this user's creations (subcollection query)
+          const q = await db
+            .collection("users")
+            .doc(uid)
+            .collection("creations")
+            .where("fileName", "==", fileName)
+            .limit(1)
+            .get();
+          if (!q.empty) {
+            await q.docs[0].ref.set(
+              {
+                videoUrl: url,
+                thumbUrl: finalized.thumbUrl || null,
+                storage: finalized.storage || null,
+                watermarkApplied: !!watermarkApplied,
+                status: "ready",
+                updatedAt: admin.firestore.Timestamp.now(),
+              },
               { merge: true }
             );
           }
