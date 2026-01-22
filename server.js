@@ -1704,48 +1704,40 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       createdAt,
     });
 
-    // ✅ Update/create the user's creation doc (users/{uid}/creations/{creationId})
-    // NOTE: The client may NOT pre-create this doc, so we always `set(..., {merge:true})`.
+    
+
+    // ✅ Update the user's creation doc if it exists (preferred direct path)
+    // users/{uid}/creations/{creationId}
     try {
       if (creationId) {
         const creationRef = db.collection("users").doc(uid).collection("creations").doc(creationId);
-
+        // ✅ Always create/update the creation doc (client might not pre-create it)
         await creationRef.set(
           {
-            // Keep existing fields, but ensure these are present for Gallery + sharing
             uid,
-            fileName: fileName || null,
+            createdAt: admin.firestore.Timestamp.now(),
             model,
             prompt: String(prompt || ""),
             length: Number(lengthSec),
             fps: Number(fps),
-            resolution: String(resolution || ""),
+            resolution: String(resolution),
             hasImage: !!req.file,
-
+            fileName: String(fileName || ""),
             status: "ready",
-            videoUrl: url,
-
-            // ✅ This is what your UI expects
+            videoUrl: finalized?.videoUrl || null,
             thumbUrl: finalized?.thumbUrl || null,
-            // Optional alias (safe for older app code / share pages)
             thumbnailUrl: finalized?.thumbUrl || null,
-
             storage: finalized?.storage || null,
             watermarkApplied: !!watermarkApplied,
-
-            // If doc already exists, this just updates; if it doesn't, it creates
             updatedAt: admin.firestore.Timestamp.now(),
-            createdAt: createdAt || admin.firestore.Timestamp.now(),
           },
           { merge: true }
         );
-
-        console.log("✅ Firestore creation upserted:", `users/${uid}/creations/${creationId}`);
+        console.log("✅ Firestore creation updated:", `users/${uid}/creations/${creationId}`);
       }
     } catch (e) {
       console.warn("⚠️ creation doc update failed:", e?.message || e);
     }
-
 // Send push/email if enabled
     try {
       await notifyUser({
