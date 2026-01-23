@@ -1615,6 +1615,53 @@ app.post("/prompt-only", verifyFirebaseToken, async (req, res) => {
 });
 
 // Main video generation route (HomeScreen uses multipart FormData with optional file)
+
+// 🔎 Try to find an existing "pending" creation doc created by the client, so we don't create duplicates.
+// We avoid Firestore composite-index requirements by only ordering by createdAt and filtering in-memory.
+async function findRecentPendingCreationId(db, uid, { model, lengthSec, resolution, fps, fileName } = {}, windowMs = 5 * 60 * 1000) {
+  try {
+    const sinceMs = Date.now() - windowMs;
+    const col = db.collection("users").doc(uid).collection("creations");
+    // NOTE: we only order+limit, no where(), to avoid composite index needs.
+    const snap = await col.orderBy("createdAt", "desc").limit(25).get();
+    if (snap.empty) return null;
+
+    const wantModel = (model || "").trim();
+    const wantRes = (resolution || "").trim();
+    const wantFps = Number(fps) || 0;
+    const wantLen = Number(lengthSec) || 0;
+    const wantFile = (fileName || "").trim();
+
+    for (const doc of snap.docs) {
+      const d = doc.data() || {};
+      const createdAt = d.createdAt && typeof d.createdAt.toMillis === "function" ? d.createdAt.toMillis() : 0;
+      if (!createdAt || createdAt < sinceMs) continue;
+
+      const status = String(d.status || "").toLowerCase();
+      // pending-ish statuses (client often creates doc before backend finishes)
+      if (!["queued", "processing", "generating", "pending"].includes(status)) continue;
+
+      // If the doc is already finalized, skip
+      if (d.videoUrl || (d.storage && d.storage.videoPath)) continue;
+
+      // Soft match by metadata (only check if we have the fields)
+      if (wantModel && String(d.model || "").trim() && String(d.model || "").trim() !== wantModel) continue;
+      if (wantRes && String(d.resolution || "").trim() && String(d.resolution || "").trim() !== wantRes) continue;
+      if (wantFps && Number(d.fps) && Number(d.fps) !== wantFps) continue;
+      if (wantLen && Number(d.length) && Number(d.length) !== wantLen) continue;
+
+      // If client already wrote fileName and we also have one, match it.
+      if (wantFile && String(d.fileName || "").trim() && String(d.fileName || "").trim() !== wantFile) continue;
+
+      return doc.id;
+    }
+    return null;
+  } catch (e) {
+    console.warn("⚠️ findRecentPendingCreationId failed:", e?.message || e);
+    return null;
+  }
+}
+
 app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (req, res) => {
   try {
     const uid = req.uid;
@@ -1673,7 +1720,16 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const sourceUrl = `${baseUrl}/placeholder.mp4`;
 
     // Client may send creationId + fileName (recommended)
-    const creationId = String(body.creationId || body.creationDocId || body.docId || "").trim() || id;
+    const clientCreationId = String(body.creationId || body.creationDocId || body.docId || "").trim();
+    let creationId = clientCreationId || "";
+    if (!creationId) {
+      const pendingId = await findRecentPendingCreationId(db, uid, { model, lengthSec, resolution, fps, fileName });
+      if (pendingId) {
+        creationId = pendingId;
+        console.log("🧩 using existing pending creation docId (dedupe):", creationId);
+      }
+    }
+    if (!creationId) creationId = id;
     let fileName = String(body.fileName || "").trim() || "";
     const watermarkApplied = !!billing?.watermarkApplied;
     // ✅ If client did not send fileName, generate a stable one (needed for Firestore + share)
@@ -1748,24 +1804,34 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
               .limit(10)
               .get();
 
-            const updates = [];
+            const updates = []; // store DocumentSnapshots
             dupSnap.forEach((d) => {
-              if (d.id !== creationId) updates.push(d.ref);
+              if (d.id !== creationId) updates.push(doc);
             });
 
             if (updates.length) {
               const batch = db.batch();
               const nowTs = admin.firestore.Timestamp.now();
-              updates.forEach((ref) => {
+              updates.forEach((docSnap) => {
+                const d = docSnap.data() || {};
+                const ref = docSnap.ref;
+                const hasThumb = !!(d.thumbUrl || d.thumbnailUrl || (d.storage && (d.storage.thumbUrl || d.storage.thumbPath)));
+                const hasVideo = !!(d.videoUrl || (d.storage && d.storage.videoPath));
+                // If it's clearly an extra placeholder row (no video + no thumb), delete it to avoid duplicates.
+                if (!hasVideo && !hasThumb) {
+                  batch.delete(ref);
+                  return;
+                }
+                // Otherwise, keep it but backfill fields and mark as duplicate-of the canonical doc.
                 batch.set(
                   ref,
                   {
                     uid,
                     status: "ready",
-                    videoUrl: finalized?.videoUrl || null,
-                    thumbUrl: finalized?.thumbUrl || null,
-                    thumbnailUrl: finalized?.thumbUrl || null,
-                    storage: finalized?.storage || null,
+                    videoUrl: finalized?.videoUrl || d.videoUrl || null,
+                    thumbUrl: finalized?.thumbUrl || d.thumbUrl || null,
+                    thumbnailUrl: finalized?.thumbUrl || d.thumbnailUrl || null,
+                    storage: finalized?.storage || d.storage || null,
                     watermarkApplied: !!watermarkApplied,
                     updatedAt: nowTs,
                     duplicateOf: creationId,
