@@ -2328,7 +2328,6 @@ app.get("/s/:id", async (req, res) => {
       <p class="h">${escapeHtml(title)}</p>
       <p class="p">${escapeHtml(desc)}</p>
       <a class="btn" href="${escapeHtml(directUrl)}">Download / Open</a>
-      <div class="small">${escapeHtml(directUrl)}</div>
     </div>
   </div>
 </body>
