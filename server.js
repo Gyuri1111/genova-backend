@@ -1634,12 +1634,20 @@ async function findRecentPendingCreationId(db, uid, { model, lengthSec, resoluti
 
     for (const doc of snap.docs) {
       const d = doc.data() || {};
-      const createdAt = d.createdAt && typeof d.createdAt.toMillis === "function" ? d.createdAt.toMillis() : 0;
-      if (!createdAt || createdAt < sinceMs) continue;
+      const createdAt = (() => {
+      const v = d.createdAt ?? d.updatedAt ?? null;
+      if (!v) return 0;
+      if (typeof v === "number") return v;
+      if (v instanceof Date) return v.getTime();
+      if (typeof v.toMillis === "function") return v.toMillis(); // Firestore Timestamp
+      if (typeof v.seconds === "number") return v.seconds * 1000; // Timestamp-like
+      return 0;
+    })();
+      if (createdAt && createdAt < sinceMs) continue;
 
       const status = String(d.status || "").toLowerCase();
       // pending-ish statuses (client often creates doc before backend finishes)
-      if (!["queued", "processing", "generating", "pending"].includes(status)) continue;
+      if (!["queued", "processing", "generating", "pending", "created", "init"].includes(status)) continue;
 
       // If the doc is already finalized, skip
       if (d.videoUrl || (d.storage && d.storage.videoPath)) continue;
@@ -1805,8 +1813,8 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
               .get();
 
             const updates = []; // store DocumentSnapshots
-            dupSnap.forEach((d) => {
-              if (d.id !== creationId) updates.push(doc);
+            dupSnap.forEach((docSnap) => {
+              if (docSnap.id !== creationId) updates.push(docSnap);
             });
 
             if (updates.length) {
@@ -1818,7 +1826,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
                 const hasThumb = !!(d.thumbUrl || d.thumbnailUrl || (d.storage && (d.storage.thumbUrl || d.storage.thumbPath)));
                 const hasVideo = !!(d.videoUrl || (d.storage && d.storage.videoPath));
                 // If it's clearly an extra placeholder row (no video + no thumb), delete it to avoid duplicates.
-                if (!hasVideo && !hasThumb) {
+                if (!hasVideo || !hasThumb || ["queued","processing","generating","pending","created","init"].includes(String(d.status||"").toLowerCase())) {
                   batch.delete(ref);
                   return;
                 }
