@@ -1719,17 +1719,6 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const baseUrl = getPublicBaseUrl(req);
     const sourceUrl = `${baseUrl}/placeholder.mp4`;
 
-    // Client may send creationId + fileName (recommended)
-    const clientCreationId = String(body.creationId || body.creationDocId || body.docId || "").trim();
-    let creationId = clientCreationId || "";
-    if (!creationId) {
-      const pendingId = await findRecentPendingCreationId(db, uid, { model, lengthSec, resolution, fps, fileName });
-      if (pendingId) {
-        creationId = pendingId;
-        console.log("🧩 using existing pending creation docId (dedupe):", creationId);
-      }
-    }
-    if (!creationId) creationId = id;
     let fileName = String(body.fileName || "").trim() || "";
     const watermarkApplied = !!billing?.watermarkApplied;
     // ✅ If client did not send fileName, generate a stable one (needed for Firestore + share)
@@ -1741,6 +1730,17 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     }
 
 
+    // Client may send creationId + fileName (recommended)
+    const clientCreationId = String(body.creationId || body.creationDocId || body.docId || "").trim();
+    let creationId = clientCreationId || "";
+    if (!creationId) {
+      const pendingId = await findRecentPendingCreationId(db, uid, { model, lengthSec, resolution, fps, fileName });
+      if (pendingId) {
+        creationId = pendingId;
+        console.log("🧩 using existing pending creation docId (dedupe):", creationId);
+      }
+    }
+    if (!creationId) creationId = id;
     const finalized = await finalizeGeneratedVideo({
       uid,
       creationId,
