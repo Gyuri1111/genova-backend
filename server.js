@@ -291,24 +291,25 @@ app.get("/version", (_, res) => res.json({ ok: true, build: BUILD_TAG }));
 
 // ------------------------------------------------------------
 // 🔐 PASSWORD RESET (verified users only)
-// - Blocks reset email for:
-//   • non-registered emails
-//   • unverified accounts
 // ------------------------------------------------------------
 app.post("/send-password-reset", async (req, res) => {
   try {
     const rawEmail = String(req.body?.email || "");
     const email = rawEmail.trim().toLowerCase();
+    console.log("📩 /send-password-reset", { email });
+
     if (!email) return res.status(400).json({ ok: false, code: "MISSING_EMAIL" });
 
     let user;
     try {
       user = await admin.auth().getUserByEmail(email);
     } catch (e) {
+      console.log("🚫 reset: NOT_REGISTERED", { email });
       return res.status(404).json({ ok: false, code: "NOT_REGISTERED" });
     }
 
     if (!user?.emailVerified) {
+      console.log("🚫 reset: NOT_VERIFIED", { email, uid: user?.uid });
       return res.status(403).json({ ok: false, code: "NOT_VERIFIED" });
     }
 
@@ -328,6 +329,7 @@ app.post("/send-password-reset", async (req, res) => {
 
     await sendEmailWithFallback({ to: email, ...built });
 
+    console.log("✅ reset email sent", { email });
     return res.json({ ok: true });
   } catch (e) {
     console.log("❌ /send-password-reset error:", e);
