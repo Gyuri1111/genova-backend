@@ -288,6 +288,75 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 app.get("/version", (_, res) => res.json({ ok: true, build: BUILD_TAG }));
 
 // ------------------------------------------------------------
+// 🔐 Password reset email (ONLY for existing + verified accounts)
+//      - prevents sending reset for unregistered emails
+//      - prevents sending reset if the account is not email-verified
+//      - returns immediately (email sending happens async) so the app toast is instant
+// ------------------------------------------------------------
+app.post("/send-password-reset", async (req, res) => {
+  try {
+    const rawEmail = req?.body?.email;
+    const email = String(rawEmail || "").trim().toLowerCase();
+
+    // basic validation (avoid obvious garbage)
+    if (!email || !/\S+@\S+\.\S+/.test(email)) {
+      return res.status(400).json({ success: false, code: "INVALID_EMAIL" });
+    }
+
+    // 1) Must exist in Firebase Auth
+    let user;
+    try {
+      user = await admin.auth().getUserByEmail(email);
+    } catch (e) {
+      const msg = String(e?.code || e?.message || "");
+      if (msg.includes("auth/user-not-found")) {
+        return res.status(404).json({ success: false, code: "USER_NOT_FOUND" });
+      }
+      console.log("❌ getUserByEmail failed:", e);
+      return res.status(500).json({ success: false, code: "LOOKUP_FAILED" });
+    }
+
+    // 2) Must be verified (no reset for unverified signups)
+    if (!user?.emailVerified) {
+      return res.status(403).json({ success: false, code: "EMAIL_NOT_VERIFIED" });
+    }
+
+    const actionCodeSettings = {
+      url: "https://genova-labs.hu/reset.html",
+      handleCodeInApp: true,
+    };
+
+    // Generate link
+    const link = await admin.auth().generatePasswordResetLink(email, actionCodeSettings);
+
+    // Fire-and-forget send (so the response is immediate → toast shows instantly)
+    const subject = "Reset your GeNova password";
+    const html = emailTemplate({
+      title: "Reset your password",
+      message:
+        "We received a request to reset your GeNova password. If you requested this, click the button below. If not, you can safely ignore this email.",
+      buttonText: "Reset password",
+      buttonUrl: link,
+    });
+
+    sendEmailWithFallback({
+      to: email,
+      subject,
+      text: "Reset your GeNova password: " + link,
+      html,
+    })
+      .then((r) => console.log("✅ password reset email sent:", { email, provider: r?.provider || null }))
+      .catch((e) => console.log("❌ password reset email send failed:", { email, err: e?.message || e }));
+
+    return res.json({ success: true });
+  } catch (e) {
+    console.log("❌ /send-password-reset error:", e);
+    return res.status(500).json({ success: false, code: "SERVER_ERROR" });
+  }
+});
+
+
+// ------------------------------------------------------------
 // 🌍 i18n helpers (EN/HU/DE) for PUSH + lastResult
 // ------------------------------------------------------------
 function normalizeLang(lang) {
@@ -2328,6 +2397,7 @@ app.get("/s/:id", async (req, res) => {
       <p class="h">${escapeHtml(title)}</p>
       <p class="p">${escapeHtml(desc)}</p>
       <a class="btn" href="${escapeHtml(directUrl)}">Download / Open</a>
+      <div class="small">${escapeHtml(directUrl)}</div>
     </div>
   </div>
 </body>
