@@ -158,7 +158,7 @@ function getPublicBaseUrl(req) {
 app.use(express.json({ limit: "10mb" }));
 
 console.log("🔥 RUNNING SERVER FILE:", __filename);
-console.log("🔥 BUILD: FIX_TRIAL_DEBIT_DEFINED_2026-01-24_v4");
+console.log("🔥 BUILD: FIX_TRIAL_DEBIT_DEFINED_2026-01-24_v3_setLastResult");
 console.log("🔥 BUILD:", BUILD_TAG);
 
 // ------------------------------------------------------------
@@ -176,6 +176,25 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
+
+
+
+// ✅ lastResult helper — used by /generate-video + offline recovery endpoints
+async function setLastResult(uid, result) {
+  if (!uid) return;
+  try {
+    const userRef = db.collection("users").doc(uid);
+    const payload = {
+      ...(result || {}),
+      // ensure seenAt is cleared when setting a new result state
+      seenAt: null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    await userRef.set({ lastResult: payload }, { merge: true });
+  } catch (e) {
+    console.log("⚠️ setLastResult failed:", e?.message || String(e));
+  }
+}
 
 // 🔥 TRIAL/BILLING helper (hotfix) — ensures identifier exists in module scope
 console.log("🧩 ensureTrialValidateAndDebit hotfix loaded");
