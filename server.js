@@ -164,7 +164,7 @@ function isActiveUntil(tsLike, nowMs) {
  * - Debits credits
  * - Returns { cost, watermarkApplied, breakdown }
  */
-async function ensureTrialValidateAndDebit(uid, { model, lengthSec, fps, resolution } = {}) {
+global.ensureTrialValidateAndDebit = global.ensureTrialValidateAndDebit || (async function ensureTrialValidateAndDebit(uid, { model, lengthSec, fps, resolution } = {}) {
   if (!uid) {
     const err = new Error("NO_UID");
     err.code = "NO_UID";
@@ -298,7 +298,10 @@ async function ensureTrialValidateAndDebit(uid, { model, lengthSec, fps, resolut
   });
 
   return result;
-}
+});
+
+// ✅ Ensure local reference exists even if code is moved around
+const ensureTrialValidateAndDebit = global.ensureTrialValidateAndDebit;
 
   }
 
@@ -307,6 +310,13 @@ async function ensureTrialValidateAndDebit(uid, { model, lengthSec, fps, resolut
 
 
 const app = express();
+// 🔥 Build stamp for deployment verification
+const SERVER_BUILD_ID = "FIX_TRIAL_DEBIT_DEFINED_2026-01-24_v2";
+console.log("🔥 BUILD:", SERVER_BUILD_ID);
+
+// ✅ Deployment verification endpoint
+app.get("/__version", (req, res) => res.json({ ok: true, build: SERVER_BUILD_ID }));
+
 
 // ------------------------------------------------------------
 // ✅ Share host + OG image configuration
