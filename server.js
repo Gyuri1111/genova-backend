@@ -158,7 +158,7 @@ function getPublicBaseUrl(req) {
 app.use(express.json({ limit: "10mb" }));
 
 console.log("🔥 RUNNING SERVER FILE:", __filename);
-console.log("🔥 BUILD: FIX_TRIAL_DEBIT_DEFINED_2026-01-24_v3_setLastResult");
+console.log("🔥 BUILD: FIX_TRIAL_v6_no_drawtext_fallback_drawbox");
 console.log("🔥 BUILD:", BUILD_TAG);
 
 // ------------------------------------------------------------
@@ -746,7 +746,7 @@ async function applyWatermark(videoPath, outPath) {
       const text = (process.env.WATERMARK_TEXT || "GeNova").replace(/:/g, "\\:");
       cmd = cmd
         .videoFilters(
-          `drawtext=text='${text}':x=w-tw-24:y=h-th-24:fontsize=24:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=10`
+          `drawbox=x=w-260:y=h-80:w=240:h=56:color=black@0.28:t=fill`
         )
         .outputOptions(["-c:v libx264", "-preset veryfast", "-crf 22", "-c:a copy"]);
     }
