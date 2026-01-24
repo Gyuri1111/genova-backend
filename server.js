@@ -289,9 +289,6 @@ app.get("/version", (_, res) => res.json({ ok: true, build: BUILD_TAG }));
 
 
 
-// ------------------------------------------------------------
-// 🔐 PASSWORD RESET (verified users only)
-// ------------------------------------------------------------
 app.post("/send-password-reset", async (req, res) => {
   try {
     const rawEmail = String(req.body?.email || "");
@@ -336,6 +333,7 @@ app.post("/send-password-reset", async (req, res) => {
     return res.status(500).json({ ok: false, code: "SERVER_ERROR" });
   }
 });
+
 // ------------------------------------------------------------
 // 🌍 i18n helpers (EN/HU/DE) for PUSH + lastResult
 // ------------------------------------------------------------
