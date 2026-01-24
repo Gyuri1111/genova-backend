@@ -3,6 +3,8 @@
 //          + OFFLINE EDGE-CASE SUPPORT: lastResult + /my-latest-result + /mark-result-seen
 
 const admin = require("firebase-admin");
+
+const BUILD_ID = '20260124-140507-pwreset-v1';
 const { Expo } = require("expo-server-sdk");
 const express = require("express");
 const multer = require("multer");
@@ -114,6 +116,190 @@ const ns =
 if (Number.isFinite(sec) && sec > 0) {
   return sec * 1000 + (Number.isFinite(ns) ? Math.floor(ns / 1e6) : 0);
 }
+
+
+/* =========================
+   MONETIZATION + LIMITS
+   (server-side source of truth for generation validation)
+========================= */
+
+// If missing elsewhere, define here (prevents runtime ReferenceErrors)
+const MONETIZATION = {
+  DEFAULT_PLAN: "free",
+  TRIAL_GRANT_CREDITS: 5,   // granted once on first generation (best-effort)
+  GENERATION_COST: 1,       // 1 credit per generation (current app expectation)
+};
+
+// Plan limits used for /generate-video validation
+const PLAN_LIMITS = {
+  free:   { maxLength: 5,  maxFps: 30, maxResolution: "720p"  },
+  basic:  { maxLength: 5,  maxFps: 30, maxResolution: "1080p" },
+  pro:    { maxLength: 10, maxFps: 60, maxResolution: "4k"    },
+  studio: { maxLength: 20, maxFps: 60, maxResolution: "4k"    },
+};
+
+function normalizePlan(p) {
+  const v = String(p || "free").toLowerCase().trim();
+  if (v === "basic" || v === "pro" || v === "studio" || v === "free") return v;
+  return "free";
+}
+
+function resolutionRank(r) {
+  const v = String(r || "").toLowerCase().trim();
+  if (v === "4k" || v === "2160p") return 3;
+  if (v === "1440p") return 2;
+  if (v === "1080p") return 1;
+  return 0; // 720p or lower
+}
+
+function isActiveUntil(tsLike, nowMs) {
+  const ms = toMsFromTimestampLike(tsLike);
+  return !!(ms && ms > nowMs);
+}
+
+/**
+ * ✅ Billing + plan limits + credit debit (transaction)
+ * - Applies once-per-user trial credit grant (if not granted yet)
+ * - Validates length/fps/resolution against effective plan
+ * - Debits credits
+ * - Returns { cost, watermarkApplied, breakdown }
+ */
+async function ensureTrialValidateAndDebit(uid, { model, lengthSec, fps, resolution } = {}) {
+  if (!uid) {
+    const err = new Error("NO_UID");
+    err.code = "NO_UID";
+    throw err;
+  }
+
+  const userRef = db.collection("users").doc(uid);
+  const nowMs = Date.now();
+
+  const result = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+
+    // Create missing user doc (safe defaults)
+    if (!snap.exists) {
+      tx.set(
+        userRef,
+        {
+          credits: 0,
+          plan: MONETIZATION.DEFAULT_PLAN,
+          planUntil: null,
+          trialCreditsGranted: false,
+          entitlements: {},
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    const data = snap.exists ? (snap.data() || {}) : {};
+    const credits0 = typeof data.credits === "number" ? data.credits : Number(data.credits || 0) || 0;
+
+    // Apply expiry cleanup *inside* the transaction as well (prevents stale plan/entitlements)
+    try {
+      const patch = buildExpiryCleanupPatch(data, nowMs);
+      if (patch && Object.keys(patch).length) {
+        tx.update(userRef, patch);
+        // reflect changes locally for calculations (minimal)
+        if (patch.plan) data.plan = patch.plan;
+        if ("planUntil" in patch) data.planUntil = patch.planUntil;
+        if (data.entitlements && typeof data.entitlements === "object") {
+          for (const k of Object.keys(patch)) {
+            if (k.startsWith("entitlements.")) {
+              const kk = k.split(".")[1];
+              data.entitlements[kk] = patch[k];
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    const plan = normalizePlan(data.plan);
+    const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+
+    const wantLen = Math.max(1, Math.min(60, Number(lengthSec || 0) || 0));
+    const wantFps = Math.max(1, Math.min(120, Number(fps || 0) || 0));
+    const wantRes = String(resolution || "720p").trim();
+
+    if (wantLen > limits.maxLength) {
+      const err = new Error("LIMIT_LENGTH");
+      err.code = "LIMIT_LENGTH";
+      err.meta = { plan, maxLength: limits.maxLength, wantLen };
+      throw err;
+    }
+    if (wantFps > limits.maxFps) {
+      const err = new Error("LIMIT_FPS");
+      err.code = "LIMIT_FPS";
+      err.meta = { plan, maxFps: limits.maxFps, wantFps };
+      throw err;
+    }
+    if (resolutionRank(wantRes) > resolutionRank(limits.maxResolution)) {
+      const err = new Error("LIMIT_RESOLUTION");
+      err.code = "LIMIT_RESOLUTION";
+      err.meta = { plan, maxResolution: limits.maxResolution, wantRes };
+      throw err;
+    }
+
+    // Trial credit grant (one time). We still debit after granting.
+    let credits = credits0;
+    const trialGranted = !!data.trialCreditsGranted;
+    let trialDelta = 0;
+
+    if (!trialGranted) {
+      trialDelta = MONETIZATION.TRIAL_GRANT_CREDITS;
+      credits += trialDelta;
+      tx.set(
+        userRef,
+        {
+          trialCreditsGranted: true,
+          credits: admin.firestore.FieldValue.increment(trialDelta),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    const cost = MONETIZATION.GENERATION_COST;
+    if (credits < cost) {
+      const err = new Error("NO_CREDITS");
+      err.code = "NO_CREDITS";
+      err.meta = { credits, cost };
+      throw err;
+    }
+
+    // Watermark rule:
+    // - Applied if user does NOT have noWatermark entitlement active AND plan is not pro/studio
+    const ent = (data.entitlements && typeof data.entitlements === "object") ? data.entitlements : {};
+    const hasNoWatermark = isActiveUntil(ent.noWatermarkUntil, nowMs) || plan === "pro" || plan === "studio";
+    const watermarkApplied = !hasNoWatermark;
+
+    // Debit
+    tx.set(
+      userRef,
+      {
+        credits: admin.firestore.FieldValue.increment(-cost),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return {
+      cost,
+      watermarkApplied,
+      breakdown: {
+        plan,
+        limits,
+        want: { lengthSec: wantLen, fps: wantFps, resolution: wantRes, model: String(model || "") },
+        trialGrant: trialDelta,
+      },
+    };
+  });
+
+  return result;
+}
+
   }
 
   return null;
@@ -285,9 +471,60 @@ async function cleanupExpiredEntitlementsForUser(uid) {
 
 
 app.get("/health", (_, res) => res.json({ ok: true }));
-app.get("/version", (req, res) => {
-  res.json({ ok: true, version: "genova-backend", build: "20260124-pwreset-strict-v2" });
+app.get('/version', (req, res) => {
+  res.json({ ok: true, version: 'genova-backend', build: BUILD_ID });
 });
+
+
+// ------------------------------------------------------------
+// 🔐 PASSWORD RESET (verified users only) — BUILD_ID included
+// ------------------------------------------------------------
+app.post('/send-password-reset', async (req, res) => {
+  res.setHeader('X-GeNova-Build', BUILD_ID);
+  try {
+    const rawEmail = String(req.body?.email || '');
+    const email = rawEmail.trim().toLowerCase();
+    console.log('📩 /send-password-reset', { email, build: BUILD_ID });
+
+    if (!email) return res.status(400).json({ ok: false, code: 'MISSING_EMAIL', build: BUILD_ID });
+
+    let user;
+    try {
+      user = await admin.auth().getUserByEmail(email);
+    } catch (e) {
+      console.log('🚫 reset: NOT_REGISTERED', { email, build: BUILD_ID });
+      return res.status(404).json({ ok: false, code: 'NOT_REGISTERED', build: BUILD_ID });
+    }
+
+    if (!user?.emailVerified) {
+      console.log('🚫 reset: NOT_VERIFIED', { email, uid: user?.uid, build: BUILD_ID });
+      return res.status(403).json({ ok: false, code: 'NOT_VERIFIED', build: BUILD_ID });
+    }
+
+    const continueUrl = String(req.body?.continueUrl || 'https://genova-labs.hu/reset.html');
+    const link = await admin.auth().generatePasswordResetLink(email, { url: continueUrl });
+
+    const built = {
+      subject: 'Reset your GeNova password',
+      text: `Use this link to reset your password:\n${link}`,
+      html: emailTemplate({
+        title: 'Reset your password',
+        message: 'Click the button below to reset your GeNova password.',
+        buttonText: 'Reset password',
+        buttonUrl: link,
+      }),
+    };
+
+    await sendEmailWithFallback({ to: email, ...built });
+
+    console.log('✅ reset email sent', { email, build: BUILD_ID });
+    return res.json({ ok: true, build: BUILD_ID });
+  } catch (e) {
+    console.log('❌ /send-password-reset error:', e, { build: BUILD_ID });
+    return res.status(500).json({ ok: false, code: 'SERVER_ERROR', build: BUILD_ID });
+  }
+});
+
 
 // ------------------------------------------------------------
 // ✅ OFFLINE EDGE-CASE ENDPOINTS
@@ -1557,53 +1794,3 @@ app.get("/d/:filename", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
-
-// ------------------------------------------------------------
-// 🔐 PASSWORD RESET (registered + email verified only)
-// BUILD: 20260124-pwreset-strict-v2
-// ------------------------------------------------------------
-app.post("/send-password-reset", async (req, res) => {
-  try {
-    const rawEmail = String(req.body?.email || "");
-    const email = rawEmail.trim().toLowerCase();
-    console.log("📩 /send-password-reset", { email, build: "20260124-pwreset-strict-v2" });
-
-    if (!email) return res.status(400).json({ ok: false, code: "MISSING_EMAIL", build: "20260124-pwreset-strict-v2" });
-
-    let user;
-    try {
-      user = await admin.auth().getUserByEmail(email);
-    } catch (e) {
-      console.log("🚫 reset: NOT_REGISTERED", { email, build: "20260124-pwreset-strict-v2" });
-      return res.status(404).json({ ok: false, code: "NOT_REGISTERED", build: "20260124-pwreset-strict-v2" });
-    }
-
-    if (!user?.emailVerified) {
-      console.log("🚫 reset: NOT_VERIFIED", { email, uid: user?.uid, build: "20260124-pwreset-strict-v2" });
-      return res.status(403).json({ ok: false, code: "NOT_VERIFIED", build: "20260124-pwreset-strict-v2" });
-    }
-
-    const continueUrl = String(req.body?.continueUrl || "https://genova-labs.hu/reset.html");
-    const link = await admin.auth().generatePasswordResetLink(email, { url: continueUrl });
-
-    const built = {
-      subject: "Reset your GeNova password",
-      text: `Use this link to reset your password:\n${link}`,
-      html: emailTemplate({
-        title: "Reset your password",
-        message: "Click the button below to reset your GeNova password.",
-        buttonText: "Reset password",
-        buttonUrl: link,
-      }),
-    };
-
-    await sendEmailWithFallback({ to: email, ...built });
-
-    console.log("✅ reset email sent", { email, build: "20260124-pwreset-strict-v2" });
-    return res.json({ ok: true, build: "20260124-pwreset-strict-v2" });
-  } catch (e) {
-    console.log("❌ /send-password-reset error:", e);
-    return res.status(500).json({ ok: false, code: "SERVER_ERROR", build: "20260124-pwreset-strict-v2" });
-  }
-});
-
