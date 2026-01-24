@@ -116,193 +116,6 @@ const ns =
 if (Number.isFinite(sec) && sec > 0) {
   return sec * 1000 + (Number.isFinite(ns) ? Math.floor(ns / 1e6) : 0);
 }
-
-
-/* =========================
-   MONETIZATION + LIMITS
-   (server-side source of truth for generation validation)
-========================= */
-
-// If missing elsewhere, define here (prevents runtime ReferenceErrors)
-const MONETIZATION = {
-  DEFAULT_PLAN: "free",
-  TRIAL_GRANT_CREDITS: 5,   // granted once on first generation (best-effort)
-  GENERATION_COST: 1,       // 1 credit per generation (current app expectation)
-};
-
-// Plan limits used for /generate-video validation
-const PLAN_LIMITS = {
-  free:   { maxLength: 5,  maxFps: 30, maxResolution: "720p"  },
-  basic:  { maxLength: 5,  maxFps: 30, maxResolution: "1080p" },
-  pro:    { maxLength: 10, maxFps: 60, maxResolution: "4k"    },
-  studio: { maxLength: 20, maxFps: 60, maxResolution: "4k"    },
-};
-
-function normalizePlan(p) {
-  const v = String(p || "free").toLowerCase().trim();
-  if (v === "basic" || v === "pro" || v === "studio" || v === "free") return v;
-  return "free";
-}
-
-function resolutionRank(r) {
-  const v = String(r || "").toLowerCase().trim();
-  if (v === "4k" || v === "2160p") return 3;
-  if (v === "1440p") return 2;
-  if (v === "1080p") return 1;
-  return 0; // 720p or lower
-}
-
-function isActiveUntil(tsLike, nowMs) {
-  const ms = toMsFromTimestampLike(tsLike);
-  return !!(ms && ms > nowMs);
-}
-
-/**
- * ✅ Billing + plan limits + credit debit (transaction)
- * - Applies once-per-user trial credit grant (if not granted yet)
- * - Validates length/fps/resolution against effective plan
- * - Debits credits
- * - Returns { cost, watermarkApplied, breakdown }
- */
-global.ensureTrialValidateAndDebit = global.ensureTrialValidateAndDebit || (async function ensureTrialValidateAndDebit(uid, { model, lengthSec, fps, resolution } = {}) {
-  if (!uid) {
-    const err = new Error("NO_UID");
-    err.code = "NO_UID";
-    throw err;
-  }
-
-  const userRef = db.collection("users").doc(uid);
-  const nowMs = Date.now();
-
-  const result = await db.runTransaction(async (tx) => {
-    const snap = await tx.get(userRef);
-
-    // Create missing user doc (safe defaults)
-    if (!snap.exists) {
-      tx.set(
-        userRef,
-        {
-          credits: 0,
-          plan: MONETIZATION.DEFAULT_PLAN,
-          planUntil: null,
-          trialCreditsGranted: false,
-          entitlements: {},
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-    }
-
-    const data = snap.exists ? (snap.data() || {}) : {};
-    const credits0 = typeof data.credits === "number" ? data.credits : Number(data.credits || 0) || 0;
-
-    // Apply expiry cleanup *inside* the transaction as well (prevents stale plan/entitlements)
-    try {
-      const patch = buildExpiryCleanupPatch(data, nowMs);
-      if (patch && Object.keys(patch).length) {
-        tx.update(userRef, patch);
-        // reflect changes locally for calculations (minimal)
-        if (patch.plan) data.plan = patch.plan;
-        if ("planUntil" in patch) data.planUntil = patch.planUntil;
-        if (data.entitlements && typeof data.entitlements === "object") {
-          for (const k of Object.keys(patch)) {
-            if (k.startsWith("entitlements.")) {
-              const kk = k.split(".")[1];
-              data.entitlements[kk] = patch[k];
-            }
-          }
-        }
-      }
-    } catch (_) {}
-
-    const plan = normalizePlan(data.plan);
-    const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
-
-    const wantLen = Math.max(1, Math.min(60, Number(lengthSec || 0) || 0));
-    const wantFps = Math.max(1, Math.min(120, Number(fps || 0) || 0));
-    const wantRes = String(resolution || "720p").trim();
-
-    if (wantLen > limits.maxLength) {
-      const err = new Error("LIMIT_LENGTH");
-      err.code = "LIMIT_LENGTH";
-      err.meta = { plan, maxLength: limits.maxLength, wantLen };
-      throw err;
-    }
-    if (wantFps > limits.maxFps) {
-      const err = new Error("LIMIT_FPS");
-      err.code = "LIMIT_FPS";
-      err.meta = { plan, maxFps: limits.maxFps, wantFps };
-      throw err;
-    }
-    if (resolutionRank(wantRes) > resolutionRank(limits.maxResolution)) {
-      const err = new Error("LIMIT_RESOLUTION");
-      err.code = "LIMIT_RESOLUTION";
-      err.meta = { plan, maxResolution: limits.maxResolution, wantRes };
-      throw err;
-    }
-
-    // Trial credit grant (one time). We still debit after granting.
-    let credits = credits0;
-    const trialGranted = !!data.trialCreditsGranted;
-    let trialDelta = 0;
-
-    if (!trialGranted) {
-      trialDelta = MONETIZATION.TRIAL_GRANT_CREDITS;
-      credits += trialDelta;
-      tx.set(
-        userRef,
-        {
-          trialCreditsGranted: true,
-          credits: admin.firestore.FieldValue.increment(trialDelta),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-    }
-
-    const cost = MONETIZATION.GENERATION_COST;
-    if (credits < cost) {
-      const err = new Error("NO_CREDITS");
-      err.code = "NO_CREDITS";
-      err.meta = { credits, cost };
-      throw err;
-    }
-
-    // Watermark rule:
-    // - Applied if user does NOT have noWatermark entitlement active AND plan is not pro/studio
-    const ent = (data.entitlements && typeof data.entitlements === "object") ? data.entitlements : {};
-    const hasNoWatermark = isActiveUntil(ent.noWatermarkUntil, nowMs) || plan === "pro" || plan === "studio";
-    const watermarkApplied = !hasNoWatermark;
-
-    // Debit
-    tx.set(
-      userRef,
-      {
-        credits: admin.firestore.FieldValue.increment(-cost),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    return {
-      cost,
-      watermarkApplied,
-      breakdown: {
-        plan,
-        limits,
-        want: { lengthSec: wantLen, fps: wantFps, resolution: wantRes, model: String(model || "") },
-        trialGrant: trialDelta,
-      },
-    };
-  });
-
-  return result;
-});
-
-// ✅ Ensure local reference exists even if code is moved around
-const ensureTrialValidateAndDebit = global.ensureTrialValidateAndDebit;
-
   }
 
   return null;
@@ -310,13 +123,6 @@ const ensureTrialValidateAndDebit = global.ensureTrialValidateAndDebit;
 
 
 const app = express();
-// 🔥 Build stamp for deployment verification
-const SERVER_BUILD_ID = "FIX_TRIAL_DEBIT_DEFINED_2026-01-24_v2";
-console.log("🔥 BUILD:", SERVER_BUILD_ID);
-
-// ✅ Deployment verification endpoint
-app.get("/__version", (req, res) => res.json({ ok: true, build: SERVER_BUILD_ID }));
-
 
 // ------------------------------------------------------------
 // ✅ Share host + OG image configuration
@@ -352,7 +158,8 @@ function getPublicBaseUrl(req) {
 app.use(express.json({ limit: "10mb" }));
 
 console.log("🔥 RUNNING SERVER FILE:", __filename);
-console.log("🔥 BUILD:FIX_TRIAL_DEBIT_DEFINED_2026-01-24_v1");
+console.log("🔥 BUILD: FIX_TRIAL_DEBIT_DEFINED_2026-01-24_v4");
+console.log("🔥 BUILD:", BUILD_TAG);
 
 // ------------------------------------------------------------
 // Firebase Admin init
@@ -368,6 +175,117 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
+
+
+// 🔥 TRIAL/BILLING helper (hotfix) — ensures identifier exists in module scope
+console.log("🧩 ensureTrialValidateAndDebit hotfix loaded");
+
+const PLAN_LIMITS = {
+  free:   { maxLength: 5,  maxFps: 30, maxResolution: "720p"  },
+  basic:  { maxLength: 5,  maxFps: 30, maxResolution: "1080p" },
+  pro:    { maxLength: 10, maxFps: 60, maxResolution: "4k"    },
+  studio: { maxLength: 20, maxFps: 60, maxResolution: "4k"    },
+};
+
+function normalizePlan(p) {
+  const v = String(p || "free").toLowerCase().trim();
+  return (v === "basic" || v === "pro" || v === "studio" || v === "free") ? v : "free";
+}
+
+function resolutionRank(r) {
+  const v = String(r || "").toLowerCase().trim();
+  if (v === "4k" || v === "2160p") return 3;
+  if (v === "1440p") return 2;
+  if (v === "1080p") return 1;
+  return 0;
+}
+
+function toMsFromTimestampLikeSafe(v) {
+  try {
+    if (!v) return 0;
+    if (typeof v === "number") return v;
+    if (v.toDate) return +v.toDate();
+    if (v._seconds) return (v._seconds * 1000) + Math.floor((v._nanoseconds || 0) / 1e6);
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
+function isActiveUntil(tsLike, nowMs) {
+  const ms = toMsFromTimestampLikeSafe(tsLike);
+  return !!(ms && ms > nowMs);
+}
+
+global.ensureTrialValidateAndDebit = global.ensureTrialValidateAndDebit || (async function ensureTrialValidateAndDebit(uid, { model, lengthSec, fps, resolution } = {}) {
+  if (!uid) {
+    const err = new Error("NO_UID");
+    err.code = "NO_UID";
+    throw err;
+  }
+
+  const userRef = db.collection("users").doc(uid);
+  const nowMs = Date.now();
+
+  return await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const data = snap.exists ? (snap.data() || {}) : {};
+
+    // best-effort ensure numeric credits
+    const credits0 = typeof data.credits === "number" ? data.credits : Number(data.credits || 0) || 0;
+
+    const plan = normalizePlan(data.plan);
+    const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+
+    const wantLen = Math.max(1, Math.min(60, Number(lengthSec || 0) || 0));
+    const wantFps = Math.max(1, Math.min(120, Number(fps || 0) || 0));
+    const wantRes = String(resolution || "720p").trim();
+
+    if (wantLen > limits.maxLength) {
+      const err = new Error("LIMIT_LENGTH");
+      err.code = "LIMIT_LENGTH";
+      err.meta = { plan, maxLength: limits.maxLength, wantLen };
+      throw err;
+    }
+    if (wantFps > limits.maxFps) {
+      const err = new Error("LIMIT_FPS");
+      err.code = "LIMIT_FPS";
+      err.meta = { plan, maxFps: limits.maxFps, wantFps };
+      throw err;
+    }
+    if (resolutionRank(wantRes) > resolutionRank(limits.maxResolution)) {
+      const err = new Error("LIMIT_RESOLUTION");
+      err.code = "LIMIT_RESOLUTION";
+      err.meta = { plan, maxResolution: limits.maxResolution, wantRes };
+      throw err;
+    }
+
+    // debit 1 credit
+    const cost = 1;
+    if (credits0 < cost) {
+      const err = new Error("NO_CREDITS");
+      err.code = "NO_CREDITS";
+      err.meta = { credits: credits0, cost };
+      throw err;
+    }
+
+    // watermark: pro/studio or active entitlement noWatermarkUntil
+    const ent = (data.entitlements && typeof data.entitlements === "object") ? data.entitlements : {};
+    const hasNoWatermark = isActiveUntil(ent.noWatermarkUntil, nowMs) || plan === "pro" || plan === "studio";
+    const watermarkApplied = !hasNoWatermark;
+
+    tx.set(userRef, {
+      credits: admin.firestore.FieldValue.increment(-cost),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return { cost, watermarkApplied, breakdown: { plan, limits, want: { lengthSec: wantLen, fps: wantFps, resolution: wantRes, model: String(model || "") } } };
+  });
+});
+
+// ✅ make module-scope identifier always exist (prevents ReferenceError)
+const ensureTrialValidateAndDebit = global.ensureTrialValidateAndDebit;
+
 const expo = new Expo();
 
 // ------------------------------------------------------------
@@ -1055,7 +973,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     }
 
     // ✅ Billing + plan limits + credit debit (transaction)
-    const billing = await ensureTrialValidateAndDebit(uid, {
+    const billing = await (global.ensureTrialValidateAndDebit || ensureTrialValidateAndDebit)(uid, {
       model,
       lengthSec,
       fps,
