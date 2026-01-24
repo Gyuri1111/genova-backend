@@ -289,6 +289,9 @@ app.get("/version", (_, res) => res.json({ ok: true, build: BUILD_TAG }));
 
 
 
+// ------------------------------------------------------------
+// 🔐 PASSWORD RESET (verified users only)
+// ------------------------------------------------------------
 app.post("/send-password-reset", async (req, res) => {
   try {
     const rawEmail = String(req.body?.email || "");
