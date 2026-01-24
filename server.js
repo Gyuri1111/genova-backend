@@ -342,7 +342,7 @@ function getPublicBaseUrl(req) {
 app.use(express.json({ limit: "10mb" }));
 
 console.log("🔥 RUNNING SERVER FILE:", __filename);
-console.log("🔥 BUILD:FIX_TRIAL_DEBIT_DEFINED_2026-01-24_v1
+console.log("🔥 BUILD:FIX_TRIAL_DEBIT_DEFINED_2026-01-24_v1");
 
 // ------------------------------------------------------------
 // Firebase Admin init
