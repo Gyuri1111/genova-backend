@@ -287,75 +287,53 @@ async function cleanupExpiredEntitlementsForUser(uid) {
 app.get("/health", (_, res) => res.json({ ok: true }));
 app.get("/version", (_, res) => res.json({ ok: true, build: BUILD_TAG }));
 
+
+
 // ------------------------------------------------------------
-// 🔐 Password reset email (ONLY for existing + verified accounts)
-//      - prevents sending reset for unregistered emails
-//      - prevents sending reset if the account is not email-verified
-//      - returns immediately (email sending happens async) so the app toast is instant
+// 🔐 PASSWORD RESET (verified users only)
+// - Blocks reset email for:
+//   • non-registered emails
+//   • unverified accounts
 // ------------------------------------------------------------
 app.post("/send-password-reset", async (req, res) => {
   try {
-    const rawEmail = req?.body?.email;
-    const email = String(rawEmail || "").trim().toLowerCase();
+    const rawEmail = String(req.body?.email || "");
+    const email = rawEmail.trim().toLowerCase();
+    if (!email) return res.status(400).json({ ok: false, code: "MISSING_EMAIL" });
 
-    // basic validation (avoid obvious garbage)
-    if (!email || !/\S+@\S+\.\S+/.test(email)) {
-      return res.status(400).json({ success: false, code: "INVALID_EMAIL" });
-    }
-
-    // 1) Must exist in Firebase Auth
     let user;
     try {
       user = await admin.auth().getUserByEmail(email);
     } catch (e) {
-      const msg = String(e?.code || e?.message || "");
-      if (msg.includes("auth/user-not-found")) {
-        return res.status(404).json({ success: false, code: "USER_NOT_FOUND" });
-      }
-      console.log("❌ getUserByEmail failed:", e);
-      return res.status(500).json({ success: false, code: "LOOKUP_FAILED" });
+      return res.status(404).json({ ok: false, code: "NOT_REGISTERED" });
     }
 
-    // 2) Must be verified (no reset for unverified signups)
     if (!user?.emailVerified) {
-      return res.status(403).json({ success: false, code: "EMAIL_NOT_VERIFIED" });
+      return res.status(403).json({ ok: false, code: "NOT_VERIFIED" });
     }
 
-    const actionCodeSettings = {
-      url: "https://genova-labs.hu/reset.html",
-      handleCodeInApp: true,
+    const continueUrl = String(req.body?.continueUrl || "https://genova-labs.hu/reset.html");
+    const link = await admin.auth().generatePasswordResetLink(email, { url: continueUrl });
+
+    const built = {
+      subject: "Reset your GeNova password",
+      text: `Use this link to reset your password:\n${link}`,
+      html: emailTemplate({
+        title: "Reset your password",
+        message: "Click the button below to reset your GeNova password.",
+        buttonText: "Reset password",
+        buttonUrl: link,
+      }),
     };
 
-    // Generate link
-    const link = await admin.auth().generatePasswordResetLink(email, actionCodeSettings);
+    await sendEmailWithFallback({ to: email, ...built });
 
-    // Fire-and-forget send (so the response is immediate → toast shows instantly)
-    const subject = "Reset your GeNova password";
-    const html = emailTemplate({
-      title: "Reset your password",
-      message:
-        "We received a request to reset your GeNova password. If you requested this, click the button below. If not, you can safely ignore this email.",
-      buttonText: "Reset password",
-      buttonUrl: link,
-    });
-
-    sendEmailWithFallback({
-      to: email,
-      subject,
-      text: "Reset your GeNova password: " + link,
-      html,
-    })
-      .then((r) => console.log("✅ password reset email sent:", { email, provider: r?.provider || null }))
-      .catch((e) => console.log("❌ password reset email send failed:", { email, err: e?.message || e }));
-
-    return res.json({ success: true });
+    return res.json({ ok: true });
   } catch (e) {
     console.log("❌ /send-password-reset error:", e);
-    return res.status(500).json({ success: false, code: "SERVER_ERROR" });
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR" });
   }
 });
-
-
 // ------------------------------------------------------------
 // 🌍 i18n helpers (EN/HU/DE) for PUSH + lastResult
 // ------------------------------------------------------------
