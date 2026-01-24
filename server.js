@@ -3,8 +3,6 @@
 //          + OFFLINE EDGE-CASE SUPPORT: lastResult + /my-latest-result + /mark-result-seen
 
 const admin = require("firebase-admin");
-
-const BUILD_ID = '20260124-140507-pwreset-v1';
 const { Expo } = require("expo-server-sdk");
 const express = require("express");
 const multer = require("multer");
@@ -287,60 +285,9 @@ async function cleanupExpiredEntitlementsForUser(uid) {
 
 
 app.get("/health", (_, res) => res.json({ ok: true }));
-app.get('/version', (req, res) => {
-  res.json({ ok: true, version: 'genova-backend', build: BUILD_ID });
+app.get("/version", (req, res) => {
+  res.json({ ok: true, version: "genova-backend", build: "20260124-pwreset-strict-v2" });
 });
-
-
-// ------------------------------------------------------------
-// 🔐 PASSWORD RESET (verified users only) — BUILD_ID included
-// ------------------------------------------------------------
-app.post('/send-password-reset', async (req, res) => {
-  res.setHeader('X-GeNova-Build', BUILD_ID);
-  try {
-    const rawEmail = String(req.body?.email || '');
-    const email = rawEmail.trim().toLowerCase();
-    console.log('📩 /send-password-reset', { email, build: BUILD_ID });
-
-    if (!email) return res.status(400).json({ ok: false, code: 'MISSING_EMAIL', build: BUILD_ID });
-
-    let user;
-    try {
-      user = await admin.auth().getUserByEmail(email);
-    } catch (e) {
-      console.log('🚫 reset: NOT_REGISTERED', { email, build: BUILD_ID });
-      return res.status(404).json({ ok: false, code: 'NOT_REGISTERED', build: BUILD_ID });
-    }
-
-    if (!user?.emailVerified) {
-      console.log('🚫 reset: NOT_VERIFIED', { email, uid: user?.uid, build: BUILD_ID });
-      return res.status(403).json({ ok: false, code: 'NOT_VERIFIED', build: BUILD_ID });
-    }
-
-    const continueUrl = String(req.body?.continueUrl || 'https://genova-labs.hu/reset.html');
-    const link = await admin.auth().generatePasswordResetLink(email, { url: continueUrl });
-
-    const built = {
-      subject: 'Reset your GeNova password',
-      text: `Use this link to reset your password:\n${link}`,
-      html: emailTemplate({
-        title: 'Reset your password',
-        message: 'Click the button below to reset your GeNova password.',
-        buttonText: 'Reset password',
-        buttonUrl: link,
-      }),
-    };
-
-    await sendEmailWithFallback({ to: email, ...built });
-
-    console.log('✅ reset email sent', { email, build: BUILD_ID });
-    return res.json({ ok: true, build: BUILD_ID });
-  } catch (e) {
-    console.log('❌ /send-password-reset error:', e, { build: BUILD_ID });
-    return res.status(500).json({ ok: false, code: 'SERVER_ERROR', build: BUILD_ID });
-  }
-});
-
 
 // ------------------------------------------------------------
 // ✅ OFFLINE EDGE-CASE ENDPOINTS
@@ -1610,3 +1557,53 @@ app.get("/d/:filename", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
+
+// ------------------------------------------------------------
+// 🔐 PASSWORD RESET (registered + email verified only)
+// BUILD: 20260124-pwreset-strict-v2
+// ------------------------------------------------------------
+app.post("/send-password-reset", async (req, res) => {
+  try {
+    const rawEmail = String(req.body?.email || "");
+    const email = rawEmail.trim().toLowerCase();
+    console.log("📩 /send-password-reset", { email, build: "20260124-pwreset-strict-v2" });
+
+    if (!email) return res.status(400).json({ ok: false, code: "MISSING_EMAIL", build: "20260124-pwreset-strict-v2" });
+
+    let user;
+    try {
+      user = await admin.auth().getUserByEmail(email);
+    } catch (e) {
+      console.log("🚫 reset: NOT_REGISTERED", { email, build: "20260124-pwreset-strict-v2" });
+      return res.status(404).json({ ok: false, code: "NOT_REGISTERED", build: "20260124-pwreset-strict-v2" });
+    }
+
+    if (!user?.emailVerified) {
+      console.log("🚫 reset: NOT_VERIFIED", { email, uid: user?.uid, build: "20260124-pwreset-strict-v2" });
+      return res.status(403).json({ ok: false, code: "NOT_VERIFIED", build: "20260124-pwreset-strict-v2" });
+    }
+
+    const continueUrl = String(req.body?.continueUrl || "https://genova-labs.hu/reset.html");
+    const link = await admin.auth().generatePasswordResetLink(email, { url: continueUrl });
+
+    const built = {
+      subject: "Reset your GeNova password",
+      text: `Use this link to reset your password:\n${link}`,
+      html: emailTemplate({
+        title: "Reset your password",
+        message: "Click the button below to reset your GeNova password.",
+        buttonText: "Reset password",
+        buttonUrl: link,
+      }),
+    };
+
+    await sendEmailWithFallback({ to: email, ...built });
+
+    console.log("✅ reset email sent", { email, build: "20260124-pwreset-strict-v2" });
+    return res.json({ ok: true, build: "20260124-pwreset-strict-v2" });
+  } catch (e) {
+    console.log("❌ /send-password-reset error:", e);
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR", build: "20260124-pwreset-strict-v2" });
+  }
+});
+
