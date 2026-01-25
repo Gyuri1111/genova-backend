@@ -7,6 +7,15 @@ const admin = require("firebase-admin");
 const BUILD_ID = '20260124-140507-pwreset-v1';
 const { Expo } = require("expo-server-sdk");
 const express = require("express");
+
+
+// 🧯 Crash guards (Render 502 often caused by silent crash)
+process.on("unhandledRejection", (reason) => {
+  console.log("🧯 UNHANDLED_REJECTION:", reason?.stack || reason?.message || String(reason));
+});
+process.on("uncaughtException", (err) => {
+  console.log("🧯 UNCAUGHT_EXCEPTION:", err?.stack || err?.message || String(err));
+});
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
@@ -116,109 +125,6 @@ const ns =
 if (Number.isFinite(sec) && sec > 0) {
   return sec * 1000 + (Number.isFinite(ns) ? Math.floor(ns / 1e6) : 0);
 }
-
-
-/* =========================
-   BILLING + LIMITS (server-side truth for generation)
-========================= */
-
-const PLAN_LIMITS = {
-  free:   { maxLength: 5,  maxFps: 30, maxResolution: "720p"  },
-  basic:  { maxLength: 5,  maxFps: 30, maxResolution: "1080p" },
-  pro:    { maxLength: 10, maxFps: 60, maxResolution: "4k"    },
-  studio: { maxLength: 20, maxFps: 60, maxResolution: "4k"    },
-};
-
-function normalizePlan(p) {
-  const v = String(p || "free").toLowerCase().trim();
-  return (v === "basic" || v === "pro" || v === "studio" || v === "free") ? v : "free";
-}
-
-function resolutionRank(r) {
-  const v = String(r || "").toLowerCase().trim();
-  if (v === "4k" || v === "2160p") return 3;
-  if (v === "1440p") return 2;
-  if (v === "1080p") return 1;
-  return 0; // 720p or lower
-}
-
-function isActiveUntil(tsLike, nowMs) {
-  try {
-    const ms = toMsFromTimestampLike(tsLike);
-    return !!(ms && ms > nowMs);
-  } catch {
-    return false;
-  }
-}
-
-async function ensureTrialValidateAndDebit(uid, { model, lengthSec, fps, resolution } = {}) {
-  if (!uid) {
-    const err = new Error("NO_UID");
-    err.code = "NO_UID";
-    throw err;
-  }
-
-  const userRef = db.collection("users").doc(uid);
-  const nowMs = Date.now();
-
-  return await db.runTransaction(async (tx) => {
-    const snap = await tx.get(userRef);
-    const data = snap.exists ? (snap.data() || {}) : {};
-
-    const credits0 = typeof data.credits === "number" ? data.credits : (Number(data.credits || 0) || 0);
-
-    const plan = normalizePlan(data.plan);
-    const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
-
-    const wantLen = Math.max(1, Math.min(60, Number(lengthSec || 0) || 0));
-    const wantFps = Math.max(1, Math.min(120, Number(fps || 0) || 0));
-    const wantRes = String(resolution || "720p").trim();
-
-    if (wantLen > limits.maxLength) {
-      const err = new Error("LIMIT_LENGTH");
-      err.code = "LIMIT_LENGTH";
-      err.meta = { plan, maxLength: limits.maxLength, wantLen };
-      throw err;
-    }
-    if (wantFps > limits.maxFps) {
-      const err = new Error("LIMIT_FPS");
-      err.code = "LIMIT_FPS";
-      err.meta = { plan, maxFps: limits.maxFps, wantFps };
-      throw err;
-    }
-    if (resolutionRank(wantRes) > resolutionRank(limits.maxResolution)) {
-      const err = new Error("LIMIT_RESOLUTION");
-      err.code = "LIMIT_RESOLUTION";
-      err.meta = { plan, maxResolution: limits.maxResolution, wantRes };
-      throw err;
-    }
-
-    // debit 1 credit (current app expectation)
-    const cost = 1;
-    if (credits0 < cost) {
-      const err = new Error("NO_CREDITS");
-      err.code = "NO_CREDITS";
-      err.meta = { credits: credits0, cost };
-      throw err;
-    }
-
-    const ent = (data.entitlements && typeof data.entitlements === "object") ? data.entitlements : {};
-    const hasNoWatermark = isActiveUntil(ent.noWatermarkUntil, nowMs) || plan === "pro" || plan === "studio";
-    const watermarkApplied = !hasNoWatermark;
-
-    tx.set(userRef, {
-      credits: admin.firestore.FieldValue.increment(-cost),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-
-    return {
-      cost,
-      watermarkApplied,
-      breakdown: { plan, limits, want: { lengthSec: wantLen, fps: wantFps, resolution: wantRes, model: String(model || "") } }
-    };
-  });
-}
-
   }
 
   return null;
@@ -226,43 +132,6 @@ async function ensureTrialValidateAndDebit(uid, { model, lengthSec, fps, resolut
 
 
 const app = express();
-
-
-
-// 🌍 Viewer language (share page) — auto by viewer browser (Accept-Language)
-function resolveViewerLang(req) {
-  const al = String(req.headers["accept-language"] || "").toLowerCase();
-  if (al.startsWith("hu")) return "hu";
-  if (al.startsWith("de")) return "de";
-  return "en";
-}
-
-const VIEW_I18N = {
-  hu: {
-    openInApp: "${T.openInApp}",
-    home: "${T.home}",
-    engine: "${T.engine}",
-    length: "${T.length}",
-    resolution: "${T.resolution}",
-    fps: "FPS",
-  },
-  en: {
-    openInApp: "Open in app",
-    home: "Home",
-    engine: "Engine",
-    length: "Length",
-    resolution: "Resolution",
-    fps: "FPS",
-  },
-  de: {
-    openInApp: "In App öffnen",
-    home: "Startseite",
-    engine: "Engine",
-    length: "Länge",
-    resolution: "Auflösung",
-    fps: "FPS",
-  },
-};
 
 // ------------------------------------------------------------
 // ✅ Share host + OG image configuration
@@ -298,6 +167,7 @@ function getPublicBaseUrl(req) {
 app.use(express.json({ limit: "10mb" }));
 
 console.log("🔥 RUNNING SERVER FILE:", __filename);
+console.log("🔥 BUILD: HOTFIX_502_WATERMARK_GUARDS_2026-01-25_v1");
 console.log("🔥 BUILD:", BUILD_TAG);
 
 // ------------------------------------------------------------
@@ -316,13 +186,16 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 
-// ✅ lastResult helper — used by /generate-video + viewer endpoints
+
+
+// ✅ lastResult helper — used by /generate-video + offline recovery endpoints
 async function setLastResult(uid, result) {
   if (!uid) return;
   try {
     const userRef = db.collection("users").doc(uid);
     const payload = {
       ...(result || {}),
+      // ensure seenAt is cleared when setting a new result state
       seenAt: null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
@@ -331,6 +204,115 @@ async function setLastResult(uid, result) {
     console.log("⚠️ setLastResult failed:", e?.message || String(e));
   }
 }
+
+// 🔥 TRIAL/BILLING helper (hotfix) — ensures identifier exists in module scope
+console.log("🧩 ensureTrialValidateAndDebit hotfix loaded");
+
+const PLAN_LIMITS = {
+  free:   { maxLength: 5,  maxFps: 30, maxResolution: "720p"  },
+  basic:  { maxLength: 5,  maxFps: 30, maxResolution: "1080p" },
+  pro:    { maxLength: 10, maxFps: 60, maxResolution: "4k"    },
+  studio: { maxLength: 20, maxFps: 60, maxResolution: "4k"    },
+};
+
+function normalizePlan(p) {
+  const v = String(p || "free").toLowerCase().trim();
+  return (v === "basic" || v === "pro" || v === "studio" || v === "free") ? v : "free";
+}
+
+function resolutionRank(r) {
+  const v = String(r || "").toLowerCase().trim();
+  if (v === "4k" || v === "2160p") return 3;
+  if (v === "1440p") return 2;
+  if (v === "1080p") return 1;
+  return 0;
+}
+
+function toMsFromTimestampLikeSafe(v) {
+  try {
+    if (!v) return 0;
+    if (typeof v === "number") return v;
+    if (v.toDate) return +v.toDate();
+    if (v._seconds) return (v._seconds * 1000) + Math.floor((v._nanoseconds || 0) / 1e6);
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
+function isActiveUntil(tsLike, nowMs) {
+  const ms = toMsFromTimestampLikeSafe(tsLike);
+  return !!(ms && ms > nowMs);
+}
+
+global.ensureTrialValidateAndDebit = global.ensureTrialValidateAndDebit || (async function ensureTrialValidateAndDebit(uid, { model, lengthSec, fps, resolution } = {}) {
+  if (!uid) {
+    const err = new Error("NO_UID");
+    err.code = "NO_UID";
+    throw err;
+  }
+
+  const userRef = db.collection("users").doc(uid);
+  const nowMs = Date.now();
+
+  return await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const data = snap.exists ? (snap.data() || {}) : {};
+
+    // best-effort ensure numeric credits
+    const credits0 = typeof data.credits === "number" ? data.credits : Number(data.credits || 0) || 0;
+
+    const plan = normalizePlan(data.plan);
+    const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+
+    const wantLen = Math.max(1, Math.min(60, Number(lengthSec || 0) || 0));
+    const wantFps = Math.max(1, Math.min(120, Number(fps || 0) || 0));
+    const wantRes = String(resolution || "720p").trim();
+
+    if (wantLen > limits.maxLength) {
+      const err = new Error("LIMIT_LENGTH");
+      err.code = "LIMIT_LENGTH";
+      err.meta = { plan, maxLength: limits.maxLength, wantLen };
+      throw err;
+    }
+    if (wantFps > limits.maxFps) {
+      const err = new Error("LIMIT_FPS");
+      err.code = "LIMIT_FPS";
+      err.meta = { plan, maxFps: limits.maxFps, wantFps };
+      throw err;
+    }
+    if (resolutionRank(wantRes) > resolutionRank(limits.maxResolution)) {
+      const err = new Error("LIMIT_RESOLUTION");
+      err.code = "LIMIT_RESOLUTION";
+      err.meta = { plan, maxResolution: limits.maxResolution, wantRes };
+      throw err;
+    }
+
+    // debit 1 credit
+    const cost = 1;
+    if (credits0 < cost) {
+      const err = new Error("NO_CREDITS");
+      err.code = "NO_CREDITS";
+      err.meta = { credits: credits0, cost };
+      throw err;
+    }
+
+    // watermark: pro/studio or active entitlement noWatermarkUntil
+    const ent = (data.entitlements && typeof data.entitlements === "object") ? data.entitlements : {};
+    const hasNoWatermark = isActiveUntil(ent.noWatermarkUntil, nowMs) || plan === "pro" || plan === "studio";
+    const watermarkApplied = !hasNoWatermark;
+
+    tx.set(userRef, {
+      credits: admin.firestore.FieldValue.increment(-cost),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return { cost, watermarkApplied, breakdown: { plan, limits, want: { lengthSec: wantLen, fps: wantFps, resolution: wantRes, model: String(model || "") } } };
+  });
+});
+
+// ✅ make module-scope identifier always exist (prevents ReferenceError)
+const ensureTrialValidateAndDebit = global.ensureTrialValidateAndDebit;
 
 const expo = new Expo();
 
@@ -772,7 +754,9 @@ async function applyWatermark(videoPath, outPath) {
       // NOTE: font selection is platform-dependent; default font should work on most Linux images.
       const text = (process.env.WATERMARK_TEXT || "GeNova").replace(/:/g, "\\:");
       cmd = cmd
-        .videoFilters(`drawbox=x=w-260:y=h-80:w=240:h=56:color=black@0.28:t=fill`)
+        .videoFilters(
+          `drawtext=text='${text}':x=w-tw-24:y=h-th-24:fontsize=24:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=10`
+        )
         .outputOptions(["-c:v libx264", "-preset veryfast", "-crf 22", "-c:a copy"]);
     }
 
@@ -1017,7 +1001,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     }
 
     // ✅ Billing + plan limits + credit debit (transaction)
-    const billing = await ensureTrialValidateAndDebit(uid, {
+    const billing = await (global.ensureTrialValidateAndDebit || ensureTrialValidateAndDebit)(uid, {
       model,
       lengthSec,
       fps,
@@ -1603,9 +1587,6 @@ app.get("/v/:id", async (req, res) => {
 });
 
 app.get("/s/:id", async (req, res) => {
-  const lang = resolveViewerLang(req);
-  const T = VIEW_I18N[lang] || VIEW_I18N.en;
-
   try {
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).send("Missing id");
@@ -1628,11 +1609,11 @@ app.get("/s/:id", async (req, res) => {
 
     const descParts = [];
     if (resolution) descParts.push(`Resolution: ${resolution}`);
-    if (fps) descParts.push(`${T.fps}: ${fps}`);
+    if (fps) descParts.push(`FPS: ${fps}`);
     const desc = descParts.length ? descParts.join(" • ") : "Generated with GeNova";
 
     const htmlDoc = `<!doctype html>
-<html lang="${lang}">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -1684,9 +1665,6 @@ function escapeHtml(str) {
 }
 
 app.get("/d/:filename", async (req, res) => {
-  const lang = resolveViewerLang(req);
-  const T = VIEW_I18N[lang] || VIEW_I18N.en;
-
   try {
     const filenameRaw = String(req.params.filename || "");
     const fileName = decodeURIComponent(filenameRaw).trim();
@@ -1726,7 +1704,7 @@ app.get("/d/:filename", async (req, res) => {
     if (model) descParts.push(`Model: ${model}`);
     if (lengthSec !== "" && lengthSec != null) descParts.push(`Length: ${lengthSec}s`);
     if (resolution) descParts.push(`Res: ${resolution}`);
-    if (fps !== "" && fps != null) descParts.push(`${T.fps}: ${fps}`);
+    if (fps !== "" && fps != null) descParts.push(`FPS: ${fps}`);
     const desc = descParts.length ? descParts.join(" • ") : "GeNova AI video";
 
     // ✅ Important: humans should go straight to the video, crawlers should see OG HTML
@@ -1736,7 +1714,7 @@ app.get("/d/:filename", async (req, res) => {
 
     res.set("Content-Type", "text/html; charset=utf-8");
     return res.status(200).send(`<!doctype html>
-<html lang="${lang}">
+<html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
