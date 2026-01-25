@@ -583,7 +583,7 @@ async function ensureTrialValidateAndDebit(uid, genParams) {
     creditsAfter: 0,
     plan: MONETIZATION.DEFAULT_PLAN,
     entitlements: {},
-    watermarkApplied: true,
+    watermarkApplied: false,
     trialGranted: false,
     cost: 0,
     breakdown: {},
@@ -716,7 +716,7 @@ async function ensureTrialAndDebitCredits(uid, cost) {
     creditsAfter: 0,
     plan: MONETIZATION.DEFAULT_PLAN,
     entitlements: {},
-    watermarkApplied: true,
+    watermarkApplied: false,
     trialGranted: false,
   };
 
