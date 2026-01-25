@@ -7,6 +7,15 @@ const admin = require("firebase-admin");
 const BUILD_ID = '20260124-140507-pwreset-v1';
 const { Expo } = require("expo-server-sdk");
 const express = require("express");
+
+
+// 🧯 Crash guards (Render 502 often caused by silent crash)
+process.on("unhandledRejection", (reason) => {
+  console.log("🧯 UNHANDLED_REJECTION:", reason?.stack || reason?.message || String(reason));
+});
+process.on("uncaughtException", (err) => {
+  console.log("🧯 UNCAUGHT_EXCEPTION:", err?.stack || err?.message || String(err));
+});
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
@@ -158,7 +167,7 @@ function getPublicBaseUrl(req) {
 app.use(express.json({ limit: "10mb" }));
 
 console.log("🔥 RUNNING SERVER FILE:", __filename);
-console.log("🔥 BUILD: FIX_TRIAL_DEBIT_DEFINED_2026-01-24_v3_setLastResult");
+console.log("🔥 BUILD: HOTFIX_502_WATERMARK_GUARDS_2026-01-25_v1");
 console.log("🔥 BUILD:", BUILD_TAG);
 
 // ------------------------------------------------------------
