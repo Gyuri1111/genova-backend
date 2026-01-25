@@ -557,6 +557,30 @@ function safeEncodePath(p) {
   return encodeURIComponent(String(p).replace(/^\//, "")).replace(/%2F/g, "%2F");
 }
 
+async function uploadFileToFirebaseStorage(localPath, destPath, contentType) {
+  const token = uuidv4();
+  const buf = fs.readFileSync(localPath);
+
+  await bucket.file(destPath).save(buf, {
+    resumable: false,
+    contentType: contentType || "application/octet-stream",
+    metadata: {
+      metadata: {
+        firebaseStorageDownloadTokens: token,
+      },
+      cacheControl: "public, max-age=31536000",
+    },
+  });
+
+  return {
+    bucket: bucket.name,
+    path: destPath,
+    token,
+    url: buildStorageDownloadUrl(bucket.name, destPath, token),
+  };
+}
+
+
 function buildStorageDownloadUrl(bucketName, objectPath, token) {
   const encoded = encodeURIComponent(objectPath).replace(/%2F/g, "%2F");
   return `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encoded}?alt=media&token=${token}`;
