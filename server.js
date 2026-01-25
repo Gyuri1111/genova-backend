@@ -121,6 +121,17 @@ if (Number.isFinite(sec) && sec > 0) {
 
 
 const app = express();
+// ------------------------------------------------------------
+// ✅ notifyUser helper (no-op fallback)
+// Some builds may call notifyUser() even when push/email modules are not included.
+// We keep a safe stub here to avoid breaking generation flows.
+// ------------------------------------------------------------
+function notifyUser() {
+  // Intentionally no-op. Real implementation may live in a different build.
+  return Promise.resolve();
+}
+
+
 
 // ------------------------------------------------------------
 // ✅ Share host + OG image configuration
@@ -762,29 +773,10 @@ async function finalizeGeneratedVideo({
     throw err;
   }
 
-  // Thumbnail (best-effort)
-  let thumbOk = false;
-  try {
-    await extractThumbnailJpg(localFinal, localThumb);
-    thumbOk = fs.existsSync(localThumb);
-    console.log("🖼️ thumb generated:", { thumbOk, localThumb });
-  } catch (e) {
-    console.warn("⚠️ thumbnail extract failed:", e?.message || e);
-  }
 
-  // Upload
-  const videoDest = `videos/${safeUid}/${safeId}.mp4`;
-  console.log("⬆️ uploading video to Storage:", { videoDest });
-  const videoUp = await uploadFileToFirebaseStorage(localFinal, videoDest, "video/mp4");
-  console.log("✅ video uploaded:", { url: videoUp.url, path: videoUp.path });
+  // 🖼️ Thumbnail generation is handled in Firebase Functions (watermarkCreationVideo).
+  // This backend does not generate thumbnails (Render environment may not have ffmpeg).
 
-  let thumbUp = null;
-  if (thumbOk) {
-    const thumbDest = `thumbs/${safeUid}/${safeId}.jpg`;
-    console.log("⬆️ uploading thumb to Storage:", { thumbDest });
-    thumbUp = await uploadFileToFirebaseStorage(localThumb, thumbDest, "image/jpeg");
-    console.log("✅ thumb uploaded:", { url: thumbUp.url, path: thumbUp.path });
-  }
 
   // Cleanup best-effort
   for (const f of [localSrc, localThumb]) {
@@ -793,10 +785,10 @@ async function finalizeGeneratedVideo({
 
   return {
     videoUrl: videoUp.url,
-    thumbUrl: thumbUp?.url || null,
+    thumbUrl: null,
     storage: {
       videoPath: videoUp.path,
-      thumbPath: thumbUp?.path || null,
+      thumbPath: null,
       bucket: videoUp.bucket,
     },
   };
