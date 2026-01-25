@@ -12,22 +12,13 @@ const os = require("os");
 const { v4: uuidv4 } = require("uuid");
 
 // Thumbnail extraction (first frame)
-let ffmpeg;
-let ffmpegPath;
 try {
-  ffmpeg = require("fluent-ffmpeg");
-  ffmpegPath = require("ffmpeg-static");
-  if (ffmpeg && ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 
-// 🔎 ffmpeg availability log (Render debug)
 try {
-  console.log("✅ ffmpeg available:", ffmpegPath);
 } catch (e) {
-  console.log("⚠️ ffmpeg path log failed:", e?.message || e);
 }
 
 } catch (e) {
-  console.warn("⚠️ ffmpeg not available (install fluent-ffmpeg + ffmpeg-static)");
 }
 
 
@@ -1323,7 +1314,6 @@ function tryCopyLocalPlaceholder(outPath) {
 }
 
 function ensureFfmpegAvailable() {
-  if (!ffmpeg || !ffmpegPath) {
     const err = new Error("FFMPEG_NOT_AVAILABLE");
     err.code = "FFMPEG_NOT_AVAILABLE";
     throw err;
@@ -1391,8 +1381,6 @@ async function extractThumbnailJpg(videoPath, thumbPath) {
   //  - take 1 frame at 0.15s
   //  - write directly to the requested path
   await new Promise((resolve, reject) => {
-    ffmpeg(videoPath)
-      .on("start", (cmd) => console.log("🖼️ ffmpeg thumb cmd:", cmd))
       .on("end", resolve)
       .on("error", reject)
       .outputOptions([
@@ -1425,7 +1413,6 @@ async function applyWatermark(videoPath, outPath) {
   const hasImage = !!wmAbs && fs.existsSync(wmAbs);
 
   await new Promise((resolve, reject) => {
-    let cmd = ffmpeg(videoPath);
 
     if (hasImage) {
       cmd = cmd
@@ -2437,3 +2424,4 @@ app.get("/d/:filename", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
+
