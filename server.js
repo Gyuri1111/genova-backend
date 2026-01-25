@@ -1615,13 +1615,10 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       title: "",
       message: "",
       url,
-      meta,
+      meta: { ...meta, creationId, fileName, watermarkRequired: !!watermarkApplied },
       createdAt,
     });
-
-    
-
-    // ✅ Update the user's creation doc if it exists (preferred direct path)
+// ✅ Update the user's creation doc if it exists (preferred direct path)
     // users/{uid}/creations/{creationId}
     try {
       if (creationId) {
@@ -1645,10 +1642,18 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
             // - overwrite url/videoUrl to the _wm.mp4 version
             videoUrl: finalized?.videoUrl || null,
             url: finalized?.videoUrl || null,
-            storage: finalized?.storage || null,
+            // Functions will create thumb + watermarked file, then update these fields.
+            thumbUrl: null,
+            thumbnailUrl: null,
+            storage: {
+              ...(finalized?.storage || null),
+              originalVideoPath: finalized?.storage?.videoPath || null,
+              thumbPath: null,
+            },
             watermarkApplied: false,
             watermarkRequired: !!watermarkApplied,
-            updatedAt: admin.firestore.Timestamp.now(),
+            watermarkStatus: !!watermarkApplied ? "pending" : "not_required",
+updatedAt: admin.firestore.Timestamp.now(),
           },
           { merge: true }
         );
@@ -1732,10 +1737,13 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       console.warn("⚠️ notifyUser failed:", e?.message || e);
     }
 
-    return res.json({ success: true,
+    return res.json({
+      success: true,
       videoUrl: url,
       resultId: id,
-      result: { id, status: "ready", url, meta, createdAt },
+      creationId,
+      fileName,
+      result: { id, status: "ready", url, meta: { ...meta, creationId, fileName, watermarkRequired: !!watermarkApplied }, createdAt },
       billing,
     });
   } catch (e) {
