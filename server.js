@@ -289,6 +289,72 @@ const ensureTrialValidateAndDebit = global.ensureTrialValidateAndDebit;
 const expo = new Expo();
 
 // ------------------------------------------------------------
+// notifyUser (push) — restored so /generate-video doesn't error
+// Uses users/{uid}.expoPushToken + users/{uid}.notifPrefs
+// ------------------------------------------------------------
+async function notifyUser({ uid, type = "video", data = {} }) {
+  try {
+    if (!uid) return { ok: false, skipped: true, reason: "no_uid" };
+
+    const uref = db.collection("users").doc(uid);
+    const usnap = await uref.get();
+    if (!usnap.exists) return { ok: false, skipped: true, reason: "no_user_doc" };
+
+    const u = usnap.data() || {};
+    const prefs = u.notifPrefs || {};
+    const lang = (prefs.language || u.language || "en").toString().toLowerCase();
+    const pushEnabled = !!prefs.pushNotif && (type !== "video" || prefs.videoNotif !== false);
+    const token = u.expoPushToken;
+
+    if (!pushEnabled) return { ok: true, skipped: true, reason: "push_disabled" };
+    if (!token || typeof token !== "string") return { ok: true, skipped: true, reason: "no_token" };
+
+    // Basic i18n (viewer/user language), keep it minimal and safe
+    const T = {
+      en: { videoTitle: "GeNova", videoBody: "Your video is ready." },
+      hu: { videoTitle: "GeNova", videoBody: "A videód elkészült." },
+      de: { videoTitle: "GeNova", videoBody: "Dein Video ist fertig." },
+    };
+    const tr = T[lang] || T.en;
+
+    const title = tr.videoTitle;
+    const body = tr.videoBody;
+
+    // Validate Expo token and send
+    if (!Expo.isExpoPushToken(token)) {
+      console.log("⚠️ notifyUser: invalid Expo token", token);
+      return { ok: true, skipped: true, reason: "invalid_token" };
+    }
+
+    const message = {
+      to: token,
+      sound: "default",
+      title,
+      body,
+      data: { type, ...(data || {}) },
+      priority: "high",
+      channelId: "default",
+    };
+
+    const chunks = expo.chunkPushNotifications([message]);
+    for (const chunk of chunks) {
+      try {
+        await expo.sendPushNotificationsAsync(chunk);
+      } catch (e) {
+        console.log("⚠️ notifyUser push send failed:", e?.message || String(e));
+      }
+    }
+
+    return { ok: true, sent: true };
+  } catch (e) {
+    console.log("⚠️ notifyUser failed:", e?.message || String(e));
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
+
+
+// ------------------------------------------------------------
 // Auth middleware
 // ------------------------------------------------------------
 const verifyFirebaseToken = async (req, res, next) => {
