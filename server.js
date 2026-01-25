@@ -1314,10 +1314,9 @@ function tryCopyLocalPlaceholder(outPath) {
 }
 
 function ensureFfmpegAvailable() {
-    const err = new Error("FFMPEG_NOT_AVAILABLE");
-    err.code = "FFMPEG_NOT_AVAILABLE";
-    throw err;
-  }
+  const err = new Error("FFMPEG_NOT_AVAILABLE");
+  err.code = "FFMPEG_NOT_AVAILABLE";
+  throw err;
 }
 
 async function downloadToFile(url, outPath) {
@@ -1370,77 +1369,20 @@ async function uploadFileToFirebaseStorage(localPath, destPath, contentType) {
 }
 
 async function extractThumbnailJpg(videoPath, thumbPath) {
+  // Thumbnail extraction requires ffmpeg. We intentionally disable it on Render.
   ensureFfmpegAvailable();
-
-  // Make sure output folder exists
-  try {
-    fs.mkdirSync(path.dirname(thumbPath), { recursive: true });
-  } catch (_) {}
-
-  // More reliable than .screenshots() in some container environments:
-  //  - take 1 frame at 0.15s
-  //  - write directly to the requested path
-  await new Promise((resolve, reject) => {
-      .on("end", resolve)
-      .on("error", reject)
-      .outputOptions([
-        "-ss 0.15",
-        "-frames:v 1",
-        "-vf scale=1280:-2",
-        "-q:v 3",
-      ])
-      .output(thumbPath)
-      .run();
-  });
-
-  if (!fs.existsSync(thumbPath)) {
-    const err = new Error("THUMB_OUTPUT_MISSING");
-    err.code = "THUMB_OUTPUT_MISSING";
-    throw err;
-  }
-
-  return thumbPath;
 }
 
 async function applyWatermark(videoPath, outPath) {
-  ensureFfmpegAvailable();
-
-  // Prefer image watermark if provided
-  const wmImage = process.env.WATERMARK_IMAGE_PATH || "";
-  const wmAbs = wmImage ? path.resolve(process.cwd(), wmImage) : "";
-
-  // fallback drawtext if watermark image is missing
-  const hasImage = !!wmAbs && fs.existsSync(wmAbs);
-
-  await new Promise((resolve, reject) => {
-
-    if (hasImage) {
-      cmd = cmd
-        .input(wmAbs)
-        .complexFilter([
-          // scale watermark relative to video width (approx 18%)
-          "[1]scale=iw*0.18:-1[wm]",
-          "[0][wm]overlay=W-w-24:H-h-24:format=auto",
-        ])
-        .outputOptions(["-c:v libx264", "-preset veryfast", "-crf 22", "-c:a copy"]);
-    } else {
-      // drawtext watermark (semi-transparent). This is a safe fallback if no logo file exists.
-      // NOTE: font selection is platform-dependent; default font should work on most Linux images.
-      const text = (process.env.WATERMARK_TEXT || "GeNova").replace(/:/g, "\\:");
-      cmd = cmd
-        .videoFilters(
-          `drawtext=text='${text}':x=w-tw-24:y=h-th-24:fontsize=24:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=10`
-        )
-        .outputOptions(["-c:v libx264", "-preset veryfast", "-crf 22", "-c:a copy"]);
-    }
-
-    cmd
-      .on("end", resolve)
-      .on("error", reject)
-      .save(outPath);
-  });
-
-  return outPath;
+  // Watermarking is handled by Cloud Functions (2nd gen).
+  // Keep backend stable: if this path is hit, do a safe no-op copy.
+  try {
+    await fs.promises.copyFile(videoPath, outPath);
+    return outPath;
+  } catch (_) {
+    // If copy fails, fall back to original video.
+    return videoPath;
+  }
 }
 
 /**
@@ -2424,4 +2366,3 @@ app.get("/d/:filename", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
-
