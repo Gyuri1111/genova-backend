@@ -1,3 +1,4 @@
+// 🔒 Watermark handling moved to Firebase Functions (Firestore trigger)
 // server.js — PROMPT + IMAGE SUPPORT (FINAL) + /notify (PREFS) + PUSH UTIL (FINAL)
 //          + notifyUser (C1) + EMAIL (D) + GeNova HTML TEMPLATE (uses src/utils/emailTemplate.js)
 //          + OFFLINE EDGE-CASE SUPPORT: lastResult + /my-latest-result + /mark-result-seen
@@ -7,39 +8,11 @@ const admin = require("firebase-admin");
 const BUILD_ID = '20260124-140507-pwreset-v1';
 const { Expo } = require("expo-server-sdk");
 const express = require("express");
-
-
-// 🧯 Crash guards (Render 502 often caused by silent crash)
-process.on("unhandledRejection", (reason) => {
-  console.log("🧯 UNHANDLED_REJECTION:", reason?.stack || reason?.message || String(reason));
-});
-process.on("uncaughtException", (err) => {
-  console.log("🧯 UNCAUGHT_EXCEPTION:", err?.stack || err?.message || String(err));
-});
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { v4: uuidv4 } = require("uuid");
-
-// Thumbnail extraction (first frame)
-let ffmpeg;
-let ffmpegPath;
-try {
-  ffmpeg = require("fluent-ffmpeg");
-  ffmpegPath = require("ffmpeg-static");
-  if (ffmpeg && ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
-
-// 🔎 ffmpeg availability log (Render debug)
-try {
-  console.log("✅ ffmpeg available:", ffmpegPath);
-} catch (e) {
-  console.log("⚠️ ffmpeg path log failed:", e?.message || e);
-}
-
-} catch (e) {
-  console.warn("⚠️ ffmpeg not available (install fluent-ffmpeg + ffmpeg-static)");
-}
 
 
 // ===== Render key bootstrap (CommonJS safe) =====
@@ -79,7 +52,6 @@ require("dotenv").config();
 const { emailTemplate } = require("./src/utils/emailTemplate");
 
 const BUILD_TAG =
-  "WATERMARK_THUMB_STORAGE_UPLOAD_2026-01-22_v5_local_placeholder_and_mp4_validation";
 
 
 /* =========================
@@ -167,7 +139,7 @@ function getPublicBaseUrl(req) {
 app.use(express.json({ limit: "10mb" }));
 
 console.log("🔥 RUNNING SERVER FILE:", __filename);
-console.log("🔥 BUILD: HOTFIX_502_WATERMARK_GUARDS_2026-01-25_v1");
+console.log("🔥 BUILD: FIX_TRIAL_DEBIT_DEFINED_2026-01-24_v3_setLastResult");
 console.log("🔥 BUILD:", BUILD_TAG);
 
 // ------------------------------------------------------------
@@ -635,144 +607,11 @@ function tryCopyLocalPlaceholder(outPath) {
   return false;
 }
 
-function ensureFfmpegAvailable() {
-  if (!ffmpeg || !ffmpegPath) {
-    const err = new Error("FFMPEG_NOT_AVAILABLE");
-    err.code = "FFMPEG_NOT_AVAILABLE";
-    throw err;
-  }
-}
-
-async function downloadToFile(url, outPath) {
-  const https = require("https");
-  const http = require("http");
-  const proto = String(url).startsWith("https") ? https : http;
-
-  await new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(outPath);
-    const req = proto.get(url, (res) => {
-      // follow redirects
-      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        file.close(() => fs.unlink(outPath, () => resolve(downloadToFile(res.headers.location, outPath))));
-        return;
-      }
-      if (res.statusCode !== 200) {
-        file.close(() => fs.unlink(outPath, () => reject(new Error(`DOWNLOAD_FAILED_${res.statusCode}`))));
-        return;
-      }
-      res.pipe(file);
-      file.on("finish", () => file.close(resolve));
-    });
-    req.on("error", (e) => {
-      try { file.close(() => fs.unlink(outPath, () => reject(e))); } catch (_) { reject(e); }
-    });
-  });
-}
-
-async function uploadFileToFirebaseStorage(localPath, destPath, contentType) {
-  const token = uuidv4();
-  const buf = fs.readFileSync(localPath);
-
-  await bucket.file(destPath).save(buf, {
-    resumable: false,
-    contentType: contentType || "application/octet-stream",
-    metadata: {
-      metadata: {
-        firebaseStorageDownloadTokens: token,
-      },
-      cacheControl: "public, max-age=31536000",
-    },
-  });
-
-  return {
-    bucket: bucket.name,
-    path: destPath,
-    token,
-    url: buildStorageDownloadUrl(bucket.name, destPath, token),
-  };
-}
-
-async function extractThumbnailJpg(videoPath, thumbPath) {
-  ensureFfmpegAvailable();
-
-  // Make sure output folder exists
-  try {
-    fs.mkdirSync(path.dirname(thumbPath), { recursive: true });
-  } catch (_) {}
-
-  // More reliable than .screenshots() in some container environments:
-  //  - take 1 frame at 0.15s
-  //  - write directly to the requested path
-  await new Promise((resolve, reject) => {
-    ffmpeg(videoPath)
-      .on("start", (cmd) => console.log("🖼️ ffmpeg thumb cmd:", cmd))
-      .on("end", resolve)
-      .on("error", reject)
-      .outputOptions([
-        "-ss 0.15",
-        "-frames:v 1",
-        "-vf scale=1280:-2",
-        "-q:v 3",
-      ])
-      .output(thumbPath)
-      .run();
-  });
-
-  if (!fs.existsSync(thumbPath)) {
-    const err = new Error("THUMB_OUTPUT_MISSING");
-    err.code = "THUMB_OUTPUT_MISSING";
-    throw err;
-  }
-
-  return thumbPath;
-}
-
-async function applyWatermark(videoPath, outPath) {
-  ensureFfmpegAvailable();
-
-  // Prefer image watermark if provided
-  const wmImage = process.env.WATERMARK_IMAGE_PATH || "";
-  const wmAbs = wmImage ? path.resolve(process.cwd(), wmImage) : "";
-
-  // fallback drawtext if watermark image is missing
-  const hasImage = !!wmAbs && fs.existsSync(wmAbs);
-
-  await new Promise((resolve, reject) => {
-    let cmd = ffmpeg(videoPath);
-
-    if (hasImage) {
-      cmd = cmd
-        .input(wmAbs)
-        .complexFilter([
-          // scale watermark relative to video width (approx 18%)
-          "[1]scale=iw*0.18:-1[wm]",
-          "[0][wm]overlay=W-w-24:H-h-24:format=auto",
-        ])
-        .outputOptions(["-c:v libx264", "-preset veryfast", "-crf 22", "-c:a copy"]);
-    } else {
-      // drawtext watermark (semi-transparent). This is a safe fallback if no logo file exists.
-      // NOTE: font selection is platform-dependent; default font should work on most Linux images.
-      const text = (process.env.WATERMARK_TEXT || "GeNova").replace(/:/g, "\\:");
-      cmd = cmd
-        .videoFilters(
-          `drawtext=text='${text}':x=w-tw-24:y=h-th-24:fontsize=24:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=10`
-        )
-        .outputOptions(["-c:v libx264", "-preset veryfast", "-crf 22", "-c:a copy"]);
-    }
-
-    cmd
-      .on("end", resolve)
-      .on("error", reject)
-      .save(outPath);
-  });
-
-  return outPath;
-}
 
 /**
  * Finalize a generated video URL:
  * - downloads source (or uses local file if already local)
- * - applies watermark conditionally
+ * - does NOT apply watermark (handled in Firebase Functions)
  * - extracts thumbnail
  * - uploads both to Firebase Storage
  * - returns { videoUrl, thumbUrl, storage: {videoPath, thumbPath} }
@@ -782,7 +621,6 @@ async function finalizeGeneratedVideo({
   creationId,
   sourceUrl,
   fileName,
-  watermarkApplied,
 }) {
   const tmpDir = os.tmpdir();
   const safeUid = String(uid || "anon").replace(/[^a-zA-Z0-9_-]/g, "");
@@ -793,9 +631,7 @@ async function finalizeGeneratedVideo({
     : `${safeId}.mp4`;
 
   const localSrc = path.join(tmpDir, `genova_src_${safeId}.mp4`);
-  const localWm = path.join(tmpDir, `genova_wm_${safeId}.mp4`);
-  const localFinal = watermarkApplied ? localWm : localSrc;
-  const localThumb = path.join(tmpDir, `genova_thumb_${safeId}.jpg`);
+  const localFinal = localSrc;
 
   // Acquire source
   const isPlaceholder = String(sourceUrl || "").includes("/placeholder.mp4");
@@ -816,37 +652,16 @@ async function finalizeGeneratedVideo({
     throw err;
   }
 
-  // Watermark if needed
-  if (watermarkApplied) {
-    await applyWatermark(localSrc, localWm);
-  }
-
-  // Thumbnail (best-effort)
-  let thumbOk = false;
-  try {
-    await extractThumbnailJpg(localFinal, localThumb);
-    thumbOk = fs.existsSync(localThumb);
-    console.log("🖼️ thumb generated:", { thumbOk, localThumb });
-  } catch (e) {
-    console.warn("⚠️ thumbnail extract failed:", e?.message || e);
-  }
-
   // Upload
   const videoDest = `videos/${safeUid}/${safeId}.mp4`;
   console.log("⬆️ uploading video to Storage:", { videoDest });
   const videoUp = await uploadFileToFirebaseStorage(localFinal, videoDest, "video/mp4");
   console.log("✅ video uploaded:", { url: videoUp.url, path: videoUp.path });
 
-  let thumbUp = null;
-  if (thumbOk) {
-    const thumbDest = `thumbs/${safeUid}/${safeId}.jpg`;
-    console.log("⬆️ uploading thumb to Storage:", { thumbDest });
-    thumbUp = await uploadFileToFirebaseStorage(localThumb, thumbDest, "image/jpeg");
-    console.log("✅ thumb uploaded:", { url: thumbUp.url, path: thumbUp.path });
-  }
+  const thumbUp = null;
 
   // Cleanup best-effort
-  for (const f of [localSrc, localWm, localThumb]) {
+  for (const f of [localSrc]) {
     try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch (_) {}
   }
 
@@ -1017,7 +832,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       lengthSec,
       fps,
       resolution,
-      watermarkApplied: !!billing?.watermarkApplied,
+      watermarkApplied: false,
       cost: billing?.cost ?? null,
       breakdown: billing?.breakdown ?? {},
       hasImage: !!req.file,
@@ -1041,7 +856,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const sourceUrl = `${baseUrl}/placeholder.mp4`;
 
     let fileName = String(body.fileName || "").trim() || "";
-    const watermarkApplied = !!billing?.watermarkApplied;
+    const watermarkApplied = false;
     // ✅ If client did not send fileName, generate a stable one (needed for Firestore + share)
     if (!fileName) {
       const now = new Date();
@@ -1067,8 +882,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       creationId,
       sourceUrl,
       fileName,
-      watermarkApplied,
-    });
+});
 
     const url = finalized.videoUrl;// Mark as ready
     await setLastResult(uid, {
@@ -1105,7 +919,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
             thumbUrl: finalized?.thumbUrl || null,
             thumbnailUrl: finalized?.thumbUrl || null,
             storage: finalized?.storage || null,
-            watermarkApplied: !!watermarkApplied,
+            watermarkApplied: false,
             updatedAt: admin.firestore.Timestamp.now(),
           },
           { merge: true }
@@ -1153,7 +967,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
                     thumbUrl: finalized?.thumbUrl || d.thumbUrl || null,
                     thumbnailUrl: finalized?.thumbUrl || d.thumbnailUrl || null,
                     storage: finalized?.storage || d.storage || null,
-                    watermarkApplied: !!watermarkApplied,
+                    watermarkApplied: false,
                     updatedAt: nowTs,
                     duplicateOf: creationId,
                   },
