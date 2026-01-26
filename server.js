@@ -1719,25 +1719,36 @@ updatedAt: admin.firestore.Timestamp.now(),
       console.warn("⚠️ creation doc update failed:", e?.message || e);
     }
 // Send push/email if enabled
-    try {
-      await notifyUser({
-        uid,
-        type: "video",
-        data: {
-          url,
-          thumbUrl: null,
-          shareUrl: fileName ? `${SHARE_HOST}/d/${encodeURIComponent(fileName)}` : null,
-          model,
-          lengthSec,
-          fps,
-          resolution,
-        },
-      });
-    } catch (e) {
-      console.warn("⚠️ notifyUser failed:", e?.message || e);
+    // ✅ IMPORTANT: if watermark is required, we delay the "Video ready" notification
+    // until the watermark worker finishes and writes the final _wm.mp4.
+    const watermarkRequiredForThis = !!watermarkApplied;
+
+    if (!watermarkRequiredForThis) {
+      try {
+        await notifyUser({
+          uid,
+          type: "video",
+          data: {
+            url,
+            thumbUrl: null,
+            shareUrl: fileName ? `${SHARE_HOST}/d/${encodeURIComponent(fileName)}` : null,
+            model,
+            lengthSec,
+            fps,
+            resolution,
+            watermarkRequired: false,
+          },
+        });
+      } catch (e) {
+        console.warn("⚠️ notifyUser failed:", e?.message || e);
+      }
+    } else {
+      try {
+        console.log("🟨 Skipping notifyUser (will notify after watermark):", creationId);
+      } catch (_) {}
     }
 
-    return res.json({
+return res.json({
       success: true,
       videoUrl: url,
       resultId: id,
@@ -2300,3 +2311,4 @@ app.get("/d/:filename", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
+
