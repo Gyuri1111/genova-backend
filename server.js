@@ -1719,11 +1719,8 @@ updatedAt: admin.firestore.Timestamp.now(),
       console.warn("⚠️ creation doc update failed:", e?.message || e);
     }
 // Send push/email if enabled
-    // ✅ IMPORTANT: if watermark is required, we delay the "Video ready" notification
-    // until the watermark worker finishes and writes the final _wm.mp4.
-    const watermarkRequiredForThis = !!watermarkApplied;
-
-    if (!watermarkRequiredForThis) {
+    // ✅ IMPORTANT: if watermark is required, do NOT notify here — the Functions watermark worker will notify after _wm.mp4 is finalized.
+    if (!watermarkApplied) {
       try {
         await notifyUser({
           uid,
@@ -1736,19 +1733,14 @@ updatedAt: admin.firestore.Timestamp.now(),
             lengthSec,
             fps,
             resolution,
-            watermarkRequired: false,
           },
         });
       } catch (e) {
         console.warn("⚠️ notifyUser failed:", e?.message || e);
       }
-    } else {
-      try {
-        console.log("🟨 Skipping notifyUser (will notify after watermark):", creationId);
-      } catch (_) {}
     }
 
-return res.json({
+    return res.json({
       success: true,
       videoUrl: url,
       resultId: id,
