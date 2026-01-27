@@ -1152,6 +1152,126 @@ app.post("/notify", verifyFirebaseToken, async (req, res) => {
   }
 });
 
+
+// ------------------------------------------------------------
+// ✅ BULK DELETE CREATIONS (FAST) — Firestore batch + Storage cleanup
+// ------------------------------------------------------------
+// Client sends: { ids: ["creationId1","creationId2", ...] }
+// Deletes from: users/{uid}/creations/{id}
+// Also best-effort deletes related Storage objects found on the doc (video/thumb/original/og/etc.)
+app.post("/delete-creations", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const idsRaw = req.body?.ids;
+    const ids = Array.isArray(idsRaw)
+      ? idsRaw.map((x) => String(x || "").trim()).filter(Boolean)
+      : [];
+
+    if (!ids.length) {
+      return res.status(400).json({ success: false, error: "ids required" });
+    }
+
+    // Hard safety limit to avoid abuse
+    const MAX_IDS = 2000;
+    const finalIds = ids.slice(0, MAX_IDS);
+
+    const colRef = db.collection("users").doc(uid).collection("creations");
+
+    const uniquePaths = new Set();
+    const missing = [];
+
+    const chunk = (arr, n) => {
+      const out = [];
+      for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+      return out;
+    };
+
+    // Read docs in chunks (best-effort) to collect storage paths
+    for (const part of chunk(finalIds, 100)) {
+      const refs = part.map((id) => colRef.doc(id));
+      const snaps = await db.getAll(...refs);
+
+      snaps.forEach((snap, idx) => {
+        if (!snap.exists) {
+          missing.push(part[idx]);
+          return;
+        }
+        const d = snap.data() || {};
+
+        // Gather likely storage paths (best-effort; ignore nulls)
+        const st = d.storage || d?.finalized?.storage || {};
+        const candidates = [
+          d.videoPath,
+          d.thumbPath,
+          d.thumbnailPath,
+          d.ogPath,
+          d.ogImagePath,
+          d.posterPath,
+          d.sharePath,
+          d.previewPath,
+          d.watermarkedVideoPath,
+          st.videoPath,
+          st.originalVideoPath,
+          st.thumbPath,
+          st.thumbnailPath,
+          st.ogPath,
+          st.ogImagePath,
+          st.posterPath,
+          st.sharePath,
+          st.previewPath,
+          st.watermarkedVideoPath,
+        ]
+          .map((p) => (p ? String(p) : ""))
+          .map((p) => p.replace(/^\/+/, "").trim())
+          .filter(Boolean);
+
+        candidates.forEach((p) => uniquePaths.add(p));
+      });
+    }
+
+    // Delete firestore docs in batches (<=500 ops)
+    let deletedDocs = 0;
+    for (const part of chunk(finalIds, 450)) {
+      const batch = db.batch();
+      part.forEach((id) => batch.delete(colRef.doc(id)));
+      await batch.commit();
+      deletedDocs += part.length;
+    }
+
+    // Best-effort delete storage objects (parallel with small concurrency)
+    let deletedFiles = 0;
+    const paths = Array.from(uniquePaths.values());
+    const CONC = 12;
+
+    for (let i = 0; i < paths.length; i += CONC) {
+      const slice = paths.slice(i, i + CONC);
+      await Promise.all(
+        slice.map(async (p) => {
+          try {
+            await bucket.file(p).delete({ ignoreNotFound: true });
+            deletedFiles += 1;
+          } catch (e) {
+            // ignore (not critical)
+          }
+        })
+      );
+    }
+
+    return res.json({
+      success: true,
+      deleted: deletedDocs,
+      deletedFiles,
+      missing,
+      buildTag: BUILD_TAG,
+    });
+  } catch (e) {
+    console.log("❌ /delete-creations error:", e);
+    return res
+      .status(500)
+      .json({ success: false, error: e?.message || "server_error" });
+  }
+});
+
 // ------------------------------------------------------------
 // ✅ OFFLINE EDGE-CASE ENDPOINTS
 // ------------------------------------------------------------
