@@ -182,6 +182,96 @@ const verifyFirebaseToken = async (req, res, next) => {
 };
 
 
+
+/* ====================
+   USERNAME (PROFILE)
+==================== */
+
+const USERNAME_RESERVED = new Set([
+  "admin","owner","genova","genova_admin","genova_owner","genovalabs","support","moderator","root","system"
+]);
+
+const USERNAME_BAD_SUBSTRINGS = [
+  "fuck","shit","cunt","bitch","kurva","fasz","geci","pina"
+];
+
+function normalizeUsernameServer(raw) {
+  const s0 = String(raw || "").trim();
+  const s1 = s0.replace(/\s+/g, "_");
+  const s2 = s1.replace(/[^A-Za-z0-9_]/g, "");
+  const s3 = s2.replace(/_+/g, "_");
+  return s3;
+}
+
+function validateUsernameServer(raw) {
+  const v = normalizeUsernameServer(raw);
+  if (!v) return { ok: false, reason: "required", human: "Username required" };
+  if (/\s/.test(String(raw || ""))) return { ok: false, reason: "spaces", human: "No spaces allowed" };
+  if (v.length < 3) return { ok: false, reason: "too_short", human: "Too short" };
+  if (v.length > 20) return { ok: false, reason: "too_long", human: "Too long" };
+  const lower = v.toLowerCase();
+  if (USERNAME_RESERVED.has(lower)) return { ok: false, reason: "reserved", human: "Reserved name" };
+  if (USERNAME_BAD_SUBSTRINGS.some((b) => lower.includes(b))) return { ok: false, reason: "inappropriate", human: "Not allowed" };
+  return { ok: true, value: v, lower };
+}
+
+// Check availability (no auth required)
+app.post("/check-username", async (req, res) => {
+  try {
+    const { username } = req.body || {};
+    const v = validateUsernameServer(username);
+    if (!v.ok) return res.json({ available: false, reason: v.reason, reasonHuman: v.human });
+
+    const ref = admin.firestore().collection("usernames").doc(v.lower);
+    const snap = await ref.get();
+    if (snap.exists) {
+      return res.json({ available: false, reason: "taken", reasonHuman: "Username is taken" });
+    }
+    return res.json({ available: true, normalized: v.value });
+  } catch (e) {
+    return res.status(500).json({ available: false, reason: "server", reasonHuman: "Server error" });
+  }
+});
+
+// Set username (auth required)
+app.post("/set-username", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { username } = req.body || {};
+    const v = validateUsernameServer(username);
+    if (!v.ok) return res.status(400).json({ success: false, error: v.reason, errorHuman: v.human });
+
+    const uid = String(req.uid);
+    const usernameRef = admin.firestore().collection("usernames").doc(v.lower);
+    const userRef = admin.firestore().collection("users").doc(uid);
+
+    await admin.firestore().runTransaction(async (tx) => {
+      const existing = await tx.get(usernameRef);
+      if (existing.exists) {
+        const data = existing.data() || {};
+        const ownerUid = String(data.uid || "");
+        if (ownerUid && ownerUid !== uid) {
+          const err = new Error("taken");
+          err.code = "taken";
+          throw err;
+        }
+      }
+
+      // Claim username
+      tx.set(usernameRef, { uid, username: v.value, usernameLower: v.lower, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+
+      // Save on user doc
+      tx.set(userRef, { username: v.value, usernameLower: v.lower }, { merge: true });
+    });
+
+    return res.json({ success: true, username: v.value, usernameLower: v.lower });
+  } catch (e) {
+    if (e?.code === "taken" || String(e?.message || "") === "taken") {
+      return res.status(409).json({ success: false, error: "taken", errorHuman: "Username is taken" });
+    }
+    return res.status(500).json({ success: false, error: "server", errorHuman: "Server error" });
+  }
+});
+
 // Manual trigger from the app (call on app start / Store open)
 // Clears ONLY expired entitlement Until fields (no plan changes).
 app.post("/cleanup-me", verifyFirebaseToken, async (req, res) => {
@@ -2423,4 +2513,5 @@ app.get("/d/:filename", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
+
 
