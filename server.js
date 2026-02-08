@@ -222,7 +222,7 @@ app.post("/check-username", async (req, res) => {
     const v = validateUsernameServer(username);
     if (!v.ok) return res.json({ available: false, reason: v.reason, reasonHuman: v.human });
 
-    const ref = admin.firestore().collection("usernames").doc(v.lower);
+    const ref = admin.firestore().collection("usernames").doc(v.value);
     const snap = await ref.get();
     if (snap.exists) {
       return res.json({ available: false, reason: "taken", reasonHuman: "Username is taken" });
@@ -241,7 +241,7 @@ app.post("/set-username", verifyFirebaseToken, async (req, res) => {
     if (!v.ok) return res.status(400).json({ success: false, error: v.reason, errorHuman: v.human });
 
     const uid = String(req.uid);
-    const usernameRef = admin.firestore().collection("usernames").doc(v.lower);
+    const usernameRef = admin.firestore().collection("usernames").doc(v.value);
     const userRef = admin.firestore().collection("users").doc(uid);
 
     await admin.firestore().runTransaction(async (tx) => {
