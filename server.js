@@ -103,6 +103,23 @@ if (Number.isFinite(sec) && sec > 0) {
 }
 
 
+function normalizeAudioConfig(input) {
+  const mode = String(input?.mode || input?.audioMode || 'off').toLowerCase().trim();
+  const volumeRaw = input?.volume ?? input?.audioVolume ?? 0.8;
+  const volume = Math.max(0, Math.min(1, Number(volumeRaw) || 0.8));
+
+  if (mode === 'music') {
+    const preset = String(input?.preset || input?.audioPreset || 'ambient').toLowerCase().trim();
+    return { mode: 'music', preset, volume, status: 'pending', audioUrl: null, audioPath: null };
+  }
+  if (mode === 'voice') {
+    const voiceStyle = String(input?.voiceStyle || 'narration').toLowerCase().trim();
+    return { mode: 'voice', voiceStyle, volume, status: 'pending', audioUrl: null, audioPath: null };
+  }
+  return { mode: 'off', volume, status: 'off', audioUrl: null, audioPath: null };
+}
+
+
 const app = express();
 
 // ------------------------------------------------------------
@@ -1515,35 +1532,6 @@ function tryCopyLocalPlaceholder(outPath) {
   return false;
 }
 
-
-
-function tryCopyLocalPlaceholderAudio(outPath, kind = "music") {
-  // kind: "music" | "voice" | "generic"
-  const candidates = [
-    path.join(process.cwd(), `placeholder_${kind}.mp3`),
-    path.join(process.cwd(), "placeholder.mp3"),
-    path.join(process.cwd(), "public", `placeholder_${kind}.mp3`),
-    path.join(process.cwd(), "public", "placeholder.mp3"),
-    path.join(__dirname, `placeholder_${kind}.mp3`),
-    path.join(__dirname, "placeholder.mp3"),
-    path.join(__dirname, "public", `placeholder_${kind}.mp3`),
-    path.join(__dirname, "public", "placeholder.mp3"),
-    path.join(process.cwd(), "assets", `placeholder_${kind}.mp3`),
-    path.join(process.cwd(), "assets", "placeholder.mp3"),
-  ];
-
-  for (const cand of candidates) {
-    try {
-      if (fs.existsSync(cand)) {
-        fs.copyFileSync(cand, outPath);
-        console.log("🎵 using local placeholder audio:", cand);
-        return true;
-      }
-    } catch (_) {}
-  }
-  console.log("⚠️ local placeholder audio not found in candidates");
-  return false;
-}
 async function downloadToFile(url, outPath) {
   const https = require("https");
   const http = require("http");
@@ -1777,17 +1765,6 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const lengthSec = Math.max(1, Math.min(60, Number(body.lengthSec ?? body.length ?? 5)));
     const fps = Math.max(1, Math.min(120, Number(body.fps ?? 30)));
     const resolution = String(body.resolution || body.res || "720p").trim();
-
-    // 🔊 Audio (off / music / voice)
-    const audioObj = (body && typeof body.audio === 'object' && body.audio) ? body.audio : {};
-    const audioMode = String(body.audioMode || audioObj.mode || 'off').trim().toLowerCase(); // off|music|voice
-    const audioPreset = String(body.audioPreset || audioObj.preset || 'ambient').trim().toLowerCase();
-    const voiceStyle = String(body.voiceStyle || audioObj.voiceStyle || 'narration').trim().toLowerCase();
-    const audioVolume = (() => {
-      const v = Number(body.audioVolume ?? audioObj.volume);
-      if (!Number.isFinite(v)) return 0.8;
-      return Math.max(0, Math.min(1, v));
-    })();
     const hasFile = !!req.file;
 
     if (!prompt && !hasFile) {
@@ -1857,26 +1834,6 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     }
     if (!creationId) creationId = id;
     const finalized = await finalizeGeneratedVideo({ uid, creationId, sourceUrl });
-    // 🔊 Optional: create/upload an audio track (placeholder for now)
-    // Real AI music/voice generation can later replace this section, but the pipeline (Firestore + Functions mix) is already wired.
-    let audioUpload = null;
-    try {
-      if (audioMode && audioMode !== "off") {
-        const tmpDir = os.tmpdir();
-        const tmpMp3 = path.join(tmpDir, `genova_audio_${uid}_${creationId}_${Date.now()}.mp3`);
-        const kind = audioMode === "voice" ? "voice" : "music";
-        const ok = tryCopyLocalPlaceholderAudio(tmpMp3, kind);
-        if (ok) {
-          const audioPath = `audios/${uid}/${creationId}_${kind}.mp3`;
-          audioUpload = await uploadFileToFirebaseStorage(tmpMp3, audioPath, "audio/mpeg");
-        }
-        try { fs.unlinkSync(tmpMp3); } catch (_) {}
-      }
-    } catch (eA) {
-      console.warn("⚠️ audio placeholder upload failed:", eA?.message || eA);
-      audioUpload = null;
-    }
-
 
     const url = finalized.videoUrl;// Mark as ready
     await setLastResult(uid, {
@@ -1885,7 +1842,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       title: "",
       message: "",
       url,
-      meta: { ...meta, creationId, fileName, watermarkRequired: !!watermarkApplied, audioMode, audioPreset, voiceStyle, audioVolume },
+      meta: { ...meta, creationId, fileName, watermarkRequired: !!watermarkApplied },
       createdAt,
     });
 // ✅ Update the user's creation doc if it exists (preferred direct path)
@@ -1903,16 +1860,6 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
             length: Number(lengthSec),
             fps: Number(fps),
             resolution: String(resolution),
-            // 🔊 audio config (mixed later in Functions watermark worker)
-            audio: {
-              mode: audioMode || 'off',
-              preset: audioPreset || 'ambient',
-              voiceStyle: voiceStyle || 'narration',
-              volume: audioVolume,
-              status: (audioMode && audioMode !== 'off') ? ((audioUpload && audioUpload.url) ? 'ready' : 'pending') : 'off',
-              audioUrl: (audioUpload && audioUpload.url) ? audioUpload.url : null,
-              audioPath: (audioUpload && audioUpload.path) ? audioUpload.path : null,
-            },
             hasImage: !!req.file,
             fileName: String(fileName || ""),
             status: "ready",
@@ -2026,8 +1973,7 @@ updatedAt: admin.firestore.Timestamp.now(),
       resultId: id,
       creationId,
       fileName,
-      audioUrl: (audioUpload && audioUpload.url) ? audioUpload.url : null,
-      result: { id, status: "ready", url, meta: { ...meta, creationId, fileName, watermarkRequired: !!watermarkApplied, audioMode, audioPreset, voiceStyle, audioVolume }, createdAt },
+      result: { id, status: "ready", url, meta: { ...meta, creationId, fileName, watermarkRequired: !!watermarkApplied }, createdAt },
       billing,
     });
   } catch (e) {
