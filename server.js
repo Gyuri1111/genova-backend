@@ -1743,16 +1743,29 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
 
     // In multipart, fields arrive as strings
     const body = req.body || {};
+    // Some clients send a JSON-encoded 'meta' field inside multipart.
+    let meta = {};
+    try {
+      if (body && typeof body.meta === 'string') meta = JSON.parse(body.meta);
+      else if (body && body.meta && typeof body.meta === 'object') meta = body.meta;
+    } catch (_) { meta = {}; }
+    const getField = (k, fallback) => {
+      const v = body?.[k];
+      if (v !== undefined && v !== null && String(v).length) return v;
+      const mv = meta?.[k];
+      if (mv !== undefined && mv !== null && String(mv).length) return mv;
+      return fallback;
+    };
     const prompt = String(body.prompt || body.text || "").trim();
     const model = String(body.model || "kling").trim();
     const lengthSec = Math.max(1, Math.min(60, Number(body.lengthSec ?? body.length ?? 5)));
     const fps = Math.max(1, Math.min(120, Number(body.fps ?? 30)));
     const resolution = String(body.resolution || body.res || "720p").trim();
     // 🔊 Audio (exclusive): off | music(preset) | voice(voiceStyle)
-    const audioMode = String(body.audioMode || body.audio || "off").trim().toLowerCase();
-    const audioPreset = String(body.audioPreset || body.preset || "ambient").trim().toLowerCase();
-    const voiceStyle = String(body.voiceStyle || body.voice || "narration").trim().toLowerCase();
-    const audioVolume = Math.max(0, Math.min(1, Number(body.audioVolume ?? body.volume ?? 0.8) || 0.8));
+    const audioMode = String(getField('audioMode', getField('audio', 'off'))).trim().toLowerCase();
+    const audioPreset = String(getField('audioPreset', getField('preset', 'ambient'))).trim().toLowerCase();
+    const voiceStyle = String(getField('voiceStyle', getField('voice', 'narration'))).trim().toLowerCase();
+    const audioVolume = Math.max(0, Math.min(1, Number(getField('audioVolume', getField('volume', 0.8))) || 0.8));
 
     const audio =
       audioMode === "music"
