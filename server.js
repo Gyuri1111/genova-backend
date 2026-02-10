@@ -103,23 +103,6 @@ if (Number.isFinite(sec) && sec > 0) {
 }
 
 
-function normalizeAudioConfig(input) {
-  const mode = String(input?.mode || input?.audioMode || 'off').toLowerCase().trim();
-  const volumeRaw = input?.volume ?? input?.audioVolume ?? 0.8;
-  const volume = Math.max(0, Math.min(1, Number(volumeRaw) || 0.8));
-
-  if (mode === 'music') {
-    const preset = String(input?.preset || input?.audioPreset || 'ambient').toLowerCase().trim();
-    return { mode: 'music', preset, volume, status: 'pending', audioUrl: null, audioPath: null };
-  }
-  if (mode === 'voice') {
-    const voiceStyle = String(input?.voiceStyle || 'narration').toLowerCase().trim();
-    return { mode: 'voice', voiceStyle, volume, status: 'pending', audioUrl: null, audioPath: null };
-  }
-  return { mode: 'off', volume, status: 'off', audioUrl: null, audioPath: null };
-}
-
-
 const app = express();
 
 // ------------------------------------------------------------
@@ -1765,6 +1748,19 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const lengthSec = Math.max(1, Math.min(60, Number(body.lengthSec ?? body.length ?? 5)));
     const fps = Math.max(1, Math.min(120, Number(body.fps ?? 30)));
     const resolution = String(body.resolution || body.res || "720p").trim();
+    // 🔊 Audio (exclusive): off | music(preset) | voice(voiceStyle)
+    const audioMode = String(body.audioMode || body.audio || "off").trim().toLowerCase();
+    const audioPreset = String(body.audioPreset || body.preset || "ambient").trim().toLowerCase();
+    const voiceStyle = String(body.voiceStyle || body.voice || "narration").trim().toLowerCase();
+    const audioVolume = Math.max(0, Math.min(1, Number(body.audioVolume ?? body.volume ?? 0.8) || 0.8));
+
+    const audio =
+      audioMode === "music"
+        ? { mode: "music", preset: audioPreset, volume: audioVolume, status: "pending", audioUrl: null, audioPath: null }
+        : audioMode === "voice"
+        ? { mode: "voice", voiceStyle, volume: audioVolume, status: "pending", audioUrl: null, audioPath: null }
+        : { mode: "off", volume: audioVolume, status: "off", audioUrl: null, audioPath: null };
+
     const hasFile = !!req.file;
 
     if (!prompt && !hasFile) {
@@ -1862,6 +1858,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
             resolution: String(resolution),
             hasImage: !!req.file,
             fileName: String(fileName || ""),
+            audio,
             status: "ready",
             // Render server uploads ORIGINAL video only. Functions will later:
             // - apply watermark (if required)
