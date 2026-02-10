@@ -105,13 +105,13 @@ if (Number.isFinite(sec) && sec > 0) {
 
 
 function normalizeAudioConfig(input) {
-  const mode = String(input?.mode || 'off').toLowerCase().trim();
-  const volume = Math.max(0, Math.min(1, Number(input?.volume ?? 0.8) || 0.8));
+  const mode = String(input && input.mode ? input.mode : 'off').toLowerCase().trim();
+  const volume = Math.max(0, Math.min(1, Number(input && input.volume != null ? input.volume : 0.8) || 0.8));
   if (mode === 'music') {
-    return { mode: 'music', preset: String(input?.preset || 'ambient'), volume, status: 'pending', audioPath: null, audioUrl: null };
+    return { mode: 'music', preset: String(input && input.preset ? input.preset : 'ambient'), volume, status: 'pending', audioPath: null, audioUrl: null };
   }
   if (mode === 'voice') {
-    return { mode: 'voice', voiceStyle: String(input?.voiceStyle || 'narration'), volume, status: 'pending', audioPath: null, audioUrl: null };
+    return { mode: 'voice', voiceStyle: String(input && input.voiceStyle ? input.voiceStyle : 'narration'), volume, status: 'pending', audioPath: null, audioUrl: null };
   }
   return { mode: 'off', volume, status: 'off', audioPath: null, audioUrl: null };
 }
@@ -1756,17 +1756,20 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
 
     // In multipart, fields arrive as strings
     const body = req.body 
-  // Safe meta parsing (no duplicate const meta)
-  let metaParsed = {};
+  // Safe meta parsing (legacy-safe)
+  var metaParsed = {};
   try {
-    metaParsed = typeof body.meta === 'string' ? JSON.parse(body.meta) : (body.meta || {});
-  } catch (_) {
+    if (body && body.meta) {
+      metaParsed = typeof body.meta === 'string' ? JSON.parse(body.meta) : body.meta;
+    }
+  } catch (e) {
     metaParsed = {};
   }
-  const audioMode = String(body.audioMode ?? metaParsed.audioMode ?? 'off');
-  const audioPreset = String(body.audioPreset ?? metaParsed.audioPreset ?? 'ambient');
-  const voiceStyle = String(body.voiceStyle ?? metaParsed.voiceStyle ?? 'narration');
-  const audioVolume = Number(body.audioVolume ?? metaParsed.audioVolume ?? 0.8);
+
+  var audioMode = String((body && body.audioMode) || (metaParsed && metaParsed.audioMode) || 'off');
+  var audioPreset = String((body && body.audioPreset) || (metaParsed && metaParsed.audioPreset) || 'ambient');
+  var voiceStyle = String((body && body.voiceStyle) || (metaParsed && metaParsed.voiceStyle) || 'narration');
+  var audioVolume = Number((body && body.audioVolume) || (metaParsed && metaParsed.audioVolume) || 0.8);
 || {};
     const prompt = String(body.prompt || body.text || "").trim();
     const model = String(body.model || "kling").trim();
