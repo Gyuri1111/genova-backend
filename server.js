@@ -296,19 +296,13 @@ app.post("/cleanup-me", verifyFirebaseToken, async (req, res) => {
 // ------------------------------------------------------------
 function buildExpiryCleanupPatch(userData, nowMs) {
   const patch = {};
-  const currentPlan = (userData && userData.plan) ? String(userData.plan) : "free";
 
+  const currentPlan = (userData && userData.plan) ? String(userData.plan) : "free";
   const ent = (userData && userData.entitlements && typeof userData.entitlements === "object")
     ? userData.entitlements
     : {};
 
-  // Plan expiry: if planUntil expired -> fall back to FREE (no stacking here)
-  const planUntilMs = toMsFromTimestampLike(userData?.planUntil);
-  if (planUntilMs && planUntilMs <= nowMs) {
-    patch["plan"] = "free";
-    patch["planUntil"] = null;
-  }
-
+  // ✅ ONLY clear expired entitlements.*Until (do NOT modify plan/planUntil here)
   const entitlementKeys = [
     "adFreeUntil",
     "noWatermarkUntil",
@@ -324,23 +318,14 @@ function buildExpiryCleanupPatch(userData, nowMs) {
     }
   }
 
-  const effectivePlan = currentPlan;
-  if (effectivePlan !== "studio") {
-    // Prompt Builder is Studio-only; always clear for non-studio
+  // ✅ Prompt Builder is Studio-only: if user is not Studio, force it off
+  if (String(currentPlan).toLowerCase() !== "studio") {
     patch["entitlements.promptBuilderUntil"] = null;
-  } else {
-    // Studio plan active: keep Prompt Builder aligned with planUntil
-    const studioPlanUntilMs = toMsFromTimestampLike(userData?.planUntil);
-    if (studioPlanUntilMs) {
-      patch["entitlements.promptBuilderUntil"] = admin.firestore.Timestamp.fromMillis(studioPlanUntilMs);
-    } else {
-      // If somehow planUntil missing, be safe and clear
-      patch["entitlements.promptBuilderUntil"] = null;
-    }
   }
 
   return patch;
 }
+
 
 async function cleanupExpiredEntitlementsForUser(uid) {
   const userRef = db.collection("users").doc(uid);
@@ -1750,6 +1735,47 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const resolution = String(body.resolution || body.res || "720p").trim();
     const hasFile = !!req.file;
 
+    // 🔊 Audio config (stored on the creation doc so Functions can apply/mix it)
+    const audioConfig = (() => {
+      try {
+        // multipart fields are strings; allow JSON in body.audio
+        const raw = body.audio;
+        let parsed = null;
+        if (raw && typeof raw === "string") {
+          const s = raw.trim();
+          if (s.startsWith("{") || s.startsWith("[")) {
+            parsed = JSON.parse(s);
+          }
+        } else if (raw && typeof raw === "object") {
+          parsed = raw;
+        }
+
+        const mode0 =
+          (parsed && parsed.mode) ||
+          body.audioMode ||
+          body.audio_mode ||
+          body.audio ||
+          "";
+        const mode = String(mode0 || "").toLowerCase().trim();
+
+        if (!mode || mode === "off" || mode === "none") return null;
+
+        const preset0 = (parsed && (parsed.preset || parsed.musicPreset)) || body.audioPreset || body.musicPreset || "";
+        const voiceStyle0 = (parsed && (parsed.voiceStyle || parsed.style)) || body.voiceStyle || body.audioVoiceStyle || body.voice || "";
+
+        const cfg = { mode };
+        if (mode === "music" && preset0) cfg.preset = String(preset0).trim();
+        if (mode === "voice" && voiceStyle0) cfg.voiceStyle = String(voiceStyle0).trim();
+
+        // Let Functions fill audioPath/audioUrl; we mark it pending here
+        cfg.status = "pending";
+        cfg.updatedAt = admin.firestore.Timestamp.now();
+        return cfg;
+      } catch (_) {
+        return null;
+      }
+    })();
+
     if (!prompt && !hasFile) {
       return res.status(400).json({ success: false, error: "MISSING_INPUT" });
     }
@@ -1856,14 +1882,15 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
             thumbUrl: null,
             thumbnailUrl: null,
             storage: {
-              ...(finalized?.storage || null),
+              ...(finalized?.storage || {}),
               originalVideoPath: finalized?.storage?.videoPath || null,
               thumbPath: null,
             },
             watermarkApplied: false,
             watermarkRequired: !!watermarkApplied,
             watermarkStatus: !!watermarkApplied ? "pending" : "not_required",
-updatedAt: admin.firestore.Timestamp.now(),
+            ...(audioConfig ? { audio: audioConfig } : {}),
+            updatedAt: admin.firestore.Timestamp.now(),
           },
           { merge: true }
         );
