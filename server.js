@@ -103,23 +103,6 @@ if (Number.isFinite(sec) && sec > 0) {
 }
 
 
-
-function normalizeAudioConfigFromInputs(audioModeRaw, audioPresetRaw, voiceStyleRaw, audioVolumeRaw) {
-  const mode = String(audioModeRaw || "off").toLowerCase().trim();
-  const volumeNum = Number(audioVolumeRaw);
-  const volume = Math.max(0, Math.min(1, Number.isFinite(volumeNum) ? volumeNum : 0.8));
-
-  if (mode === "music") {
-    const preset = String(audioPresetRaw || "ambient").toLowerCase().trim();
-    return { mode: "music", preset, volume, status: "pending", audioPath: null, audioUrl: null };
-  }
-  if (mode === "voice") {
-    const voiceStyle = String(voiceStyleRaw || "narration").toLowerCase().trim();
-    return { mode: "voice", voiceStyle, volume, status: "pending", audioPath: null, audioUrl: null };
-  }
-  return { mode: "off", volume, status: "off", audioPath: null, audioUrl: null };
-}
-
 const app = express();
 
 // ------------------------------------------------------------
@@ -1760,21 +1743,6 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
 
     // In multipart, fields arrive as strings
     const body = req.body || {};
-    // --- Audio fields (may come either as direct fields or inside meta JSON) ---
-    let metaParsedAudio = {};
-    try {
-      if (body.meta) {
-        metaParsedAudio = typeof body.meta === "string" ? JSON.parse(body.meta) : body.meta;
-      }
-    } catch (e) {
-      metaParsedAudio = {};
-    }
-
-    const audioMode = String(body.audioMode || metaParsedAudio.audioMode || "off").trim();
-    const audioPreset = String(body.audioPreset || metaParsedAudio.audioPreset || "ambient").trim();
-    const voiceStyle = String(body.voiceStyle || metaParsedAudio.voiceStyle || "narration").trim();
-    const audioVolume = Number(body.audioVolume ?? metaParsedAudio.audioVolume ?? 0.8);
-
     const prompt = String(body.prompt || body.text || "").trim();
     const model = String(body.model || "kling").trim();
     const lengthSec = Math.max(1, Math.min(60, Number(body.lengthSec ?? body.length ?? 5)));
@@ -1895,7 +1863,6 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
             watermarkApplied: false,
             watermarkRequired: !!watermarkApplied,
             watermarkStatus: !!watermarkApplied ? "pending" : "not_required",
-            audio: normalizeAudioConfigFromInputs(audioMode, audioPreset, voiceStyle, audioVolume),
 updatedAt: admin.firestore.Timestamp.now(),
           },
           { merge: true }
