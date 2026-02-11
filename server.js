@@ -171,12 +171,9 @@ const verifyFirebaseToken = async (req, res, next) => {
     const decoded = await admin.auth().verifyIdToken(token);
     req.uid = decoded.uid;
 
-    // Auto-expiry cleanup (await) so expired entitlements are cleared BEFORE billing checks
-    try {
-      await cleanupExpiredEntitlementsForUser(req.uid);
-    } catch (e) {
-      console.log('⚠️ cleanupExpiredEntitlementsForUser failed:', e?.message || e);
-    }
+    // Auto-expiry cleanup (best-effort) so expired entitlements are cleared ASAP
+    cleanupExpiredEntitlementsForUser(req.uid)
+      .catch((e) => console.log('⚠️ cleanupExpiredEntitlementsForUser failed:', e?.message || e));
 
     next();
   } catch {
@@ -1753,6 +1750,46 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const resolution = String(body.resolution || body.res || "720p").trim();
     const hasFile = !!req.file;
 
+    // --- Audio config (optional) ---
+    // Accept either body.audio as JSON string/object OR flat fields: audioMode/mode, audioPreset/preset, voiceStyle/style
+    let audioCfg = null;
+    try {
+      const rawAudio = body.audio;
+      if (rawAudio) {
+        if (typeof rawAudio === "string") {
+          const parsed = JSON.parse(rawAudio);
+          if (parsed && typeof parsed === "object") audioCfg = parsed;
+        } else if (typeof rawAudio === "object") {
+          audioCfg = rawAudio;
+        }
+      }
+    } catch (_) {}
+
+    // Fallback to flat fields
+    if (!audioCfg) audioCfg = {};
+    const audioMode = String(audioCfg.mode ?? body.audioMode ?? body.mode ?? "off").toLowerCase().trim();
+    const audioPreset = String(audioCfg.preset ?? body.audioPreset ?? body.preset ?? "").trim();
+    const voiceStyle = String(audioCfg.voiceStyle ?? audioCfg.style ?? body.voiceStyle ?? body.audioVoiceStyle ?? body.style ?? "").trim();
+
+    // Build Firestore audio map ONLY if mode is not off/none and at least one selector is present
+    const shouldWriteAudio =
+      audioMode && audioMode !== "off" && audioMode !== "none" && audioMode !== "false" &&
+      (audioPreset || voiceStyle || audioCfg.audioPath || audioCfg.audioUrl);
+
+    const audioToWrite = shouldWriteAudio
+      ? {
+          ...audioCfg,
+          mode: audioMode,
+          ...(audioPreset ? { preset: audioPreset } : {}),
+          ...(voiceStyle ? { voiceStyle } : {}),
+          status: "pending",
+          updatedAt: admin.firestore.Timestamp.now(),
+          // keep createdAt if client provided; else set
+          createdAt: audioCfg.createdAt || admin.firestore.Timestamp.now(),
+        }
+      : null;
+
+
     if (!prompt && !hasFile) {
       return res.status(400).json({ success: false, error: "MISSING_INPUT" });
     }
@@ -1866,7 +1903,8 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
             watermarkApplied: false,
             watermarkRequired: !!watermarkApplied,
             watermarkStatus: !!watermarkApplied ? "pending" : "not_required",
-updatedAt: admin.firestore.Timestamp.now(),
+            ...(audioToWrite ? { audio: audioToWrite } : {}),
+            updatedAt: admin.firestore.Timestamp.now(),
           },
           { merge: true }
         );
