@@ -1585,7 +1585,10 @@ async function finalizeGeneratedVideo({ uid, creationId, sourceUrl }) {
   if (isPlaceholder) {
     const copied = tryCopyLocalPlaceholder(localSrc);
     if (!copied) {
-      await downloadToFile(sourceUrl, localSrc);
+      // Avoid a self-HTTP call on Render (can be flaky behind the proxy).
+      // Write the tiny placeholder mp4 directly.
+      fs.writeFileSync(localSrc, Buffer.from(PLACEHOLDER_MP4_BASE64, "base64"));
+      console.log("🎬 wrote inline placeholder mp4 to:", localSrc);
     }
   } else {
     await downloadToFile(sourceUrl, localSrc);
@@ -1618,7 +1621,7 @@ async function finalizeGeneratedVideo({ uid, creationId, sourceUrl }) {
 }
 
 
-_MP4_BASE64 =
+const PLACEHOLDER_MP4_BASE64 =
   "AAAAHGZ0eXBpc29tAAAAAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAABXRtZGF0AAAAAA==";
 
 async function genFromPrompt(out) {
@@ -1772,6 +1775,12 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const voiceStyle = String(audioCfg.voiceStyle ?? audioCfg.style ?? body.voiceStyle ?? body.audioVoiceStyle ?? body.style ?? "").trim();
 
     // Build Firestore audio map ONLY if mode is not off/none and at least one selector is present
+    // For upload/recording narration, the client will stage an audioPath/audioUrl first.
+    // In that case we must preserve `status: "ready"` so Functions can start mixing immediately.
+    const normalizedAudioMode = audioMode;
+    const isNarrationAsset = normalizedAudioMode === "upload" || normalizedAudioMode === "recording";
+    const desiredAudioStatus = isNarrationAsset ? (String(audioCfg.status || "ready").toLowerCase().trim() || "ready") : "pending";
+
     const shouldWriteAudio =
       audioMode && audioMode !== "off" && audioMode !== "none" && audioMode !== "false" &&
       (audioPreset || voiceStyle || audioCfg.audioPath || audioCfg.audioUrl);
@@ -1782,7 +1791,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
           mode: audioMode,
           ...(audioPreset ? { preset: audioPreset } : {}),
           ...(voiceStyle ? { voiceStyle } : {}),
-          status: "pending",
+          status: desiredAudioStatus,
           updatedAt: admin.firestore.Timestamp.now(),
           // keep createdAt if client provided; else set
           createdAt: audioCfg.createdAt || admin.firestore.Timestamp.now(),
