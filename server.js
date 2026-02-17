@@ -2307,9 +2307,6 @@ const nowMs = Date.now();
 const ent0 = (user.entitlements && typeof user.entitlements === "object") ? user.entitlements : {};
 const isProOrStudio = planId === "pro" || planId === "studio";
 
-const ent0 = (user.entitlements && typeof user.entitlements === "object") ? user.entitlements : {};
-const isProOrStudio = planId === "pro" || planId === "studio";
-
 const entUpdates = {};
 if (isProOrStudio) {
   const existingAdFreeMs = toMsFromTimestampLike(ent0.adFreeUntil);
