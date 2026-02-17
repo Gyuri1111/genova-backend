@@ -503,6 +503,10 @@ templates_30d: { cost: 50, days: 30, entitlementKey: "templatesUntil" },
 // PRO Prompt Pack (time-based) — 7d and 30d grant their respective durations
 pro_prompt_7d: { cost: 20, days: 7, entitlementKey: "proPromptUntil" },
 pro_prompt_30d: { cost: 50, days: 30, entitlementKey: "proPromptUntil" },
+
+    // Audio Mix (music / narration) — time-based
+    audio_mix_7d: { cost: 30, days: 7, entitlementKey: "audioMixUntil" },
+    audio_mix_30d: { cost: 70, days: 30, entitlementKey: "audioMixUntil" },
   },
 };
 
