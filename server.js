@@ -314,7 +314,8 @@ function buildExpiryCleanupPatch(userData, nowMs) {
     "noWatermarkUntil",
     "templatesUntil",
     "proPromptUntil",
-    "promptBuilderUntil",
+    "promptBuilderUntil",    "audioMixUntil",
+
   ];
 
   for (const k of entitlementKeys) {
