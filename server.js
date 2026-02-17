@@ -323,10 +323,6 @@ function buildExpiryCleanupPatch(userData, nowMs) {
     if (ms && ms <= nowMs) {
       patch[`entitlements.${k}`] = null;
     }
-  // Legacy safeguard: if audioMixUntil was stored at the root, clear it when expired.
-  const legacyAudioMixMs = toMsFromTimestampLike(userData?.audioMixUntil);
-  if (legacyAudioMixMs && legacyAudioMixMs <= nowMs) {
-    patch["audioMixUntil"] = null;
   }
 
   const effectivePlan = currentPlan;
