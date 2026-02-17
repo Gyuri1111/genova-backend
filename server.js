@@ -314,8 +314,8 @@ function buildExpiryCleanupPatch(userData, nowMs) {
     "noWatermarkUntil",
     "templatesUntil",
     "proPromptUntil",
-    "promptBuilderUntil",    "audioMixUntil",
-
+    "promptBuilderUntil",
+    "audioMixUntil",
   ];
 
   for (const k of entitlementKeys) {
@@ -323,6 +323,10 @@ function buildExpiryCleanupPatch(userData, nowMs) {
     if (ms && ms <= nowMs) {
       patch[`entitlements.${k}`] = null;
     }
+  // Legacy safeguard: if audioMixUntil was stored at the root, clear it when expired.
+  const legacyAudioMixMs = toMsFromTimestampLike(userData?.audioMixUntil);
+  if (legacyAudioMixMs && legacyAudioMixMs <= nowMs) {
+    patch["audioMixUntil"] = null;
   }
 
   const effectivePlan = currentPlan;
@@ -339,19 +343,6 @@ function buildExpiryCleanupPatch(userData, nowMs) {
       patch["entitlements.promptBuilderUntil"] = null;
     }
   }
-
-
-
-// ✅ Audio mixing: PRO + STUDIO include it for the plan duration (but keep longer purchased add-on if any)
-try {
-  const p = String(effectivePlan || "").toLowerCase();
-  const planMs = toMsFromTimestampLike(userData?.planUntil);
-  if (planMs && (p === "pro" || p === "studio")) {
-    const existingMs = toMsFromTimestampLike(ent?.audioMixUntil);
-    const targetMs = existingMs && existingMs > planMs ? existingMs : planMs;
-    patch["entitlements.audioMixUntil"] = admin.firestore.Timestamp.fromMillis(targetMs);
-  }
-} catch (_) {}
 
   return patch;
 }
@@ -516,10 +507,6 @@ templates_30d: { cost: 50, days: 30, entitlementKey: "templatesUntil" },
 // PRO Prompt Pack (time-based) — 7d and 30d grant their respective durations
 pro_prompt_7d: { cost: 20, days: 7, entitlementKey: "proPromptUntil" },
 pro_prompt_30d: { cost: 50, days: 30, entitlementKey: "proPromptUntil" },
-
-    // Audio mixing (time-based) — enables Music + Narration
-    audio_mix_7d: { cost: 30, days: 7, entitlementKey: "audioMixUntil" },
-    audio_mix_30d: { cost: 70, days: 30, entitlementKey: "audioMixUntil" },
   },
 };
 
@@ -2326,14 +2313,11 @@ if (isProOrStudio) {
   const existingNoWmMs = toMsFromTimestampLike(ent0.noWatermarkUntil);
   const existingTplMs = toMsFromTimestampLike(ent0.templatesUntil);
   const existingProPromptMs = toMsFromTimestampLike(ent0.proPromptUntil);
-  const existingAudioMixMs = toMsFromTimestampLike(ent0.audioMixUntil);
 
   entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, 30));
   entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, 30));
   entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, 30));
   entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, 30));
-  // Audio mixing included for full plan duration (keep longer purchased add-on if any)
-  entUpdates.audioMixUntil = admin.firestore.Timestamp.fromMillis(Math.max(existingAudioMixMs || 0, planUntilMs));
 }
 
 // ✅ Prompt Builder: Studio-only AND duration must match Studio planUntil exactly
