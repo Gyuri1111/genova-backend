@@ -2307,17 +2307,23 @@ const nowMs = Date.now();
 const ent0 = (user.entitlements && typeof user.entitlements === "object") ? user.entitlements : {};
 const isProOrStudio = planId === "pro" || planId === "studio";
 
+const ent0 = (user.entitlements && typeof user.entitlements === "object") ? user.entitlements : {};
+const isProOrStudio = planId === "pro" || planId === "studio";
+
 const entUpdates = {};
 if (isProOrStudio) {
   const existingAdFreeMs = toMsFromTimestampLike(ent0.adFreeUntil);
   const existingNoWmMs = toMsFromTimestampLike(ent0.noWatermarkUntil);
   const existingTplMs = toMsFromTimestampLike(ent0.templatesUntil);
   const existingProPromptMs = toMsFromTimestampLike(ent0.proPromptUntil);
+  const existingAudioMixMs = toMsFromTimestampLike(ent0.audioMixUntil);
 
-  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, 30));
-  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, 30));
-  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, 30));
-  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, 30));
+  // ✅ Plan-included add-ons stack by the purchased plan period (days)
+  entUpdates.adFreeUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAdFreeMs, days));
+  entUpdates.noWatermarkUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingNoWmMs, days));
+  entUpdates.templatesUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingTplMs, days));
+  entUpdates.proPromptUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingProPromptMs, days));
+  entUpdates.audioMixUntil = admin.firestore.Timestamp.fromMillis(addDaysToExpiry(existingAudioMixMs, days));
 }
 
 // ✅ Prompt Builder: Studio-only AND duration must match Studio planUntil exactly
@@ -2568,5 +2574,4 @@ app.get("/d/:filename", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
 );
-
 
