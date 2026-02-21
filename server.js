@@ -654,11 +654,30 @@ function entitlementActive(untilTs) {
 
 function computeWatermarkApplied(userData) {
   const ent = userData?.entitlements || {};
+  const plan = String(userData?.plan || "free").toLowerCase();
   const noWm = entitlementActive(ent?.noWatermarkUntil);
+
+  // Base rule (current system):
   // ✅ Only Firestore entitlement decides no-watermark (plan does NOT grant it automatically)
-  // watermarkApplied=true means watermark should be applied (i.e. noWatermark NOT active)
-  return !noWm;
+  let watermarkApplied = !noWm;
+
+  // Rewarded override (single-request):
+  // If the client explicitly requests rewarded no-watermark, allow the request to be watermark-free
+  // for FREE/BASIC only, and only when there is no active noWatermark entitlement.
+  const useRewardedNoWatermark = userData?.useRewardedNoWatermark === true;
+
+  if (
+    watermarkApplied === true &&
+    useRewardedNoWatermark &&
+    (plan === "free" || plan === "basic") &&
+    !noWm
+  ) {
+    watermarkApplied = false;
+  }
+
+  return watermarkApplied;
 }
+
 
 
 async function ensureTrialValidateAndDebit(uid, genParams) {
@@ -1751,7 +1770,10 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
 
     // In multipart, fields arrive as strings
     const body = req.body || {};
-    const prompt = String(body.prompt || body.text || "").trim();
+    
+    // Rewarded single-use flags (strings in multipart)
+    const useRewardedNoWatermark = String(body.useRewardedNoWatermark || '').toLowerCase() === 'true';
+const prompt = String(body.prompt || body.text || "").trim();
     const model = String(body.model || "kling").trim();
     const lengthSec = Math.max(1, Math.min(60, Number(body.lengthSec ?? body.length ?? 5)));
     const fps = Math.max(1, Math.min(120, Number(body.fps ?? 30)));
@@ -1814,6 +1836,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
       lengthSec,
       fps,
       resolution,
+      useRewardedNoWatermark,
     });
 
     // Build result skeleton
