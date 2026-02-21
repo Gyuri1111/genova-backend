@@ -1882,6 +1882,61 @@ async function findRecentPendingCreationId(db, uid, { model, lengthSec, resoluti
   }
 }
 
+
+
+// ✅ Consume one rewarded token (used by AudioScreen "Add Audio" single-use unlock)
+// Body: { branch: "audio" | "nowm" }
+app.post("/consume-rewarded-token", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    if (!uid) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+
+    const branchRaw = String(req.body?.branch || "").trim().toLowerCase();
+    const branch = (branchRaw === "audio" || branchRaw === "nowm") ? branchRaw : null;
+    if (!branch) return res.status(400).json({ ok: false, error: "INVALID_BRANCH" });
+
+    const userRef = db.collection("users").doc(uid);
+
+    let before = 0;
+    let after = 0;
+
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) {
+        const err = new Error("NO_USER");
+        err.code = "NO_USER";
+        throw err;
+      }
+      const data = snap.data() || {};
+      const rewarded = data.rewarded || {};
+      const branches = rewarded.branches || {};
+      const b = branches[branch] || {};
+      before = Number(b.tokens ?? 0) || 0;
+
+      if (before <= 0) {
+        after = before;
+        return;
+      }
+
+      after = before - 1;
+
+      tx.update(userRef, {
+        [`rewarded.branches.${branch}.tokens`]: admin.firestore.FieldValue.increment(-1),
+        "rewarded.updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    if (before <= 0) {
+      return res.status(200).json({ ok: false, error: "NO_TOKEN", tokensBefore: before, tokensAfter: after });
+    }
+
+    return res.status(200).json({ ok: true, tokensBefore: before, tokensAfter: after });
+  } catch (e) {
+    console.error("❌ consume-rewarded-token error:", e);
+    return res.status(500).json({ ok: false, error: String(e?.code || e?.message || e) });
+  }
+});
+
 app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (req, res) => {
   try {
     const uid = req.uid;
