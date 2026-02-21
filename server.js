@@ -708,6 +708,8 @@ async function ensureTrialValidateAndDebit(uid, genParams) {
         trialCreditsGranted: true,
         entitlements: {},
         notifPrefs: {},
+        rewarded: { branches: { nowm: { progress: 0, tokens: 0 }, audio: { progress: 0, tokens: 0 } }, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       };
@@ -732,7 +734,47 @@ async function ensureTrialValidateAndDebit(uid, genParams) {
       result.trialGranted = true;
       result.plan = planInfo.plan;
       result.entitlements = init.entitlements;
-      result.watermarkApplied = computeWatermarkApplied({ plan: planInfo.plan, entitlements: init.entitlements });
+      // Decide rewarded AUDIO unlock (single-use) when an audio mode is requested.
+// This is separate from no-watermark and only applies to FREE/BASIC when there is no active audioMix entitlement.
+let allowRewardedAudio = false;
+try {
+  const p = String(planInfo.plan || "free").toLowerCase();
+  const audioModeNorm = String(genParams.audioMode || "").toLowerCase().trim();
+  const audioRequested = !!audioModeNorm && audioModeNorm !== "off" && audioModeNorm !== "none" && audioModeNorm !== "false";
+  const audioEntActive = entitlementActive(entitlements?.audioMixUntil);
+
+  if (
+    audioRequested &&
+    !!genParams.useRewardedAudioMix &&
+    (p === "free" || p === "basic") &&
+    !audioEntActive
+  ) {
+    if (audioTokens > 0) {
+      tx.update(userRef, {
+        "rewarded.branches.audio.tokens": admin.firestore.FieldValue.increment(-1),
+        "rewarded.updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+      });
+      allowRewardedAudio = true;
+      result.rewarded = {
+        ...(result.rewarded || {}),
+        audioTokensBefore: audioTokens,
+        audioTokensAfter: audioTokens - 1,
+        usedAudioToken: true,
+      };
+    } else {
+      result.rewarded = {
+        ...(result.rewarded || {}),
+        audioTokensBefore: audioTokens,
+        audioTokensAfter: audioTokens,
+        usedAudioToken: false,
+      };
+    }
+  }
+} catch (_) {}
+
+    result.rewardedAudioUnlocked = allowRewardedAudio;
+
+    result.watermarkApplied = computeWatermarkApplied({ plan: planInfo.plan, entitlements: init.entitlements, useRewardedNoWatermark: false });
       result.limits = planInfo.limits;
       result.cost = costInfo.cost;
       result.breakdown = costInfo.breakdown;
@@ -759,6 +801,36 @@ async function ensureTrialValidateAndDebit(uid, genParams) {
     const credits = Number(data.credits ?? 0);
     const plan = normalizePlan(data.plan);
     const entitlements = data.entitlements || {};
+
+
+// --- Rewarded tokens (server-side source of truth) ---
+// We keep interstitial logic client-side; rewarded tokens are enforced here for generation.
+// Structure: users/{uid}.rewarded.branches.{nowm|audio}.{progress,tokens}
+const rewarded = data.rewarded || {};
+const branches = rewarded.branches || {};
+const nowm = branches.nowm || {};
+const audioRw = branches.audio || {};
+const nowmTokens = Number(nowm.tokens ?? 0);
+const audioTokens = Number(audioRw.tokens ?? 0);
+
+// Ensure the rewarded structure exists so clients can rely on it.
+// (We only write defaults if missing; does not affect existing data.)
+if (!data.rewarded || !rewarded.branches) {
+  tx.set(
+    userRef,
+    {
+      rewarded: {
+        branches: {
+          nowm: { progress: Number(nowm.progress ?? 0), tokens: Number(nowm.tokens ?? 0) },
+          audio: { progress: Number(audioRw.progress ?? 0), tokens: Number(audioRw.tokens ?? 0) },
+        },
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+    },
+    { merge: true }
+  );
+}
+
 
     // Grant trial once if needed (legacy users)
     if (!data.trialCreditsGranted) {
@@ -789,7 +861,53 @@ async function ensureTrialValidateAndDebit(uid, genParams) {
 
     result.plan = planInfo.plan;
     result.entitlements = entitlements;
-    result.watermarkApplied = computeWatermarkApplied({ plan: planInfo.plan, entitlements });
+
+    // Decide rewarded no-watermark on the SERVER (prevents client/AsyncStorage desync).
+    let useRewardedNoWatermarkEffective = !!genParams.useRewardedNoWatermark;
+    try {
+      const noWmEntActive = entitlementActive(entitlements?.noWatermarkUntil);
+      const p = String(planInfo.plan || "free").toLowerCase();
+
+      if (
+        useRewardedNoWatermarkEffective &&
+        (p === "free" || p === "basic") &&
+        !noWmEntActive
+      ) {
+        if (nowmTokens > 0) {
+          // consume exactly one token for this generation request
+          tx.update(userRef, {
+            "rewarded.branches.nowm.tokens": admin.firestore.FieldValue.increment(-1),
+            "rewarded.updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+          });
+          result.rewarded = {
+            ...(result.rewarded || {}),
+            nowmTokensBefore: nowmTokens,
+            nowmTokensAfter: nowmTokens - 1,
+            usedNowmToken: true,
+          };
+        } else {
+          // No token available -> cannot apply rewarded no-watermark
+          useRewardedNoWatermarkEffective = false;
+          result.rewarded = {
+            ...(result.rewarded || {}),
+            nowmTokensBefore: nowmTokens,
+            nowmTokensAfter: nowmTokens,
+            usedNowmToken: false,
+          };
+        }
+      } else {
+        // not eligible / not requested
+        useRewardedNoWatermarkEffective = false;
+      }
+    } catch (_) {
+      useRewardedNoWatermarkEffective = false;
+    }
+
+    result.watermarkApplied = computeWatermarkApplied({
+      plan: planInfo.plan,
+      entitlements,
+      useRewardedNoWatermark: useRewardedNoWatermarkEffective,
+    });
     result.limits = planInfo.limits;
     result.cost = costInfo.cost;
     result.breakdown = costInfo.breakdown;
@@ -1773,6 +1891,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     
     // Rewarded single-use flags (strings in multipart)
     const useRewardedNoWatermark = String(body.useRewardedNoWatermark || '').toLowerCase() === 'true';
+    const useRewardedAudioMix = String(body.useRewardedAudioMix || '').toLowerCase() === 'true';
 const prompt = String(body.prompt || body.text || "").trim();
     const model = String(body.model || "kling").trim();
     const lengthSec = Math.max(1, Math.min(60, Number(body.lengthSec ?? body.length ?? 5)));
@@ -1837,6 +1956,9 @@ const prompt = String(body.prompt || body.text || "").trim();
       fps,
       resolution,
       useRewardedNoWatermark,
+      audioMode,
+
+      useRewardedAudioMix,
     });
 
     // Build result skeleton
