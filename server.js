@@ -397,6 +397,14 @@ function formatVideoMetaLine({ lang, model, videoLength, resolution, fps }) {
  * Localize notifications by type. Uses data if available.
  * Returns { title, body }.
  */
+
+function localizeVideoReady(lang) {
+  const l = String(lang || "").toLowerCase();
+  if (l.startsWith("hu")) return { title: "GeNova", body: "A videód elkészült." };
+  if (l.startsWith("de")) return { title: "GeNova", body: "Dein Video ist fertig." };
+  return { title: "GeNova", body: "Your video is ready." };
+}
+
 function localizeNotification({ lang, type, title, body, data }) {
   const L = normalizeLang(lang);
 
@@ -406,20 +414,15 @@ function localizeNotification({ lang, type, title, body, data }) {
   const fps = data?.fps ?? data?.meta?.fps ?? "";
 
   if (type === "video") {
-    const t =
-      L === "hu"
-        ? "🎬 A videó elkészült"
-        : L === "de"
-        ? "🎬 Dein Video ist fertig"
-        : "🎬 Your video has been generated";
-
-    const b =
+    const ready = localizeVideoReady(L);
+    const meta =
       model || videoLength || resolution || fps
         ? formatVideoMetaLine({ lang: L, model, videoLength, resolution, fps })
-        : body || "";
+        : null;
 
-    return { title: t, body: b };
+    return { title: ready.title, body: meta ? `${ready.body}\n${meta}` : ready.body };
   }
+
 
   if (type === "system") {
     const t =
@@ -1089,6 +1092,7 @@ async function sendPush(userDoc, payload) {
           return d;
         })(),
         priority: "high",
+        channelId: "default",
         collapseId: (() => {
           const d = payload.data || {};
           const base = `${payload.type || 'n'}_${d.creationId || d.id || ''}`;
@@ -2195,7 +2199,7 @@ const prompt = String(body.prompt || body.text || "").trim();
     }
 // Send push/email if enabled
     // ✅ IMPORTANT: if watermark is required, do NOT notify here — the Functions watermark worker will notify after _wm.mp4 is finalized.
-    if (!watermarkApplied) {
+    if (!watermarkApplied && !useRewardedNoWatermark) {
       try {
         await notifyUser({
           uid,
