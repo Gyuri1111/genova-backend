@@ -867,14 +867,6 @@ if (!data.rewarded || !rewarded.branches) {
     try {
       const noWmEntActive = entitlementActive(entitlements?.noWatermarkUntil);
       const p = String(planInfo.plan || "free").toLowerCase();
-      console.log('🎁 SERVER_NOWM_DECISION', {
-        uid,
-        requestedUseRewardedNoWatermark: !!genParams.useRewardedNoWatermark,
-        useRewardedNoWatermarkEffective,
-        plan: p,
-        noWmEntActive,
-        nowmTokens,
-      });
 
       if (
         useRewardedNoWatermarkEffective &&
@@ -882,7 +874,6 @@ if (!data.rewarded || !rewarded.branches) {
         !noWmEntActive
       ) {
         if (nowmTokens > 0) {
-          console.log('🎁 SERVER_NOWM_CONSUME_OK', { uid, nowmTokensBefore: nowmTokens });
           // consume exactly one token for this generation request
           tx.update(userRef, {
             "rewarded.branches.nowm.tokens": admin.firestore.FieldValue.increment(-1),
@@ -895,7 +886,6 @@ if (!data.rewarded || !rewarded.branches) {
             usedNowmToken: true,
           };
         } else {
-          console.log('🟥 SERVER_NOWM_NO_TOKENS', { uid, nowmTokensBefore: nowmTokens });
           // No token available -> cannot apply rewarded no-watermark
           useRewardedNoWatermarkEffective = false;
           result.rewarded = {
@@ -1092,8 +1082,18 @@ async function sendPush(userDoc, payload) {
         sound: "default",
         title: payload.title || "GeNova",
         body: payload.body || "",
-        data: payload.data || {},
+        data: (() => {
+          const d = payload.data || {};
+          // lightweight dedupe key (helps some Android launchers collapse duplicates)
+          if (!d._nid) d._nid = `${payload.type || 'n'}:${d.creationId || d.id || d.url || Date.now()}`;
+          return d;
+        })(),
         priority: "high",
+        collapseId: (() => {
+          const d = payload.data || {};
+          const base = `${payload.type || 'n'}_${d.creationId || d.id || ''}`;
+          return String(d.collapseId || base).slice(0, 64);
+        })(),
       },
     ];
 
@@ -1957,14 +1957,6 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     // Rewarded single-use flags (strings in multipart)
     const useRewardedNoWatermark = String(body.useRewardedNoWatermark || '').toLowerCase() === 'true';
     const useRewardedAudioMix = String(body.useRewardedAudioMix || '').toLowerCase() === 'true';
-    console.log('🚀 GENERATE_VIDEO_REQ_FLAGS', {
-      uid,
-      raw_useRewardedNoWatermark: body.useRewardedNoWatermark,
-      parsed_useRewardedNoWatermark: useRewardedNoWatermark,
-      raw_useRewardedAudioMix: body.useRewardedAudioMix,
-      parsed_useRewardedAudioMix: useRewardedAudioMix,
-      bodyKeys: Object.keys(body || {}),
-    });
 const prompt = String(body.prompt || body.text || "").trim();
     const model = String(body.model || "kling").trim();
     const lengthSec = Math.max(1, Math.min(60, Number(body.lengthSec ?? body.length ?? 5)));
