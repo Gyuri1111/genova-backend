@@ -664,7 +664,7 @@ function computeWatermarkApplied(userData) {
   // Rewarded override (single-request):
   // If the client explicitly requests rewarded no-watermark, allow the request to be watermark-free
   // for FREE/BASIC only, and only when there is no active noWatermark entitlement.
-  const useRewardedNoWatermark = userData?.useRewardedNoWatermark === true;
+  const useRewardedNoWatermark = (userData?.useRewardedNoWatermark === true) || (String(userData?.useRewardedNoWatermark || '').toLowerCase() === 'true');
 
   if (
     watermarkApplied === true &&
