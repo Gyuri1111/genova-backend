@@ -10,6 +10,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { v4: uuidv4 } = require("uuid");
+const crypto = require("crypto");
 
 // Video processing (watermark/thumbnail) has been moved to Firebase Functions.
 // This Render server intentionally does NOT use ffmpeg.
@@ -137,6 +138,29 @@ function getPublicBaseUrl(req) {
 }
 
 app.use(express.json({ limit: "10mb" }));
+
+// ===== DEBUG_REQUEST_LOGGER (TEMP) =====
+app.use((req, res, next) => {
+  const rid = crypto.randomBytes(4).toString("hex");
+  req._rid = rid;
+  const start = Date.now();
+  const ip =
+    (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
+    req.socket?.remoteAddress ||
+    "";
+
+  // NOTE: Do NOT log Authorization headers.
+  console.log(`➡️ [${rid}] ${req.method} ${req.originalUrl} ip=${ip}`);
+  console.log(`🧾 [${rid}] ct=${req.headers["content-type"] || ""} host=${req.headers["host"] || ""}`);
+
+  res.on("finish", () => {
+    console.log(`⬅️ [${rid}] ${req.method} ${req.originalUrl} status=${res.statusCode} ms=${Date.now() - start}`);
+  });
+
+  next();
+});
+// ===== END DEBUG_REQUEST_LOGGER =====
+
 
 console.log("🔥 RUNNING SERVER FILE:", __filename);
 console.log("🔥 BUILD:", BUILD_TAG);
@@ -1953,6 +1977,31 @@ app.post("/consume-rewarded-token", verifyFirebaseToken, async (req, res) => {
 
 app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (req, res) => {
   try {
+    // ===== GEN_DEBUG (TEMP) =====
+    const rid = req._rid || "no_rid";
+    console.log(`🎬 [${rid}] /generate-video HIT uid=${req.uid || "?"}`);
+    console.log(`🎬 [${rid}] multipart file? ${req.file ? "YES" : "NO"}`);
+    if (req.file) {
+      console.log(`🎬 [${rid}] file: field=${req.file.fieldname} name=${req.file.originalname} size=${req.file.size}`);
+    }
+    // Log a SAFE subset of body fields (multipart fields arrive as strings)
+    try {
+      const b = req.body || {};
+      const safe = {
+        prompt: typeof b.prompt === "string" ? b.prompt.slice(0, 120) : undefined,
+        lengthSec: b.lengthSec,
+        fps: b.fps,
+        resolution: b.resolution,
+        useNoWatermark: b.useNoWatermark,
+        useRewardedNoWatermark: b.useRewardedNoWatermark,
+        hasImage: !!b.hasImage,
+      };
+      console.log(`🎬 [${rid}] body.safe`, safe);
+    } catch (e) {
+      console.log(`🎬 [${rid}] body.safe log failed`, e?.message || e);
+    }
+    // ===== END GEN_DEBUG =====
+
     const uid = req.uid;
 
     // In multipart, fields arrive as strings
