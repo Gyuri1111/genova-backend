@@ -562,29 +562,48 @@ const BILLING = {
   },
   // Cost factors
   FPS_FACTOR: {
-    24: 0.8,
-    30: 1.0,
-    60: 2.0,
+    30: 1.00,
+    60: 1.15,
   },
   RES_FACTOR: {
-    "720p": 1.0,
-    "1080p": 1.5,
-    "4k": 3.0,
+    "720p": 1.00,
+    "1080p": 1.35,
+    "4k": 1.85,
   },
+  // Length multipliers (bucketed)
+  LEN_FACTOR: {
+    5: 1.00,
+    10: 1.45,
+    15: 1.80,
+    20: 2.10,
+  },
+  BASE_CREDITS: 8,
   // Model cost multipliers (v1 defaults)
   MODEL_FACTOR: {
-    kling: 1.0,
-    veo: 1.4,
-    runway: 1.3,
-    pika: 1.2,
-    svd: 1.0,
-    default: 1.0,
+    stable: 1.00,
+    pika: 1.25,
+    kling: 1.55,
+    runway: 1.85,
+    default: 1.00,
   },
 };
 
 function normalizePlan(p) {
   const plan = String(p || MONETIZATION.DEFAULT_PLAN).toLowerCase();
   return BILLING.PLAN_LIMITS[plan] ? plan : MONETIZATION.DEFAULT_PLAN;
+}
+
+function isModelAllowedByPlan(plan, model) {
+  const p = normalizePlan(plan);
+  const mk = String(model || "stable").toLowerCase().trim();
+  const map = {
+    free:   new Set(["stable"]),
+    basic:  new Set(["stable", "pika"]),
+    pro:    new Set(["stable", "pika", "kling"]),
+    studio: new Set(["stable", "pika", "kling", "runway"]),
+  };
+  const allowed = map[p] || map.free;
+  return allowed.has(mk);
 }
 
 function normalizeResolution(res) {
@@ -649,15 +668,32 @@ function enforceCapsAndLimits({ plan, lengthSec, fps, resolution }) {
 }
 
 function computeGenerationCost({ lengthSec, fps, resolution, model }) {
-  const baseUnits = Math.max(1, Math.ceil(lengthSec / 5)); // 1 unit per 5s
-  const fpsKey = fps >= 60 ? 60 : (fps <= 24 ? 24 : 30);
-  const fpsFactor = BILLING.FPS_FACTOR[fpsKey] ?? 1.0;
-  const resFactor = BILLING.RES_FACTOR[resolution] ?? 1.0;
-  const modelKey = String(model || "").toLowerCase().trim();
-  const modelFactor = BILLING.MODEL_FACTOR[modelKey] ?? BILLING.MODEL_FACTOR.default ?? 1.0;
+  // Multiplier-based pricing, kept in sync with HomeScreen:
+  // BASE: 5s / 720p / 30fps / Stable = BILLING.BASE_CREDITS (default 8)
+  const len = (() => {
+    const n = Number(lengthSec) || 0;
+    if (n <= 6) return 5;
+    if (n <= 12) return 10;
+    if (n <= 17) return 15;
+    return 20;
+  })();
 
-  const cost = Math.max(1, Math.ceil(baseUnits * fpsFactor * resFactor * modelFactor));
-  return { cost, breakdown: { baseUnits, fpsKey, fpsFactor, resFactor, modelFactor } };
+  const fpsKey = (Number(fps) || 0) >= 45 ? 60 : 30;
+  const resKey = normalizeResolution(resolution); // "720p" | "1080p" | "4k"
+
+  const modelKey = String(model || "stable").toLowerCase().trim();
+  const mLen = BILLING.LEN_FACTOR[len] ?? 1.0;
+  const mFps = BILLING.FPS_FACTOR[fpsKey] ?? 1.0;
+  const mRes = BILLING.RES_FACTOR[resKey] ?? 1.0;
+  const mModel = BILLING.MODEL_FACTOR[modelKey] ?? BILLING.MODEL_FACTOR.default ?? 1.0;
+
+  const raw = Number(BILLING.BASE_CREDITS || 8) * mLen * mFps * mRes * mModel;
+  const cost = Math.max(1, Math.ceil(raw));
+
+  return {
+    cost,
+    breakdown: { base: Number(BILLING.BASE_CREDITS || 8), len, mLen, fpsKey, mFps, resKey, mRes, modelKey, mModel, raw },
+  };
 }
 
 
@@ -748,6 +784,13 @@ async function ensureTrialValidateAndDebit(uid, genParams) {
         fps: genParams.fps,
         resolution: genParams.resolution,
       });
+      // Enforce model access by plan (server-side safety)
+      if (!isModelAllowedByPlan(planInfo.plan, genParams.model)) {
+        const err = new Error('MODEL_NOT_ALLOWED');
+        err.code = 'MODEL_NOT_ALLOWED';
+        throw err;
+      }
+
       const costInfo = computeGenerationCost({
         lengthSec: genParams.lengthSec,
         fps: genParams.fps,
