@@ -346,6 +346,7 @@ function buildExpiryCleanupPatch(userData, nowMs) {
     const ms = toMsFromTimestampLike(ent[k]);
     if (ms && ms <= nowMs) {
       patch[`entitlements.${k}`] = null;
+      if (k === "audioMixUntil") patch["audioMixUntil"] = null;
     }
   }
 
