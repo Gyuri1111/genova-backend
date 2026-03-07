@@ -1735,6 +1735,7 @@ function tryCopyLocalPlaceholder(outPath, orientation) {
     orientation,
     outPath
   });
+
   const isPortrait = String(orientation || "").toLowerCase() === "portrait";
   const candidates = isPortrait
     ? [
@@ -1828,7 +1829,7 @@ async function uploadFileToFirebaseStorage(localPath, destPath, contentType) {
  *
  * Watermarking + thumbnail generation are handled in Firebase Functions.
  */
-async function finalizeGeneratedVideo({ uid, creationId, sourceUrl }) {
+async function finalizeGeneratedVideo({ uid, creationId, sourceUrl, orientation }) {
   const tmpDir = os.tmpdir();
   const safeUid = String(uid || "anon").replace(/[^a-zA-Z0-9_-]/g, "");
   const safeId = String(creationId || uuidv4()).replace(/[^a-zA-Z0-9_-]/g, "");
@@ -1840,7 +1841,7 @@ async function finalizeGeneratedVideo({ uid, creationId, sourceUrl }) {
     String(sourceUrl || "").includes("/placeholder.mp4") ||
     String(sourceUrl || "").includes("/placeholder-portrait.mp4");
   if (isPlaceholder) {
-    const copied = tryCopyLocalPlaceholder(localSrc);
+    const copied = tryCopyLocalPlaceholder(localSrc, orientation);
     if (!copied) {
       // Avoid a self-HTTP call on Render (can be flaky behind the proxy).
       // Write the tiny placeholder mp4 directly.
@@ -2218,14 +2219,6 @@ const prompt = String(body.prompt || body.text || "").trim();
 	hasGetVideoFrameForResolution: typeof getVideoFrameForResolution,
 	});
 
-    console.log("🧭 ORIENTATION_DECISION", {
-      reqOrientation: req.body?.orientation,
-      reqVideoOrientation: req.body?.videoOrientation,
-      hasImage: !!req.file,
-      resolution,
-      outputFrame
-    });
-
     // Build result skeleton
     const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const createdAt = admin.firestore.Timestamp.now();
@@ -2264,11 +2257,6 @@ const prompt = String(body.prompt || body.text || "").trim();
       ? `${baseUrl}/placeholder-portrait.mp4`
       : `${baseUrl}/placeholder.mp4`;
 
-    console.log("🎞 PLACEHOLDER_PICK", {
-      orientation: outputFrame.orientation,
-      sourceUrl
-    });
-
     let fileName = String(body.fileName || "").trim() || "";
     const watermarkApplied = !!billing?.watermarkApplied;
     // ✅ If client did not send fileName, generate a stable one (needed for Firestore + share)
@@ -2291,11 +2279,6 @@ const prompt = String(body.prompt || body.text || "").trim();
       }
     }
     if (!creationId) creationId = id;
-    console.log("📦 FINALIZE_CALL", {
-      creationId,
-      orientation: outputFrame.orientation,
-      sourceUrl
-    });
     const finalized = await finalizeGeneratedVideo({
 	  uid,
 	  creationId,
