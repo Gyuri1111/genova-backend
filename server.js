@@ -346,6 +346,7 @@ function buildExpiryCleanupPatch(userData, nowMs) {
     const ms = toMsFromTimestampLike(ent[k]);
     if (ms && ms <= nowMs) {
       patch[`entitlements.${k}`] = null;
+      if (k === "audioMixUntil") patch["audioMixUntil"] = null;
     }
   }
 
@@ -715,22 +716,8 @@ function entitlementActive(untilTs) {
   return untilTs.toMillis() > tsNow().toMillis();
 }
 
-function getEffectiveEntitlements(userData) {
-  const ent = (userData && userData.entitlements && typeof userData.entitlements === "object")
-    ? userData.entitlements
-    : {};
-
-  return {
-    ...ent,
-    noWatermarkUntil: userData?.noWatermarkUntil ?? ent?.noWatermarkUntil,
-    adFreeUntil: userData?.adFreeUntil ?? ent?.adFreeUntil,
-    templatesUntil: userData?.templatesUntil ?? ent?.templatesUntil,
-    proPromptUntil: userData?.proPromptUntil ?? ent?.proPromptUntil,
-  };
-}
-
 function computeWatermarkApplied(userData) {
-  const ent = getEffectiveEntitlements(userData);
+  const ent = userData?.entitlements || {};
   const plan = String(userData?.plan || "free").toLowerCase();
   const noWm = entitlementActive(ent?.noWatermarkUntil);
 
@@ -884,7 +871,7 @@ try {
     const data = snap.data() || {};
     const credits = Number(data.credits ?? 0);
     const plan = normalizePlan(data.plan);
-    const entitlements = getEffectiveEntitlements(data);
+    const entitlements = data.entitlements || {};
 
 
 // --- Rewarded tokens (server-side source of truth) ---
@@ -1069,7 +1056,7 @@ async function ensureTrialAndDebitCredits(uid, cost) {
     const data = snap.data() || {};
     const credits = Number(data.credits ?? 0);
     const plan = String(data.plan || MONETIZATION.DEFAULT_PLAN);
-    const entitlements = getEffectiveEntitlements(data);
+    const entitlements = data.entitlements || {};
 
     // Grant trial once if not granted yet
     if (!data.trialCreditsGranted) {
@@ -1730,25 +1717,33 @@ function validateLocalMp4(filePath, label) {
   }
 }
 
-function tryCopyLocalPlaceholder(outPath) {
-  const candidates = [
-    path.join(process.cwd(), "placeholder.mp4"),
-    path.join(process.cwd(), "public", "placeholder.mp4"),
-    path.join(__dirname, "placeholder.mp4"),
-    path.join(__dirname, "public", "placeholder.mp4"),
-    path.join(process.cwd(), "assets", "placeholder.mp4"),
-  ];
+function tryCopyLocalPlaceholder(outPath, orientation) {
+  const isPortrait = String(orientation || "").toLowerCase() === "portrait";
+  const names = isPortrait
+    ? ["placeholder-portrait.mp4", "placeholder.mp4"]
+    : ["placeholder.mp4", "placeholder-portrait.mp4"];
+
+  const candidates = [];
+  for (const name of names) {
+    candidates.push(
+      path.join(process.cwd(), name),
+      path.join(process.cwd(), "public", name),
+      path.join(__dirname, name),
+      path.join(__dirname, "public", name),
+      path.join(process.cwd(), "assets", name)
+    );
+  }
 
   for (const cand of candidates) {
     try {
       if (fs.existsSync(cand)) {
         fs.copyFileSync(cand, outPath);
-        console.log("🎬 using local placeholder.mp4:", cand);
+        console.log("🎬 using local placeholder mp4:", { orientation: isPortrait ? "portrait" : "landscape", path: cand });
         return true;
       }
     } catch (_) {}
   }
-  console.log("⚠️ local placeholder.mp4 not found in candidates");
+  console.log("⚠️ local placeholder mp4 not found in candidates", { orientation: isPortrait ? "portrait" : "landscape" });
   return false;
 }
 
@@ -1818,11 +1813,13 @@ async function finalizeGeneratedVideo({ uid, creationId, sourceUrl }) {
   const localSrc = path.join(tmpDir, `genova_src_${safeId}.mp4`);
 
   // Acquire source
+  const sourceUrlStr = String(sourceUrl || "");
+  const isPortraitPlaceholder = sourceUrlStr.includes("/placeholder-portrait.mp4");
   const isPlaceholder =
-    String(sourceUrl || "").includes("/placeholder.mp4") ||
-    String(sourceUrl || "").includes("/placeholder-portrait.mp4");
+    sourceUrlStr.includes("/placeholder.mp4") ||
+    isPortraitPlaceholder;
   if (isPlaceholder) {
-    const copied = tryCopyLocalPlaceholder(localSrc);
+    const copied = tryCopyLocalPlaceholder(localSrc, isPortraitPlaceholder ? "portrait" : "landscape");
     if (!copied) {
       // Avoid a self-HTTP call on Render (can be flaky behind the proxy).
       // Write the tiny placeholder mp4 directly.
@@ -2134,71 +2131,9 @@ const prompt = String(body.prompt || body.text || "").trim();
       resolution,
       useRewardedNoWatermark,
       audioMode,
+
       useRewardedAudioMix,
     });
-	
-	let orientation = "portrait";
-
-	// If image is present, image orientation is always the source of truth
-	// even when prompt is also provided.
-	if (req.file && req.file.path) {
-	  try {
-		const dims = imageSize.imageSize ? imageSize.imageSize(req.file.path) : imageSize(req.file.path);
-		const w = Number(dims?.width || 0);
-		const h = Number(dims?.height || 0);
-		if (w > 0 && h > 0) {
-		  orientation = h > w ? "portrait" : "landscape";
-		}
-	  } catch (_) {}
-	} else {
-	  const explicit = String(
-		body?.orientation || body?.videoOrientation || body?.aspect || body?.aspectRatio || ""
-	  ).toLowerCase().trim();
-
-	  if (["landscape", "16:9", "horizontal"].includes(explicit)) {
-		orientation = "landscape";
-	  } else if (["portrait", "9:16", "vertical"].includes(explicit)) {
-		orientation = "portrait";
-	  } else {
-		// Prompt-only default
-		orientation = "portrait";
-	  }
-	}
-
-	let outputFrame;
-	const resKey = String(resolution || "").toLowerCase();
-
-	if (resKey === "4k") {
-	  outputFrame =
-		orientation === "landscape"
-		  ? { width: 3840, height: 2160, aspectRatio: "16:9", orientation: "landscape" }
-		  : { width: 2160, height: 3840, aspectRatio: "9:16", orientation: "portrait" };
-	} else if (resKey === "1080p") {
-	  outputFrame =
-		orientation === "landscape"
-		  ? { width: 1920, height: 1080, aspectRatio: "16:9", orientation: "landscape" }
-		  : { width: 1080, height: 1920, aspectRatio: "9:16", orientation: "portrait" };
-	} else if (resKey === "720p") {
-	  outputFrame =
-		orientation === "landscape"
-		  ? { width: 1280, height: 720, aspectRatio: "16:9", orientation: "landscape" }
-		  : { width: 720, height: 1280, aspectRatio: "9:16", orientation: "portrait" };
-	} else if (resKey === "480p") {
-	  outputFrame =
-		orientation === "landscape"
-		  ? { width: 854, height: 480, aspectRatio: "16:9", orientation: "landscape" }
-		  : { width: 480, height: 854, aspectRatio: "9:16", orientation: "portrait" };
-	} else {
-	  outputFrame =
-		orientation === "landscape"
-		  ? { width: 1280, height: 720, aspectRatio: "16:9", orientation: "landscape" }
-		  : { width: 720, height: 1280, aspectRatio: "9:16", orientation: "portrait" };
-	}
-	
-	console.log("✅ ORIENTATION_HELPERS_LOADED", {
-	hasDetectGenerationOrientation: typeof detectGenerationOrientation,
-	hasGetVideoFrameForResolution: typeof getVideoFrameForResolution,
-	});
 
     // Build result skeleton
     const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -2229,10 +2164,8 @@ const prompt = String(body.prompt || body.text || "").trim();
     // --- Placeholder "generation" (replace with real provider call later) ---
     // We serve a static placeholder mp4 from this server.
     // ✅ Finalization pipeline already runs (watermark + thumbnail + Storage upload).
-    const baseUrl = process.env.PUBLIC_BASE_URL || "https://genova-labs.hu";
-    const sourceUrl = outputFrame.orientation === "portrait"
-      ? `${baseUrl}/placeholder-portrait.mp4`
-      : `${baseUrl}/placeholder.mp4`;
+    const baseUrl = getPublicBaseUrl(req);
+    const sourceUrl = `${baseUrl}/placeholder.mp4`;
 
     let fileName = String(body.fileName || "").trim() || "";
     const watermarkApplied = !!billing?.watermarkApplied;
