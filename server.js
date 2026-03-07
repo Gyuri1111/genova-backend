@@ -2267,7 +2267,12 @@ const prompt = String(body.prompt || body.text || "").trim();
       }
     }
     if (!creationId) creationId = id;
-    const finalized = await finalizeGeneratedVideo({ uid, creationId, sourceUrl });
+    const finalized = await finalizeGeneratedVideo({
+	  uid,
+	  creationId,
+	  sourceUrl,
+	  orientation: outputFrame.orientation,
+	});
 
     const url = finalized.videoUrl;// Mark as ready
     await setLastResult(uid, {
