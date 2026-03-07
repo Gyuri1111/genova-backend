@@ -2137,6 +2137,11 @@ const prompt = String(body.prompt || body.text || "").trim();
 	
 	const orientation = detectGenerationOrientation(body, req.file);
 	const outputFrame = getVideoFrameForResolution(resolution, orientation);
+	
+	console.log("✅ ORIENTATION_HELPERS_LOADED", {
+	hasDetectGenerationOrientation: typeof detectGenerationOrientation,
+	hasGetVideoFrameForResolution: typeof getVideoFrameForResolution,
+	});
 
     // Build result skeleton
     const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
