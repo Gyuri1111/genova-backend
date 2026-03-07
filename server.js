@@ -11,7 +11,6 @@ const path = require("path");
 const os = require("os");
 const { v4: uuidv4 } = require("uuid");
 const crypto = require("crypto");
-const imageSize = require("image-size");
 
 // Video processing (watermark/thumbnail) has been moved to Firebase Functions.
 // This Render server intentionally does NOT use ffmpeg.
@@ -626,47 +625,6 @@ function resRank(r) {
   return r === "4k" ? 3 : (r === "1080p" ? 2 : 1);
 }
 
-function getVideoFrameForResolution(resolution, orientation) {
-  const res = normalizeResolution(resolution);
-  const orient = String(orientation || "landscape").toLowerCase() === "portrait" ? "portrait" : "landscape";
-
-  if (res === "4k") {
-    return orient === "portrait"
-      ? { width: 2160, height: 3840, aspectRatio: "9:16", orientation: "portrait" }
-      : { width: 3840, height: 2160, aspectRatio: "16:9", orientation: "landscape" };
-  }
-
-  if (res === "1080p") {
-    return orient === "portrait"
-      ? { width: 1080, height: 1920, aspectRatio: "9:16", orientation: "portrait" }
-      : { width: 1920, height: 1080, aspectRatio: "16:9", orientation: "landscape" };
-  }
-
-  return orient === "portrait"
-    ? { width: 720, height: 1280, aspectRatio: "9:16", orientation: "portrait" }
-    : { width: 1280, height: 720, aspectRatio: "16:9", orientation: "landscape" };
-}
-
-function detectGenerationOrientation(body, file) {
-  // If image is present, image orientation is always the source of truth
-  // even when prompt is also provided.
-  if (file && file.path) {
-    try {
-      const dims = imageSize.imageSize ? imageSize.imageSize(file.path) : imageSize(file.path);
-      const w = Number(dims?.width || 0);
-      const h = Number(dims?.height || 0);
-      if (w > 0 && h > 0) return h > w ? "portrait" : "landscape";
-    } catch (_) {}
-  }
-
-  const explicit = String(body?.orientation || body?.videoOrientation || body?.aspect || body?.aspectRatio || "").toLowerCase().trim();
-  if (["portrait", "9:16", "vertical"].includes(explicit)) return "portrait";
-  if (["landscape", "16:9", "horizontal"].includes(explicit)) return "landscape";
-
-  // Prompt-only default
-  return "portrait";
-}
-
 function enforceCapsAndLimits({ plan, lengthSec, fps, resolution }) {
   // Hard caps
   if (lengthSec > BILLING.HARD_CAPS.MAX_LENGTH_SEC) {
@@ -757,8 +715,22 @@ function entitlementActive(untilTs) {
   return untilTs.toMillis() > tsNow().toMillis();
 }
 
+function getEffectiveEntitlements(userData) {
+  const ent = (userData && userData.entitlements && typeof userData.entitlements === "object")
+    ? userData.entitlements
+    : {};
+
+  return {
+    ...ent,
+    noWatermarkUntil: userData?.noWatermarkUntil ?? ent?.noWatermarkUntil,
+    adFreeUntil: userData?.adFreeUntil ?? ent?.adFreeUntil,
+    templatesUntil: userData?.templatesUntil ?? ent?.templatesUntil,
+    proPromptUntil: userData?.proPromptUntil ?? ent?.proPromptUntil,
+  };
+}
+
 function computeWatermarkApplied(userData) {
-  const ent = userData?.entitlements || {};
+  const ent = getEffectiveEntitlements(userData);
   const plan = String(userData?.plan || "free").toLowerCase();
   const noWm = entitlementActive(ent?.noWatermarkUntil);
 
@@ -912,7 +884,7 @@ try {
     const data = snap.data() || {};
     const credits = Number(data.credits ?? 0);
     const plan = normalizePlan(data.plan);
-    const entitlements = data.entitlements || {};
+    const entitlements = getEffectiveEntitlements(data);
 
 
 // --- Rewarded tokens (server-side source of truth) ---
@@ -1097,7 +1069,7 @@ async function ensureTrialAndDebitCredits(uid, cost) {
     const data = snap.data() || {};
     const credits = Number(data.credits ?? 0);
     const plan = String(data.plan || MONETIZATION.DEFAULT_PLAN);
-    const entitlements = data.entitlements || {};
+    const entitlements = getEffectiveEntitlements(data);
 
     // Grant trial once if not granted yet
     if (!data.trialCreditsGranted) {
@@ -1758,33 +1730,25 @@ function validateLocalMp4(filePath, label) {
   }
 }
 
-function tryCopyLocalPlaceholder(outPath, orientation) {
-  const isPortrait = String(orientation || "").toLowerCase() === "portrait";
-  const names = isPortrait
-    ? ["placeholder_portrait.mp4", "placeholder-portrait.mp4", "placeholder.mp4"]
-    : ["placeholder.mp4", "placeholder_landscape.mp4", "placeholder-landscape.mp4"];
-
-  const roots = [
-    process.cwd(),
-    path.join(process.cwd(), "public"),
-    __dirname,
-    path.join(__dirname, "public"),
-    path.join(process.cwd(), "assets"),
+function tryCopyLocalPlaceholder(outPath) {
+  const candidates = [
+    path.join(process.cwd(), "placeholder.mp4"),
+    path.join(process.cwd(), "public", "placeholder.mp4"),
+    path.join(__dirname, "placeholder.mp4"),
+    path.join(__dirname, "public", "placeholder.mp4"),
+    path.join(process.cwd(), "assets", "placeholder.mp4"),
   ];
 
-  for (const name of names) {
-    for (const root of roots) {
-      const cand = path.join(root, name);
-      try {
-        if (fs.existsSync(cand)) {
-          fs.copyFileSync(cand, outPath);
-          console.log("🎬 using local placeholder mp4:", { cand, orientation: isPortrait ? "portrait" : "landscape" });
-          return true;
-        }
-      } catch (_) {}
-    }
+  for (const cand of candidates) {
+    try {
+      if (fs.existsSync(cand)) {
+        fs.copyFileSync(cand, outPath);
+        console.log("🎬 using local placeholder.mp4:", cand);
+        return true;
+      }
+    } catch (_) {}
   }
-  console.log("⚠️ local placeholder mp4 not found", { orientation: isPortrait ? "portrait" : "landscape" });
+  console.log("⚠️ local placeholder.mp4 not found in candidates");
   return false;
 }
 
@@ -1846,7 +1810,7 @@ async function uploadFileToFirebaseStorage(localPath, destPath, contentType) {
  *
  * Watermarking + thumbnail generation are handled in Firebase Functions.
  */
-async function finalizeGeneratedVideo({ uid, creationId, sourceUrl, orientation }) {
+async function finalizeGeneratedVideo({ uid, creationId, sourceUrl }) {
   const tmpDir = os.tmpdir();
   const safeUid = String(uid || "anon").replace(/[^a-zA-Z0-9_-]/g, "");
   const safeId = String(creationId || uuidv4()).replace(/[^a-zA-Z0-9_-]/g, "");
@@ -1854,10 +1818,9 @@ async function finalizeGeneratedVideo({ uid, creationId, sourceUrl, orientation 
   const localSrc = path.join(tmpDir, `genova_src_${safeId}.mp4`);
 
   // Acquire source
-  const srcStr = String(sourceUrl || "");
-  const isPlaceholder = srcStr.includes("/placeholder.mp4") || srcStr.includes("/placeholder-portrait.mp4") || srcStr.includes("/placeholder_portrait.mp4");
+  const isPlaceholder = String(sourceUrl || "").includes("/placeholder.mp4");
   if (isPlaceholder) {
-    const copied = tryCopyLocalPlaceholder(localSrc, orientation);
+    const copied = tryCopyLocalPlaceholder(localSrc);
     if (!copied) {
       // Avoid a self-HTTP call on Render (can be flaky behind the proxy).
       // Write the tiny placeholder mp4 directly.
@@ -1913,33 +1876,6 @@ async function genFromImage(inp, out) {
 // Serve a tiny placeholder MP4 so the app always receives a playable URL
 app.get("/placeholder.mp4", (req, res) => {
   try {
-    const buf = Buffer.from(PLACEHOLDER_MP4_BASE64, "base64");
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Length", String(buf.length));
-    res.setHeader("Cache-Control", "no-store");
-    return res.status(200).send(buf);
-  } catch (e) {
-    return res.status(500).send("placeholder_error");
-  }
-});
-
-app.get("/placeholder-portrait.mp4", (req, res) => {
-  try {
-    const candidates = [
-      path.join(process.cwd(), "placeholder_portrait.mp4"),
-      path.join(process.cwd(), "placeholder-portrait.mp4"),
-      path.join(__dirname, "placeholder_portrait.mp4"),
-      path.join(__dirname, "placeholder-portrait.mp4"),
-      path.join(process.cwd(), "public", "placeholder_portrait.mp4"),
-      path.join(process.cwd(), "public", "placeholder-portrait.mp4"),
-    ];
-    for (const cand of candidates) {
-      try {
-        if (fs.existsSync(cand)) {
-          return res.sendFile(cand);
-        }
-      } catch (_) {}
-    }
     const buf = Buffer.from(PLACEHOLDER_MP4_BASE64, "base64");
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Length", String(buf.length));
@@ -2137,8 +2073,6 @@ const prompt = String(body.prompt || body.text || "").trim();
     const fps = Math.max(1, Math.min(120, Number(body.fps ?? 30)));
     const resolution = String(body.resolution || body.res || "720p").trim();
     const hasFile = !!req.file;
-    const orientation = detectGenerationOrientation(body, req.file);
-    const outputFrame = getVideoFrameForResolution(resolution, orientation);
 
     // --- Audio config (optional) ---
     // Accept either body.audio as JSON string/object OR flat fields: audioMode/mode, audioPreset/preset, voiceStyle/style
@@ -2215,10 +2149,6 @@ const prompt = String(body.prompt || body.text || "").trim();
       cost: billing?.cost ?? null,
       breakdown: billing?.breakdown ?? {},
       hasImage: !!req.file,
-      width: outputFrame.width,
-      height: outputFrame.height,
-      aspectRatio: outputFrame.aspectRatio,
-      orientation: outputFrame.orientation,
     };
 
     // Mark as processing first
@@ -2262,7 +2192,7 @@ const prompt = String(body.prompt || body.text || "").trim();
       }
     }
     if (!creationId) creationId = id;
-    const finalized = await finalizeGeneratedVideo({ uid, creationId, sourceUrl, orientation: outputFrame.orientation });
+    const finalized = await finalizeGeneratedVideo({ uid, creationId, sourceUrl });
 
     const url = finalized.videoUrl;// Mark as ready
     await setLastResult(uid, {
@@ -2290,10 +2220,6 @@ const prompt = String(body.prompt || body.text || "").trim();
             fps: Number(fps),
             resolution: String(resolution),
             hasImage: !!req.file,
-            width: Number(outputFrame.width),
-            height: Number(outputFrame.height),
-            aspectRatio: String(outputFrame.aspectRatio),
-            orientation: String(outputFrame.orientation),
             fileName: String(fileName || ""),
             status: "ready",
             // Render server uploads ORIGINAL video only. Functions will later:
