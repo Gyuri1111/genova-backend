@@ -2135,8 +2135,34 @@ const prompt = String(body.prompt || body.text || "").trim();
       useRewardedAudioMix,
     });
 	
-	const hasFile = !!req.file;
-	const orientation = detectGenerationOrientation(body, req.file);
+	let orientation = "portrait";
+
+	// If image is present, image orientation is always the source of truth
+	// even when prompt is also provided.
+	if (req.file && req.file.path) {
+	  try {
+		const dims = imageSize.imageSize ? imageSize.imageSize(req.file.path) : imageSize(req.file.path);
+		const w = Number(dims?.width || 0);
+		const h = Number(dims?.height || 0);
+		if (w > 0 && h > 0) {
+		  orientation = h > w ? "portrait" : "landscape";
+		}
+	  } catch (_) {}
+	} else {
+	  const explicit = String(
+		body?.orientation || body?.videoOrientation || body?.aspect || body?.aspectRatio || ""
+	  ).toLowerCase().trim();
+
+	  if (["landscape", "16:9", "horizontal"].includes(explicit)) {
+		orientation = "landscape";
+	  } else if (["portrait", "9:16", "vertical"].includes(explicit)) {
+		orientation = "portrait";
+	  } else {
+		// Prompt-only default
+		orientation = "portrait";
+	  }
+	}
+
 	const outputFrame = getVideoFrameForResolution(resolution, orientation);
 	
 	console.log("✅ ORIENTATION_HELPERS_LOADED", {
