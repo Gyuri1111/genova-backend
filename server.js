@@ -2132,9 +2132,11 @@ const prompt = String(body.prompt || body.text || "").trim();
       resolution,
       useRewardedNoWatermark,
       audioMode,
-
       useRewardedAudioMix,
     });
+	
+	const orientation = detectGenerationOrientation(body, req.file);
+	const outputFrame = getVideoFrameForResolution(resolution, orientation);
 
     // Build result skeleton
     const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
