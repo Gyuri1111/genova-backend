@@ -2135,6 +2135,7 @@ const prompt = String(body.prompt || body.text || "").trim();
       useRewardedAudioMix,
     });
 	
+	const hasFile = !!req.file;
 	const orientation = detectGenerationOrientation(body, req.file);
 	const outputFrame = getVideoFrameForResolution(resolution, orientation);
 	
