@@ -2163,7 +2163,24 @@ const prompt = String(body.prompt || body.text || "").trim();
 	  }
 	}
 
-	const outputFrame = getVideoFrameForResolution(resolution, orientation);
+	let outputFrame;
+
+	if (String(resolution || "").toLowerCase() === "4k") {
+	  outputFrame =
+		orientation === "landscape"
+		  ? { width: 3840, height: 2160, aspectRatio: "16:9", orientation: "landscape" }
+		  : { width: 2160, height: 3840, aspectRatio: "9:16", orientation: "portrait" };
+	} else if (String(resolution || "").toLowerCase() === "1080p") {
+	  outputFrame =
+		orientation === "landscape"
+		  ? { width: 1920, height: 1080, aspectRatio: "16:9", orientation: "landscape" }
+		  : { width: 1080, height: 1920, aspectRatio: "9:16", orientation: "portrait" };
+	} else {
+	  outputFrame =
+		orientation === "landscape"
+		  ? { width: 1280, height: 720, aspectRatio: "16:9", orientation: "landscape" }
+		  : { width: 720, height: 1280, aspectRatio: "9:16", orientation: "portrait" };
+	}
 	
 	console.log("✅ ORIENTATION_HELPERS_LOADED", {
 	hasDetectGenerationOrientation: typeof detectGenerationOrientation,
