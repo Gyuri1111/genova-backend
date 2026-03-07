@@ -1730,14 +1730,25 @@ function validateLocalMp4(filePath, label) {
   }
 }
 
-function tryCopyLocalPlaceholder(outPath) {
-  const candidates = [
-    path.join(process.cwd(), "placeholder.mp4"),
-    path.join(process.cwd(), "public", "placeholder.mp4"),
-    path.join(__dirname, "placeholder.mp4"),
-    path.join(__dirname, "public", "placeholder.mp4"),
-    path.join(process.cwd(), "assets", "placeholder.mp4"),
-  ];
+function tryCopyLocalPlaceholder(outPath, orientation) {
+  const isPortrait = String(orientation || "").toLowerCase() === "portrait";
+  const candidates = isPortrait
+    ? [
+        path.join(process.cwd(), "placeholder-portrait.mp4"),
+        path.join(process.cwd(), "public", "placeholder-portrait.mp4"),
+        path.join(__dirname, "placeholder-portrait.mp4"),
+        path.join(__dirname, "public", "placeholder-portrait.mp4"),
+        path.join(process.cwd(), "placeholder.mp4"),
+        path.join(process.cwd(), "public", "placeholder.mp4"),
+        path.join(__dirname, "placeholder.mp4"),
+        path.join(__dirname, "public", "placeholder.mp4"),
+      ]
+    : [
+        path.join(process.cwd(), "placeholder.mp4"),
+        path.join(process.cwd(), "public", "placeholder.mp4"),
+        path.join(__dirname, "placeholder.mp4"),
+        path.join(__dirname, "public", "placeholder.mp4"),
+      ];
 
   for (const cand of candidates) {
     try {
