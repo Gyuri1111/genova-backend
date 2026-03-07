@@ -2164,17 +2164,28 @@ const prompt = String(body.prompt || body.text || "").trim();
 	}
 
 	let outputFrame;
+	const resKey = String(resolution || "").toLowerCase();
 
-	if (String(resolution || "").toLowerCase() === "4k") {
+	if (resKey === "4k") {
 	  outputFrame =
 		orientation === "landscape"
 		  ? { width: 3840, height: 2160, aspectRatio: "16:9", orientation: "landscape" }
 		  : { width: 2160, height: 3840, aspectRatio: "9:16", orientation: "portrait" };
-	} else if (String(resolution || "").toLowerCase() === "1080p") {
+	} else if (resKey === "1080p") {
 	  outputFrame =
 		orientation === "landscape"
 		  ? { width: 1920, height: 1080, aspectRatio: "16:9", orientation: "landscape" }
 		  : { width: 1080, height: 1920, aspectRatio: "9:16", orientation: "portrait" };
+	} else if (resKey === "720p") {
+	  outputFrame =
+		orientation === "landscape"
+		  ? { width: 1280, height: 720, aspectRatio: "16:9", orientation: "landscape" }
+		  : { width: 720, height: 1280, aspectRatio: "9:16", orientation: "portrait" };
+	} else if (resKey === "480p") {
+	  outputFrame =
+		orientation === "landscape"
+		  ? { width: 854, height: 480, aspectRatio: "16:9", orientation: "landscape" }
+		  : { width: 480, height: 854, aspectRatio: "9:16", orientation: "portrait" };
 	} else {
 	  outputFrame =
 		orientation === "landscape"
