@@ -1818,7 +1818,9 @@ async function finalizeGeneratedVideo({ uid, creationId, sourceUrl }) {
   const localSrc = path.join(tmpDir, `genova_src_${safeId}.mp4`);
 
   // Acquire source
-  const isPlaceholder = String(sourceUrl || "").includes("/placeholder.mp4");
+  const isPlaceholder =
+    String(sourceUrl || "").includes("/placeholder.mp4") ||
+    String(sourceUrl || "").includes("/placeholder-portrait.mp4");
   if (isPlaceholder) {
     const copied = tryCopyLocalPlaceholder(localSrc);
     if (!copied) {
@@ -2227,7 +2229,7 @@ const prompt = String(body.prompt || body.text || "").trim();
     // --- Placeholder "generation" (replace with real provider call later) ---
     // We serve a static placeholder mp4 from this server.
     // ✅ Finalization pipeline already runs (watermark + thumbnail + Storage upload).
-    const baseUrl = getPublicBaseUrl(req);
+    const baseUrl = process.env.PUBLIC_BASE_URL || "https://genova-labs.hu";
     const sourceUrl = outputFrame.orientation === "portrait"
       ? `${baseUrl}/placeholder-portrait.mp4`
       : `${baseUrl}/placeholder.mp4`;
