@@ -1731,6 +1731,10 @@ function validateLocalMp4(filePath, label) {
 }
 
 function tryCopyLocalPlaceholder(outPath, orientation) {
+  console.log("📁 LOCAL_PLACEHOLDER_START", {
+    orientation,
+    outPath
+  });
   const isPortrait = String(orientation || "").toLowerCase() === "portrait";
   const candidates = isPortrait
     ? [
@@ -1750,10 +1754,13 @@ function tryCopyLocalPlaceholder(outPath, orientation) {
         path.join(__dirname, "public", "placeholder.mp4"),
       ];
 
+  console.log("📁 LOCAL_PLACEHOLDER_CANDIDATES", candidates);
+
   for (const cand of candidates) {
     try {
       if (fs.existsSync(cand)) {
         fs.copyFileSync(cand, outPath);
+        console.log("📁 LOCAL_PLACEHOLDER_FOUND", cand);
         console.log("🎬 using local placeholder.mp4:", cand);
         return true;
       }
@@ -2211,6 +2218,14 @@ const prompt = String(body.prompt || body.text || "").trim();
 	hasGetVideoFrameForResolution: typeof getVideoFrameForResolution,
 	});
 
+    console.log("🧭 ORIENTATION_DECISION", {
+      reqOrientation: req.body?.orientation,
+      reqVideoOrientation: req.body?.videoOrientation,
+      hasImage: !!req.file,
+      resolution,
+      outputFrame
+    });
+
     // Build result skeleton
     const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const createdAt = admin.firestore.Timestamp.now();
@@ -2249,6 +2264,11 @@ const prompt = String(body.prompt || body.text || "").trim();
       ? `${baseUrl}/placeholder-portrait.mp4`
       : `${baseUrl}/placeholder.mp4`;
 
+    console.log("🎞 PLACEHOLDER_PICK", {
+      orientation: outputFrame.orientation,
+      sourceUrl
+    });
+
     let fileName = String(body.fileName || "").trim() || "";
     const watermarkApplied = !!billing?.watermarkApplied;
     // ✅ If client did not send fileName, generate a stable one (needed for Firestore + share)
@@ -2271,6 +2291,11 @@ const prompt = String(body.prompt || body.text || "").trim();
       }
     }
     if (!creationId) creationId = id;
+    console.log("📦 FINALIZE_CALL", {
+      creationId,
+      orientation: outputFrame.orientation,
+      sourceUrl
+    });
     const finalized = await finalizeGeneratedVideo({
 	  uid,
 	  creationId,
