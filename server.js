@@ -2216,15 +2216,19 @@ const prompt = String(body.prompt || body.text || "").trim();
     const createdAt = admin.firestore.Timestamp.now();
 
     const meta = {
-      model,
-      lengthSec,
-      fps,
-      resolution,
-      watermarkApplied: !!billing?.watermarkApplied,
-      cost: billing?.cost ?? null,
-      breakdown: billing?.breakdown ?? {},
-      hasImage: !!req.file,
-    };
+	  model,
+	  lengthSec,
+	  fps,
+	  resolution,
+	  watermarkApplied: !!billing?.watermarkApplied,
+	  cost: billing?.cost ?? null,
+	  breakdown: billing?.breakdown ?? {},
+	  hasImage: !!req.file,
+	  width: outputFrame.width,
+	  height: outputFrame.height,
+	  aspectRatio: outputFrame.aspectRatio,
+	  orientation: outputFrame.orientation,
+	};
 
     // Mark as processing first
     await setLastResult(uid, {
