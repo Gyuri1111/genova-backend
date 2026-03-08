@@ -510,31 +510,9 @@ async function getUserDoc(uid) {
  */
 
 const MONETIZATION = {
-  TRIAL_CREDITS: 5,
+  TRIAL_CREDITS: 10,
   DEFAULT_PLAN: "free",
-  GENERATION_COST: 1, // credits per generation
-  ADDONS: {
-    // Watermark removal (time-based)
-    no_watermark_7d: { cost: 20, days: 7, entitlementKey: "noWatermarkUntil" },
-    no_watermark_30d: { cost: 50, days: 30, entitlementKey: "noWatermarkUntil" },
-
-    // Ad-free (time-based) — for future UI/ads
-    ad_free_7d: { cost: 20, days: 7, entitlementKey: "adFreeUntil" },
-    ad_free_30d: { cost: 50, days: 30, entitlementKey: "adFreeUntil" },
-
-
-// Templates access (time-based) — 7d and 30d grant their respective durations
-templates_7d: { cost: 20, days: 7, entitlementKey: "templatesUntil" },
-templates_30d: { cost: 50, days: 30, entitlementKey: "templatesUntil" },
-
-// PRO Prompt Pack (time-based) — 7d and 30d grant their respective durations
-pro_prompt_7d: { cost: 20, days: 7, entitlementKey: "proPromptUntil" },
-pro_prompt_30d: { cost: 50, days: 30, entitlementKey: "proPromptUntil" },
-
-    // Audio Mix (music / narration) — time-based
-    audio_mix_7d: { cost: 30, days: 7, entitlementKey: "audioMixUntil" },
-    audio_mix_30d: { cost: 70, days: 30, entitlementKey: "audioMixUntil" },
-  },
+  GENERATION_COST: 4, // credits per generation
 };
 
 
@@ -555,7 +533,7 @@ const BILLING = {
   },
   // Allowed maxima per plan (v1)
   PLAN_LIMITS: {
-    free:   { maxLength: 5,  maxFps: 30, maxResolution: "720p" },
+    free:   { maxLength: 5,  maxFps: 30, maxResolution: "480p" },
     basic:  { maxLength: 5,  maxFps: 30, maxResolution: "1080p" },
     pro:    { maxLength: 10, maxFps: 60, maxResolution: "4k" },
     studio: { maxLength: 20, maxFps: 60, maxResolution: "4k" },
@@ -566,7 +544,8 @@ const BILLING = {
     60: 1.15,
   },
   RES_FACTOR: {
-    "720p": 1.00,
+    "480p": 1.00,
+    "720p": 1.20,
     "1080p": 1.35,
     "4k": 1.85,
   },
@@ -577,7 +556,7 @@ const BILLING = {
     15: 1.80,
     20: 2.10,
   },
-  BASE_CREDITS: 8,
+  BASE_CREDITS: 4,
   // Model cost multipliers (v1 defaults)
   MODEL_FACTOR: {
     stable: 1.00,
@@ -611,8 +590,9 @@ function normalizeResolution(res) {
   if (r.includes("4k") || r.includes("2160")) return "4k";
   if (r.includes("1080")) return "1080p";
   if (r.includes("720")) return "720p";
+  if (r.includes("480")) return "480p";
   // fallback
-  return "1080p";
+  return "480p";
 }
 
 function clampInt(v, fallback) {
@@ -622,7 +602,7 @@ function clampInt(v, fallback) {
 }
 
 function resRank(r) {
-  return r === "4k" ? 3 : (r === "1080p" ? 2 : 1);
+  return r === "4k" ? 3 : (r === "1080p" ? 2 : (r === "720p" ? 1 : 0));
 }
 
 function enforceCapsAndLimits({ plan, lengthSec, fps, resolution }) {
@@ -669,7 +649,7 @@ function enforceCapsAndLimits({ plan, lengthSec, fps, resolution }) {
 
 function computeGenerationCost({ lengthSec, fps, resolution, model }) {
   // Multiplier-based pricing, kept in sync with HomeScreen:
-  // BASE: 5s / 720p / 30fps / Stable = BILLING.BASE_CREDITS (default 8)
+  // BASE: 5s / 480p / 30fps / Stable = BILLING.BASE_CREDITS (default 4)
   const len = (() => {
     const n = Number(lengthSec) || 0;
     if (n <= 6) return 5;
@@ -679,7 +659,7 @@ function computeGenerationCost({ lengthSec, fps, resolution, model }) {
   })();
 
   const fpsKey = (Number(fps) || 0) >= 45 ? 60 : 30;
-  const resKey = normalizeResolution(resolution); // "720p" | "1080p" | "4k"
+  const resKey = normalizeResolution(resolution); // "480p" | "720p" | "1080p" | "4k"
 
   const modelKey = String(model || "stable").toLowerCase().trim();
   const mLen = BILLING.LEN_FACTOR[len] ?? 1.0;
@@ -687,12 +667,12 @@ function computeGenerationCost({ lengthSec, fps, resolution, model }) {
   const mRes = BILLING.RES_FACTOR[resKey] ?? 1.0;
   const mModel = BILLING.MODEL_FACTOR[modelKey] ?? BILLING.MODEL_FACTOR.default ?? 1.0;
 
-  const raw = Number(BILLING.BASE_CREDITS || 8) * mLen * mFps * mRes * mModel;
+  const raw = Number(BILLING.BASE_CREDITS || 4) * mLen * mFps * mRes * mModel;
   const cost = Math.max(1, Math.ceil(raw));
 
   return {
     cost,
-    breakdown: { base: Number(BILLING.BASE_CREDITS || 8), len, mLen, fpsKey, mFps, resKey, mRes, modelKey, mModel, raw },
+    breakdown: { base: Number(BILLING.BASE_CREDITS || 4), len, mLen, fpsKey, mFps, resKey, mRes, modelKey, mModel, raw },
   };
 }
 
