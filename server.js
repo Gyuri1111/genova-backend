@@ -535,7 +535,7 @@ const BILLING = {
   PLAN_LIMITS: {
     free:   { maxLength: 5,  maxFps: 30, maxResolution: "480p" },
     basic:  { maxLength: 5,  maxFps: 30, maxResolution: "1080p" },
-    pro:    { maxLength: 10, maxFps: 60, maxResolution: "4k" },
+    pro:    { maxLength: 10, maxFps: 30, maxResolution: "4k" },
     studio: { maxLength: 20, maxFps: 60, maxResolution: "4k" },
   },
   // Cost factors
