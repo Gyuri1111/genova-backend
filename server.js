@@ -731,22 +731,22 @@ function getEffectiveEntitlements(userData) {
 
 function computeWatermarkApplied(userData) {
   const ent = getEffectiveEntitlements(userData);
-  const plan = String(userData?.plan || "free").toLowerCase();
   const noWm = entitlementActive(ent?.noWatermarkUntil);
 
-  // Base rule (current system):
-  // ✅ Only Firestore entitlement decides no-watermark (plan does NOT grant it automatically)
+  // Base rule:
+  // ✅ Only Firestore entitlement decides persistent no-watermark.
   let watermarkApplied = !noWm;
 
   // Rewarded override (single-request):
   // If the client explicitly requests rewarded no-watermark, allow the request to be watermark-free
-  // for FREE/BASIC only, and only when there is no active noWatermark entitlement.
-  const useRewardedNoWatermark = (userData?.useRewardedNoWatermark === true) || (String(userData?.useRewardedNoWatermark || '').toLowerCase() === 'true');
+  // on ANY plan, as long as there is no active noWatermark entitlement already.
+  const useRewardedNoWatermark =
+    (userData?.useRewardedNoWatermark === true) ||
+    (String(userData?.useRewardedNoWatermark || '').toLowerCase() === 'true');
 
   if (
     watermarkApplied === true &&
     useRewardedNoWatermark &&
-    (plan === "free" || plan === "basic") &&
     !noWm
   ) {
     watermarkApplied = false;
@@ -818,45 +818,53 @@ async function ensureTrialValidateAndDebit(uid, genParams) {
       result.trialGranted = true;
       result.plan = planInfo.plan;
       result.entitlements = init.entitlements;
+
       // Decide rewarded AUDIO unlock (single-use) when an audio mode is requested.
-// This is separate from no-watermark and only applies to FREE/BASIC when there is no active audioMix entitlement.
-let allowRewardedAudio = false;
-try {
-  const p = String(planInfo.plan || "free").toLowerCase();
-  const audioModeNorm = String(genParams.audioMode || "").toLowerCase().trim();
-  const audioRequested = !!audioModeNorm && audioModeNorm !== "off" && audioModeNorm !== "none" && audioModeNorm !== "false";
-  const audioEntActive = entitlementActive(entitlements?.audioMixUntil);
+      // Applies on ANY plan when there is no active audioMix entitlement.
+      const initRewarded = init.rewarded || {};
+      const initBranches = initRewarded.branches || {};
+      const initAudioRw = initBranches.audio || {};
+      const initAudioTokens = Number(initAudioRw.tokens ?? 0);
 
-  if (
-    audioRequested &&
-    !!genParams.useRewardedAudioMix &&
-    (p === "free" || p === "basic") &&
-    !audioEntActive
-  ) {
-    if (audioTokens > 0) {
-      tx.update(userRef, {
-        "rewarded.branches.audio.tokens": admin.firestore.FieldValue.increment(-1),
-        "rewarded.updatedAt": admin.firestore.FieldValue.serverTimestamp(),
-      });
-      allowRewardedAudio = true;
-      result.rewarded = {
-        ...(result.rewarded || {}),
-        audioTokensBefore: audioTokens,
-        audioTokensAfter: audioTokens - 1,
-        usedAudioToken: true,
-      };
-    } else {
-      result.rewarded = {
-        ...(result.rewarded || {}),
-        audioTokensBefore: audioTokens,
-        audioTokensAfter: audioTokens,
-        usedAudioToken: false,
-      };
-    }
-  }
-} catch (_) {}
+      let allowRewardedAudio = false;
+      try {
+        const audioModeNorm = String(genParams.audioMode || "").toLowerCase().trim();
+        const audioRequested =
+          !!audioModeNorm &&
+          audioModeNorm !== "off" &&
+          audioModeNorm !== "none" &&
+          audioModeNorm !== "false";
+        const audioEntActive = entitlementActive(init.entitlements?.audioMixUntil);
 
-    result.rewardedAudioUnlocked = allowRewardedAudio;
+        if (
+          audioRequested &&
+          !!genParams.useRewardedAudioMix &&
+          !audioEntActive
+        ) {
+          if (initAudioTokens > 0) {
+            tx.update(userRef, {
+              "rewarded.branches.audio.tokens": admin.firestore.FieldValue.increment(-1),
+              "rewarded.updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+            });
+            allowRewardedAudio = true;
+            result.rewarded = {
+              ...(result.rewarded || {}),
+              audioTokensBefore: initAudioTokens,
+              audioTokensAfter: initAudioTokens - 1,
+              usedAudioToken: true,
+            };
+          } else {
+            result.rewarded = {
+              ...(result.rewarded || {}),
+              audioTokensBefore: initAudioTokens,
+              audioTokensAfter: initAudioTokens,
+              usedAudioToken: false,
+            };
+          }
+        }
+      } catch (_) {}
+
+      result.rewardedAudioUnlocked = allowRewardedAudio;
 
     result.watermarkApplied = computeWatermarkApplied({ plan: planInfo.plan, entitlements: init.entitlements, useRewardedNoWatermark: false });
       result.limits = planInfo.limits;
@@ -950,11 +958,9 @@ if (!data.rewarded || !rewarded.branches) {
     let useRewardedNoWatermarkEffective = !!genParams.useRewardedNoWatermark;
     try {
       const noWmEntActive = entitlementActive(entitlements?.noWatermarkUntil);
-      const p = String(planInfo.plan || "free").toLowerCase();
 
       if (
         useRewardedNoWatermarkEffective &&
-        (p === "free" || p === "basic") &&
         !noWmEntActive
       ) {
         if (nowmTokens > 0) {
