@@ -1216,7 +1216,15 @@ function buildEmailForType(type, { title, body, data }) {
   const safeBody = body || "";
 
   if (type === "video") {
-    const videoUrl = data?.videoUrl || "";
+    const viewerUrl =
+      data?.viewerUrl ||
+      ((data?._uid || data?.uid) && data?.creationId
+        ? `https://genova-labs.hu/v/u/${data?._uid || data?.uid}/${data.creationId}`
+        : null) ||
+      data?.videoUrl ||
+      data?.url ||
+      "";
+
     return {
       subject: "🎬 Your GeNova video is ready",
       text: safeBody || "Your video is ready.",
@@ -1224,7 +1232,7 @@ function buildEmailForType(type, { title, body, data }) {
         title: safeTitle,
         message: safeBody,
         buttonText: "View video",
-        buttonUrl: videoUrl || null,
+        buttonUrl: viewerUrl || null,
       }),
     };
   }
@@ -1359,7 +1367,11 @@ async function sendEmailIfAllowed({ uid, userDoc, type, title, body, data }) {
   const to = await resolveUserEmail(uid, userDoc);
   if (!to) return { skipped: true, reason: "no_email" };
 
-  const built = buildEmailForType(type, { title, body, data });
+  const built = buildEmailForType(type, {
+    title,
+    body,
+    data: { ...(data || {}), _uid: uid },
+  });
   const result = await sendEmailWithFallback({ to, ...built });
   return result;
 }
