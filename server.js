@@ -2423,27 +2423,26 @@ const prompt = String(body.prompt || body.text || "").trim();
       console.warn("⚠️ creation doc update failed:", e?.message || e);
     }
 // Send push/email if enabled
-    // ✅ IMPORTANT: if watermark is required, do NOT notify here — the Functions watermark worker will notify after _wm.mp4 is finalized.
-    if (!watermarkApplied) {
-      try {
-        await notifyUser({
+    // ✅ Simplified: notify immediately when the base video is ready, independent of watermark flow.
+    try {
+      await notifyUser({
+        uid,
+        type: "video",
+        data: {
+          creationId,
           uid,
-          type: "video",
-          data: {
-            creationId,
-            uid,
-            homeUrl: "genova://home",
-            videoUrl: url,
-            url,
-            model,
-            videoLength: Number(lengthSec),
-            resolution: String(resolution),
-            fps: Number(fps),
-          },
-        });
-      } catch (e3) {
-        console.warn("⚠️ ready notify failed:", e3?.message || e3);
-      }
+          homeUrl: "genova://home",
+          videoUrl: url,
+          url,
+          model,
+          videoLength: Number(lengthSec),
+          resolution: String(resolution),
+          fps: Number(fps),
+          watermarkApplied: !!watermarkApplied,
+        },
+      });
+    } catch (e3) {
+      console.warn("⚠️ ready notify failed:", e3?.message || e3);
     }
 
     return res.json({
