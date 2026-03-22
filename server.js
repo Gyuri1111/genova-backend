@@ -1366,6 +1366,32 @@ async function sendEmailIfAllowed({ uid, userDoc, type, title, body, data }) {
   return result;
 }
 
+async function sendVideoReadyEmailDirect({ uid, data }) {
+  if (!uid) return { skipped: true, reason: "no_uid" };
+
+  const userDoc = await getUserDoc(uid);
+  if (!userDoc) return { skipped: true, reason: "user_not_found" };
+
+  const to = await resolveUserEmail(uid, userDoc);
+  if (!to) return { skipped: true, reason: "no_email" };
+
+  const lang = getUserLang(userDoc);
+  const localized = localizeNotification({
+    lang,
+    type: "video",
+    data: data || {},
+  });
+
+  const built = buildEmailForType("video", {
+    title: localized.title,
+    body: localized.body,
+    data: data || {},
+  });
+
+  const result = await sendEmailWithFallback({ to, ...built });
+  return { ...result, lang, to };
+}
+
 // ------------------------------------------------------------
 // ✅ lastResult helpers (offline / push-missed safety net)
 // ------------------------------------------------------------
@@ -2422,28 +2448,27 @@ const prompt = String(body.prompt || body.text || "").trim();
     } catch (e) {
       console.warn("⚠️ creation doc update failed:", e?.message || e);
     }
-// Send push/email if enabled
-    // ✅ IMPORTANT: if watermark is required, do NOT notify here — the Functions watermark worker will notify after _wm.mp4 is finalized.
-    if (!watermarkApplied) {
-      try {
-        await notifyUser({
+// Send ONLY the video-ready email here (no push), so we avoid duplicate push notifications.
+    // Also do not depend on watermark completion anymore: as soon as the plain video is ready,
+    // send the email with the Home deep link.
+    try {
+      const emailResult = await sendVideoReadyEmailDirect({
+        uid,
+        data: {
+          creationId,
           uid,
-          type: "video",
-          data: {
-            creationId,
-            uid,
-            homeUrl: "genova://home",
-            videoUrl: url,
-            url,
-            model,
-            videoLength: Number(lengthSec),
-            resolution: String(resolution),
-            fps: Number(fps),
-          },
-        });
-      } catch (e3) {
-        console.warn("⚠️ ready notify failed:", e3?.message || e3);
-      }
+          homeUrl: "genova://home",
+          videoUrl: url,
+          url,
+          model,
+          videoLength: Number(lengthSec),
+          resolution: String(resolution),
+          fps: Number(fps),
+        },
+      });
+      console.log("📧 generate-video ready email result:", emailResult);
+    } catch (e3) {
+      console.warn("⚠️ ready email failed:", e3?.message || e3);
     }
 
     return res.json({
