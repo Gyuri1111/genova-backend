@@ -1216,23 +1216,17 @@ function buildEmailForType(type, { title, body, data }) {
   const safeBody = body || "";
 
   if (type === "video") {
-    const viewerUrl =
-      data?.viewerUrl ||
-      ((data?._uid || data?.uid) && data?.creationId
-        ? `https://genova-labs.hu/v/u/${data?._uid || data?.uid}/${data.creationId}`
-        : null) ||
-      data?.videoUrl ||
-      data?.url ||
-      "";
-
+    const homeUrl =
+      data?.homeUrl ||
+      "genova://home";
     return {
       subject: "🎬 Your GeNova video is ready",
       text: safeBody || "Your video is ready.",
       html: emailTemplate({
         title: safeTitle,
         message: safeBody,
-        buttonText: "View video",
-        buttonUrl: viewerUrl || null,
+        buttonText: "Open GeNova",
+        buttonUrl: homeUrl || "genova://home",
       }),
     };
   }
@@ -1367,11 +1361,7 @@ async function sendEmailIfAllowed({ uid, userDoc, type, title, body, data }) {
   const to = await resolveUserEmail(uid, userDoc);
   if (!to) return { skipped: true, reason: "no_email" };
 
-  const built = buildEmailForType(type, {
-    title,
-    body,
-    data: { ...(data || {}), _uid: uid },
-  });
+  const built = buildEmailForType(type, { title, body, data });
   const result = await sendEmailWithFallback({ to, ...built });
   return result;
 }
@@ -2434,7 +2424,28 @@ const prompt = String(body.prompt || body.text || "").trim();
     }
 // Send push/email if enabled
     // ✅ IMPORTANT: if watermark is required, do NOT notify here — the Functions watermark worker will notify after _wm.mp4 is finalized.
-    
+    if (!watermarkApplied) {
+      try {
+        await notifyUser({
+          uid,
+          type: "video",
+          data: {
+            creationId,
+            uid,
+            homeUrl: "genova://home",
+            videoUrl: url,
+            url,
+            model,
+            videoLength: Number(lengthSec),
+            resolution: String(resolution),
+            fps: Number(fps),
+          },
+        });
+      } catch (e3) {
+        console.warn("⚠️ ready notify failed:", e3?.message || e3);
+      }
+    }
+
     return res.json({
       success: true,
       videoUrl: url,
