@@ -52,7 +52,11 @@ require("dotenv").config();
 const { emailTemplate } = require("./src/utils/emailTemplate");
 
 const BUILD_TAG =
-  "NO_FFMPEG_ON_RENDER__WATERMARK_THUMB_IN_FUNCTIONS__2026-01-25";
+  "NO_FFMPEG_ON_RENDER__WATERMARK_THUMB_IN_FUNCTIONS__2026-03-22_VIDEO_READY_EMAIL_VIA_API";
+
+const VIDEO_READY_EMAIL_ENDPOINT =
+  process.env.VIDEO_READY_EMAIL_ENDPOINT ||
+  "https://api.genova-labs.hu/send-video-ready";
 
 
 /* =========================
@@ -103,6 +107,37 @@ if (Number.isFinite(sec) && sec > 0) {
   return null;
 }
 
+
+
+async function sendVideoReadyEmailViaApi({ uid, creationId, videoUrl, model, videoLength, resolution, fps }) {
+  const payload = {
+    uid,
+    creationId,
+    homeUrl: 'genova://home',
+    videoUrl: videoUrl || null,
+    model: model || null,
+    videoLength: Number(videoLength) || 0,
+    resolution: String(resolution || ''),
+    fps: Number(fps) || 0,
+  };
+
+  const res = await fetch(VIDEO_READY_EMAIL_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  let json = null;
+  try {
+    json = await res.json();
+  } catch (_) {}
+
+  if (!res.ok || !json?.ok) {
+    throw new Error(`video-ready email api failed: status=${res.status} body=${JSON.stringify(json || {})}`);
+  }
+
+  return json;
+}
 
 const app = express();
 
@@ -1366,32 +1401,6 @@ async function sendEmailIfAllowed({ uid, userDoc, type, title, body, data }) {
   return result;
 }
 
-async function sendVideoReadyEmailDirect({ uid, data }) {
-  if (!uid) return { skipped: true, reason: "no_uid" };
-
-  const userDoc = await getUserDoc(uid);
-  if (!userDoc) return { skipped: true, reason: "user_not_found" };
-
-  const to = await resolveUserEmail(uid, userDoc);
-  if (!to) return { skipped: true, reason: "no_email" };
-
-  const lang = getUserLang(userDoc);
-  const localized = localizeNotification({
-    lang,
-    type: "video",
-    data: data || {},
-  });
-
-  const built = buildEmailForType("video", {
-    title: localized.title,
-    body: localized.body,
-    data: data || {},
-  });
-
-  const result = await sendEmailWithFallback({ to, ...built });
-  return { ...result, lang, to };
-}
-
 // ------------------------------------------------------------
 // ✅ lastResult helpers (offline / push-missed safety net)
 // ------------------------------------------------------------
@@ -2448,27 +2457,20 @@ const prompt = String(body.prompt || body.text || "").trim();
     } catch (e) {
       console.warn("⚠️ creation doc update failed:", e?.message || e);
     }
-// Send ONLY the video-ready email here (no push), so we avoid duplicate push notifications.
-    // Also do not depend on watermark completion anymore: as soon as the plain video is ready,
-    // send the email with the Home deep link.
+// Send ONLY ready email through the dedicated mail API (no push here, no watermark dependency)
     try {
-      const emailResult = await sendVideoReadyEmailDirect({
+      const emailResult = await sendVideoReadyEmailViaApi({
         uid,
-        data: {
-          creationId,
-          uid,
-          homeUrl: "genova://home",
-          videoUrl: url,
-          url,
-          model,
-          videoLength: Number(lengthSec),
-          resolution: String(resolution),
-          fps: Number(fps),
-        },
+        creationId,
+        videoUrl: url,
+        model,
+        videoLength: Number(lengthSec),
+        resolution: String(resolution),
+        fps: Number(fps),
       });
       console.log("📧 generate-video ready email result:", emailResult);
     } catch (e3) {
-      console.warn("⚠️ ready email failed:", e3?.message || e3);
+      console.warn("⚠️ ready email api failed:", e3?.message || e3);
     }
 
     return res.json({
