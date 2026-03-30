@@ -110,6 +110,19 @@ if (Number.isFinite(sec) && sec > 0) {
 
 
 async function sendVideoReadyEmailViaApi({ uid, creationId, videoUrl, model, videoLength, resolution, fps }) {
+  // 🔒 respect user email notification preference
+  try {
+    const userSnap = await admin.firestore().doc(`users/${uid}`).get();
+    const userData = userSnap.exists ? userSnap.data() : null;
+    if (!userData?.notifPrefs?.emailNotif) {
+      console.log("📭 emailNotif disabled -> skip video ready email", uid);
+      return { skipped: true, reason: "email_pref_disabled" };
+    }
+  } catch (e) {
+    console.warn("email preference check failed -> skip email", e?.message || e);
+    return { skipped: true, reason: "email_pref_check_failed" };
+  }
+
   const payload = {
     uid,
     creationId,
