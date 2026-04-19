@@ -607,7 +607,7 @@ const BILLING = {
   BASE_CREDITS: 4,
   // Model cost multipliers (v1 defaults)
   MODEL_FACTOR: {
-    stable: 1.00,
+    minimax: 1.00,
     pika: 1.25,
     kling: 1.55,
     runway: 1.85,
@@ -622,12 +622,12 @@ function normalizePlan(p) {
 
 function isModelAllowedByPlan(plan, model) {
   const p = normalizePlan(plan);
-  const mk = String(model || "stable").toLowerCase().trim();
+  const mk = String(model || "minimax").toLowerCase().trim();
   const map = {
-    free:   new Set(["stable"]),
-    basic:  new Set(["stable", "pika"]),
-    pro:    new Set(["stable", "pika", "kling"]),
-    studio: new Set(["stable", "pika", "kling", "runway"]),
+    free:   new Set(["minimax"]),
+    basic:  new Set(["minimax", "pika"]),
+    pro:    new Set(["minimax", "pika", "kling"]),
+    studio: new Set(["minimax", "pika", "kling", "runway"]),
   };
   const allowed = map[p] || map.free;
   return allowed.has(mk);
@@ -709,7 +709,7 @@ function computeGenerationCost({ lengthSec, fps, resolution, model }) {
   const fpsKey = (Number(fps) || 0) >= 45 ? 60 : 30;
   const resKey = normalizeResolution(resolution); // "480p" | "720p" | "1080p" | "4k"
 
-  const modelKey = String(model || "stable").toLowerCase().trim();
+  const modelKey = String(model || "minimax").toLowerCase().trim();
   const mLen = BILLING.LEN_FACTOR[len] ?? 1.0;
   const mFps = BILLING.FPS_FACTOR[fpsKey] ?? 1.0;
   const mRes = BILLING.RES_FACTOR[resKey] ?? 1.0;
@@ -1730,6 +1730,393 @@ const storage = new Storage({
 });
 const bucket = storage.bucket("genova-27d76.firebasestorage.app");
 
+
+// ------------------------------------------------------------
+// ✅ Provider configuration + helpers (MiniMax / Pika / Kling / Runway)
+// ------------------------------------------------------------
+const PROVIDERS = {
+  minimax: {
+    apiKey: String(process.env.MINIMAX_API_KEY || "").trim(),
+    baseUrl: String(process.env.MINIMAX_BASE_URL || "https://api.minimax.io").trim().replace(/\/+$/, ""),
+    textModel: String(process.env.MINIMAX_TEXT_MODEL || "MiniMax-Hailuo-2.3").trim(),
+    imageModel: String(process.env.MINIMAX_IMAGE_MODEL || "MiniMax-Hailuo-2.3-Fast").trim(),
+    callbackUrl: String(process.env.MINIMAX_CALLBACK_URL || "").trim(),
+  },
+  pika: {
+    apiKey: String(process.env.PIKA_API_KEY || "").trim(),
+    textModel: String(process.env.PIKA_TEXT_MODEL || "fal-ai/pika/v2.2/text-to-video").trim(),
+    imageModel: String(process.env.PIKA_IMAGE_MODEL || "fal-ai/pika/v2.2/image-to-video").trim(),
+  },
+  kling: {
+    accessKey: String(process.env.KLING_ACCESS_KEY || "").trim(),
+    secretKey: String(process.env.KLING_SECRET_KEY || "").trim(),
+    baseUrl: String(process.env.KLING_BASE_URL || "https://api-singapore.klingai.com").trim().replace(/\/+$/, ""),
+    textModel: String(process.env.KLING_TEXT_MODEL || "kling-v2-6").trim(),
+    imageModel: String(process.env.KLING_IMAGE_MODEL || "kling-v2-6").trim(),
+    callbackUrl: String(process.env.KLING_CALLBACK_URL || "").trim(),
+  },
+  runway: {
+    apiKey: String(process.env.RUNWAY_API_KEY || "").trim(),
+    baseUrl: "https://api.dev.runwayml.com",
+    textModel: String(process.env.RUNWAY_TEXT_MODEL || "gen4.5").trim(),
+    imageModel: String(process.env.RUNWAY_IMAGE_MODEL || "gen4.5").trim(),
+  },
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function resolveProviderFromModel(rawModel) {
+  const m = String(rawModel || "").trim().toLowerCase();
+  if (m === "runway") return "runway";
+  if (m === "kling") return "kling";
+  if (m === "pika") return "pika";
+  if (m === "minimax" || m === "stable") return "minimax"; // legacy stable -> MiniMax
+  throw new Error(`UNKNOWN_MODEL:${rawModel}`);
+}
+
+function mapOutputToProviderModel(rawModel) {
+  const p = resolveProviderFromModel(rawModel);
+  if (p === "minimax") return "MiniMax";
+  return String(rawModel || "").trim();
+}
+
+function mapAspectRatio(orientation) {
+  return String(orientation || "").toLowerCase() === "landscape" ? "16:9" : "9:16";
+}
+
+function mapRunwayRatio(orientation) {
+  return String(orientation || "").toLowerCase() === "landscape" ? "1280:768" : "768:1280";
+}
+
+function mapMiniMaxResolution(resolution) {
+  const r = String(resolution || "").toLowerCase();
+  if (r === "4k") return "1080P";
+  if (r === "1080p") return "1080P";
+  return "768P";
+}
+
+function mapPikaResolution(resolution) {
+  const r = String(resolution || "").toLowerCase();
+  if (r === "1080p" || r === "4k") return "1080p";
+  return "720p";
+}
+
+async function httpJson(url, { method = "GET", headers = {}, body = undefined, timeoutMs = 60000 } = {}) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method,
+      headers,
+      body,
+      signal: controller.signal,
+    });
+    const raw = await res.text().catch(() => "");
+    let json = null;
+    try { json = raw ? JSON.parse(raw) : null; } catch (_) { json = null; }
+    if (!res.ok) {
+      const err = new Error(`HTTP_${res.status}`);
+      err.status = res.status;
+      err.url = url;
+      err.raw = raw;
+      err.json = json;
+      throw err;
+    }
+    return { res, raw, json };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function ensureProviderReady(provider) {
+  const p = PROVIDERS[provider];
+  if (!p) throw new Error(`UNKNOWN_PROVIDER:${provider}`);
+  if (provider === "minimax" && !p.apiKey) throw new Error("MINIMAX_API_KEY_MISSING");
+  if (provider === "pika" && !p.apiKey) throw new Error("PIKA_API_KEY_MISSING");
+  if (provider === "kling" && (!p.accessKey || !p.secretKey)) throw new Error("KLING_KEY_MISSING");
+  if (provider === "runway" && !p.apiKey) throw new Error("RUNWAY_API_KEY_MISSING");
+  return p;
+}
+
+async function localFileToDataUrl(localPath, mimeType = "image/jpeg") {
+  const b64 = await fs.promises.readFile(localPath, { encoding: "base64" });
+  return `data:${mimeType};base64,${b64}`;
+}
+
+async function uploadTempInputAndGetSignedUrl(uid, localPath, mimeType = "image/jpeg") {
+  const ext = path.extname(String(localPath || "")) || ".jpg";
+  const objectPath = `temp-inputs/${uid}/${Date.now()}_${crypto.randomUUID()}${ext}`;
+  await bucket.upload(localPath, {
+    destination: objectPath,
+    metadata: { contentType: mimeType, cacheControl: "private, max-age=3600" },
+  });
+  const file = bucket.file(objectPath);
+  const [signedUrl] = await file.getSignedUrl({
+    action: "read",
+    version: "v4",
+    expires: Date.now() + 1000 * 60 * 60,
+  });
+  return { signedUrl, objectPath };
+}
+
+function pickVideoUrlFromAny(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const direct = obj.videoUrl || obj.video_url || obj.url || null;
+  if (direct) return String(direct);
+  const output0 = Array.isArray(obj.output) && obj.output[0] ? obj.output[0] : null;
+  if (output0) return String(output0);
+  const data = obj.data || {};
+  const d1 = data.videoUrl || data.video_url || data.url || null;
+  if (d1) return String(d1);
+  if (Array.isArray(data.videos) && data.videos[0]?.url) return String(data.videos[0].url);
+  if (obj.task_result?.videos?.[0]?.url) return String(obj.task_result.videos[0].url);
+  if (obj.data?.task_result?.videos?.[0]?.url) return String(obj.data.task_result.videos[0].url);
+  return null;
+}
+
+async function createMiniMaxTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
+  const cfg = ensureProviderReady("minimax");
+  const payload = {
+    model: hasImage ? cfg.imageModel : cfg.textModel,
+    prompt: String(prompt || "").trim(),
+    duration: Number(lengthSec || 6),
+    resolution: mapMiniMaxResolution(resolution),
+  };
+  if (cfg.callbackUrl) payload.callback_url = cfg.callbackUrl;
+  if (hasImage && localImagePath) {
+    payload.first_frame_image = await localFileToDataUrl(localImagePath, mimeType || "image/jpeg");
+  }
+  const create = await httpJson(`${cfg.baseUrl}/v1/video_generation`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${cfg.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+    timeoutMs: 90000,
+  });
+  const taskId = String(create?.json?.task_id || create?.json?.data?.task_id || "").trim();
+  if (!taskId) throw new Error("MINIMAX_TASK_ID_MISSING");
+
+  let fileId = null;
+  for (let i = 0; i < 30; i += 1) {
+    await sleep(4000);
+    const q = await httpJson(`${cfg.baseUrl}/v1/query/video_generation?task_id=${encodeURIComponent(taskId)}`, {
+      headers: { Authorization: `Bearer ${cfg.apiKey}` },
+      timeoutMs: 45000,
+    });
+    const j = q.json || {};
+    const status = String(j.status || j.task_status || "").toLowerCase();
+    if (status === "success") {
+      fileId = String(j.file_id || j.fileId || "").trim();
+      break;
+    }
+    if (status === "failed") {
+      throw new Error(`MINIMAX_FAILED:${j.base_resp?.status_msg || j.status_msg || "failed"}`);
+    }
+  }
+  if (!fileId) throw new Error("MINIMAX_TIMEOUT");
+
+  const dl = await httpJson(`${cfg.baseUrl}/v1/files/retrieve?file_id=${encodeURIComponent(fileId)}`, {
+    headers: { Authorization: `Bearer ${cfg.apiKey}` },
+    timeoutMs: 45000,
+  });
+  const videoUrl =
+    dl.json?.file?.download_url ||
+    dl.json?.file?.url ||
+    dl.json?.download_url ||
+    dl.json?.url ||
+    pickVideoUrlFromAny(dl.json);
+  if (!videoUrl) throw new Error("MINIMAX_VIDEO_URL_MISSING");
+  return { provider: "minimax", taskId, videoUrl };
+}
+
+async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
+  const cfg = ensureProviderReady("pika");
+  let signedInput = null;
+  if (hasImage && localImagePath) {
+    signedInput = await uploadTempInputAndGetSignedUrl(uid, localImagePath, mimeType || "image/jpeg");
+  }
+  const modelSlug = hasImage ? cfg.imageModel : cfg.textModel;
+  const input = {
+    prompt: String(prompt || "").trim(),
+    duration: Number(lengthSec || 5),
+    aspect_ratio: mapAspectRatio(orientation),
+    resolution: mapPikaResolution(resolution),
+  };
+  if (hasImage && signedInput?.signedUrl) input.image_url = signedInput.signedUrl;
+
+  const submit = await httpJson(`https://queue.fal.run/${modelSlug}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Key ${cfg.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ input }),
+    timeoutMs: 90000,
+  });
+  const requestId = String(submit.json?.request_id || submit.json?.requestId || "").trim();
+  if (!requestId) throw new Error("PIKA_REQUEST_ID_MISSING");
+
+  let videoUrl = null;
+  for (let i = 0; i < 30; i += 1) {
+    await sleep(4000);
+    const status = await httpJson(`https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`, {
+      headers: { Authorization: `Key ${cfg.apiKey}` },
+      timeoutMs: 45000,
+    });
+    const s = String(status.json?.status || "").toUpperCase();
+    if (s === "COMPLETED") {
+      const result = await httpJson(`https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}`, {
+        headers: { Authorization: `Key ${cfg.apiKey}` },
+        timeoutMs: 45000,
+      });
+      videoUrl = pickVideoUrlFromAny(result.json);
+      break;
+    }
+    if (s === "FAILED") {
+      throw new Error(`PIKA_FAILED:${status.json?.error || "failed"}`);
+    }
+  }
+  if (!videoUrl) throw new Error("PIKA_TIMEOUT");
+  return { provider: "pika", taskId: requestId, videoUrl };
+}
+
+function createKlingJwtToken(accessKey, secretKey) {
+  const header = { alg: "HS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    iss: accessKey,
+    exp: now + 1800,
+    nbf: now - 5,
+  };
+  const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+  const tokenUnsigned = `${b64url(header)}.${b64url(payload)}`;
+  const sig = crypto.createHmac("sha256", secretKey).update(tokenUnsigned).digest("base64url");
+  return `${tokenUnsigned}.${sig}`;
+}
+
+async function createKlingTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
+  const cfg = ensureProviderReady("kling");
+  const token = createKlingJwtToken(cfg.accessKey, cfg.secretKey);
+  const endpoint = hasImage ? "/v1/videos/image2video" : "/v1/videos/text2video";
+  const queryPrefix = hasImage ? "/v1/videos/image2video/" : "/v1/videos/text2video/";
+  const payload = {
+    model_name: hasImage ? cfg.imageModel : cfg.textModel,
+    prompt: String(prompt || "").trim(),
+    duration: String(Math.max(3, Math.min(15, Number(lengthSec || 5)))),
+    mode: "std",
+    sound: "off",
+    aspect_ratio: mapAspectRatio(orientation),
+    watermark_info: { enabled: false },
+  };
+  if (cfg.callbackUrl) payload.callback_url = cfg.callbackUrl;
+  if (hasImage && localImagePath) {
+    payload.image = await localFileToDataUrl(localImagePath, mimeType || "image/jpeg");
+  }
+  const create = await httpJson(`${cfg.baseUrl}${endpoint}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+    timeoutMs: 90000,
+  });
+  const taskId = String(create.json?.data?.task_id || create.json?.task_id || "").trim();
+  if (!taskId) throw new Error("KLING_TASK_ID_MISSING");
+
+  let videoUrl = null;
+  for (let i = 0; i < 35; i += 1) {
+    await sleep(4000);
+    const q = await httpJson(`${cfg.baseUrl}${queryPrefix}${encodeURIComponent(taskId)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      timeoutMs: 45000,
+    });
+    const status = String(q.json?.data?.task_status || q.json?.task_status || "").toLowerCase();
+    if (status === "succeed" || status === "success") {
+      videoUrl = pickVideoUrlFromAny(q.json);
+      break;
+    }
+    if (status === "failed") {
+      throw new Error(`KLING_FAILED:${q.json?.data?.task_status_msg || q.json?.task_status_msg || "failed"}`);
+    }
+  }
+  if (!videoUrl) throw new Error("KLING_TIMEOUT");
+  return { provider: "kling", taskId, videoUrl };
+}
+
+async function createRunwayTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
+  const cfg = ensureProviderReady("runway");
+  const endpoint = hasImage ? "/v1/image_to_video" : "/v1/text_to_video";
+  const payload = {
+    model: hasImage ? cfg.imageModel : cfg.textModel,
+    promptText: String(prompt || "").trim(),
+    ratio: mapRunwayRatio(orientation),
+    duration: Math.max(2, Math.min(10, Number(lengthSec || 5))),
+  };
+  if (hasImage && localImagePath) {
+    payload.promptImage = await localFileToDataUrl(localImagePath, mimeType || "image/jpeg");
+  }
+  const create = await httpJson(`${cfg.baseUrl}${endpoint}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${cfg.apiKey}`,
+      "Content-Type": "application/json",
+      "X-Runway-Version": "2024-11-06",
+    },
+    body: JSON.stringify(payload),
+    timeoutMs: 90000,
+  });
+  const taskId = String(create.json?.id || create.json?.taskId || "").trim();
+  if (!taskId) throw new Error("RUNWAY_TASK_ID_MISSING");
+
+  let videoUrl = null;
+  for (let i = 0; i < 35; i += 1) {
+    await sleep(4000);
+    const q = await httpJson(`${cfg.baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`, {
+      headers: {
+        Authorization: `Bearer ${cfg.apiKey}`,
+        "X-Runway-Version": "2024-11-06",
+      },
+      timeoutMs: 45000,
+    });
+    const status = String(q.json?.status || "").toUpperCase();
+    if (status === "SUCCEEDED") {
+      videoUrl = pickVideoUrlFromAny(q.json);
+      break;
+    }
+    if (status === "FAILED" || status === "CANCELLED") {
+      throw new Error(`RUNWAY_FAILED:${q.json?.failure || status}`);
+    }
+  }
+  if (!videoUrl) throw new Error("RUNWAY_TIMEOUT");
+  return { provider: "runway", taskId, videoUrl };
+}
+
+app.post("/minimax/callback", async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (body.challenge) return res.json({ challenge: body.challenge });
+    console.log("📥 MINIMAX callback", JSON.stringify(body).slice(0, 1500));
+    return res.json({ status: "success" });
+  } catch (e) {
+    console.warn("⚠️ MINIMAX callback error", e?.message || e);
+    return res.status(500).json({ error: "callback_failed" });
+  }
+});
+
+app.post("/kling/callback", async (req, res) => {
+  try {
+    console.log("📥 KLING callback", JSON.stringify(req.body || {}).slice(0, 1500));
+    return res.json({ ok: true });
+  } catch (e) {
+    console.warn("⚠️ KLING callback error", e?.message || e);
+    return res.status(500).json({ error: "callback_failed" });
+  }
+});
+
+
 // ------------------------------------------------------------
 // ✅ Video finalization helpers: watermark + thumbnail + upload
 // ------------------------------------------------------------
@@ -2125,7 +2512,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const useRewardedNoWatermark = String(body.useRewardedNoWatermark || '').toLowerCase() === 'true';
     const useRewardedAudioMix = String(body.useRewardedAudioMix || '').toLowerCase() === 'true';
 const prompt = String(body.prompt || body.text || "").trim();
-    const model = String(body.model || "kling").trim();
+    const model = mapOutputToProviderModel(String(body.model || "minimax").trim());
     const lengthSec = Math.max(1, Math.min(60, Number(body.lengthSec ?? body.length ?? 5)));
     const fps = Math.max(1, Math.min(120, Number(body.fps ?? 30)));
     const resolution = String(body.resolution || body.res || "720p").trim();
@@ -2272,6 +2659,7 @@ const prompt = String(body.prompt || body.text || "").trim();
 	  height: outputFrame.height,
 	  aspectRatio: outputFrame.aspectRatio,
 	  orientation: outputFrame.orientation,
+	  provider: resolveProviderFromModel(model),
 	};
 
     // Mark as processing first
@@ -2285,13 +2673,66 @@ const prompt = String(body.prompt || body.text || "").trim();
       createdAt,
     });
 
-    // --- Placeholder "generation" (replace with real provider call later) ---
-    // We serve a static placeholder mp4 from this server.
-    // ✅ Finalization pipeline already runs (watermark + thumbnail + Storage upload).
-    const baseUrl = process.env.PUBLIC_BASE_URL || "https://genova-labs.hu";
-    const sourceUrl = outputFrame.orientation === "portrait"
-      ? `${baseUrl}/placeholder-portrait.mp4`
-      : `${baseUrl}/placeholder.mp4`;
+    // --- Real provider generation ---
+    const provider = resolveProviderFromModel(model);
+    console.log("🎬 PROVIDER_RESOLVE", {
+      provider,
+      model,
+      hasImage: !!req.file,
+      orientation: outputFrame.orientation,
+      resolution,
+      fps,
+      lengthSec,
+    });
+
+    const imageMimeType = String(req.file?.mimetype || "image/jpeg").trim() || "image/jpeg";
+    const providerResult =
+      provider === "minimax"
+        ? await createMiniMaxTask({
+            uid,
+            prompt,
+            hasImage: !!req.file,
+            localImagePath: req.file?.path || null,
+            mimeType: imageMimeType,
+            lengthSec,
+            resolution,
+            orientation: outputFrame.orientation,
+          })
+        : provider === "pika"
+        ? await createPikaTask({
+            uid,
+            prompt,
+            hasImage: !!req.file,
+            localImagePath: req.file?.path || null,
+            mimeType: imageMimeType,
+            lengthSec,
+            resolution,
+            orientation: outputFrame.orientation,
+          })
+        : provider === "kling"
+        ? await createKlingTask({
+            uid,
+            prompt,
+            hasImage: !!req.file,
+            localImagePath: req.file?.path || null,
+            mimeType: imageMimeType,
+            lengthSec,
+            resolution,
+            orientation: outputFrame.orientation,
+          })
+        : await createRunwayTask({
+            uid,
+            prompt,
+            hasImage: !!req.file,
+            localImagePath: req.file?.path || null,
+            mimeType: imageMimeType,
+            lengthSec,
+            resolution,
+            orientation: outputFrame.orientation,
+          });
+
+    const sourceUrl = String(providerResult?.videoUrl || "").trim();
+    if (!sourceUrl) throw new Error("PROVIDER_VIDEO_URL_MISSING");
 
     let fileName = String(body.fileName || "").trim() || "";
     const watermarkApplied = !!billing?.watermarkApplied;
