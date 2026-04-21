@@ -576,15 +576,15 @@ const PACK_CATALOG = {
 // - Plan controls max allowed params + watermark defaults
 const BILLING = {
   HARD_CAPS: {
-    MAX_LENGTH_SEC: 20,
-    MAX_FPS: 60,
+    MAX_LENGTH_SEC: 15,
+    MAX_FPS: 30,
   },
   // Allowed maxima per plan (v1)
   PLAN_LIMITS: {
     free:   { maxLength: 5,  maxFps: 30, maxResolution: "480p" },
-    basic:  { maxLength: 5,  maxFps: 30, maxResolution: "1080p" },
-    pro:    { maxLength: 10, maxFps: 30, maxResolution: "4k" },
-    studio: { maxLength: 20, maxFps: 60, maxResolution: "4k" },
+    basic:  { maxLength: 5,  maxFps: 30, maxResolution: "720p" },
+    pro:    { maxLength: 10, maxFps: 30, maxResolution: "1080p" },
+    studio: { maxLength: 15, maxFps: 30, maxResolution: "1080p" },
   },
   // Cost factors
   FPS_FACTOR: {
@@ -602,7 +602,6 @@ const BILLING = {
     5: 1.00,
     10: 1.45,
     15: 1.80,
-    20: 2.10,
   },
   BASE_CREDITS: 4,
   // Model cost multipliers (v1 defaults)
@@ -697,19 +696,18 @@ function enforceCapsAndLimits({ plan, lengthSec, fps, resolution }) {
 
 function computeGenerationCost({ lengthSec, fps, resolution, model }) {
   // Multiplier-based pricing, kept in sync with HomeScreen:
-  // BASE: 5s / 480p / 30fps / Stable = BILLING.BASE_CREDITS (default 4)
+  // BASE: 5s / 480p / 30fps / Pika = BILLING.BASE_CREDITS (default 4)
   const len = (() => {
     const n = Number(lengthSec) || 0;
-    if (n <= 6) return 5;
+    if (n <= 7) return 5;
     if (n <= 12) return 10;
-    if (n <= 17) return 15;
-    return 20;
+    return 15;
   })();
 
   const fpsKey = (Number(fps) || 0) >= 45 ? 60 : 30;
   const resKey = normalizeResolution(resolution); // "480p" | "720p" | "1080p" | "4k"
 
-  const modelKey = String(model || "minimax").toLowerCase().trim();
+  const modelKey = String(model || "pika").toLowerCase().trim();
   const mLen = BILLING.LEN_FACTOR[len] ?? 1.0;
   const mFps = BILLING.FPS_FACTOR[fpsKey] ?? 1.0;
   const mRes = BILLING.RES_FACTOR[resKey] ?? 1.0;
@@ -1832,7 +1830,6 @@ function ensureProviderReady(provider) {
   if (!p) throw new Error(`UNKNOWN_PROVIDER:${provider}`);
   if (provider === "pika" && !p.apiKey) throw new Error("PIKA_API_KEY_MISSING");
   if (provider === "wan" && !p.apiKey) throw new Error("WAN_API_KEY_MISSING");
-  if (provider === "pika" && !p.apiKey) throw new Error("PIKA_API_KEY_MISSING");
   if (provider === "kling" && (!p.accessKey || !p.secretKey)) throw new Error("KLING_KEY_MISSING");
   if (provider === "runway" && !p.apiKey) throw new Error("RUNWAY_API_KEY_MISSING");
   return p;
@@ -1938,7 +1935,7 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
     dl.json?.url ||
     pickVideoUrlFromAny(dl.json);
   if (!videoUrl) throw new Error("WAN_VIDEO_URL_MISSING");
-  return { provider: "minimax", taskId, videoUrl };
+  return { provider: "wan", taskId, videoUrl };
 }
 
 async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
