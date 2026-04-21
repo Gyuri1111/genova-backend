@@ -1895,8 +1895,18 @@ async function createMiniMaxTask({ uid, prompt, hasImage, localImagePath, mimeTy
     body: JSON.stringify(payload),
     timeoutMs: 90000,
   });
-  const taskId = String(create?.json?.task_id || create?.json?.data?.task_id || "").trim();
-  if (!taskId) throw new Error("MINIMAX_TASK_ID_MISSING");
+  const statusCode = Number(create?.json?.base_resp?.status_code ?? -1);
+  const statusMsg = String(create?.json?.base_resp?.status_msg || "");
+
+  if (statusCode !== 0) {
+    throw new Error(`MINIMAX_CREATE_FAILED:${statusCode}:${statusMsg}`);
+  }
+
+  const taskId = String(create?.json?.task_id || "").trim();
+  if (!taskId) {
+    console.log("❌ MINIMAX raw response", create?.json);
+    throw new Error("MINIMAX_TASK_ID_MISSING");
+  }
 
   let fileId = null;
   for (let i = 0; i < 30; i += 1) {
