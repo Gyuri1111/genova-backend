@@ -607,8 +607,8 @@ const BILLING = {
   BASE_CREDITS: 4,
   // Model cost multipliers (v1 defaults)
   MODEL_FACTOR: {
-    minimax: 1.00,
-    pika: 1.25,
+    pika: 1.00,
+    wan: 1.25,
     kling: 1.55,
     runway: 1.85,
     default: 1.00,
@@ -622,12 +622,12 @@ function normalizePlan(p) {
 
 function isModelAllowedByPlan(plan, model) {
   const p = normalizePlan(plan);
-  const mk = String(model || "minimax").toLowerCase().trim();
+  const mk = String(model || "pika").toLowerCase().trim();
   const map = {
-    free:   new Set(["minimax"]),
-    basic:  new Set(["minimax", "pika"]),
-    pro:    new Set(["minimax", "pika", "kling"]),
-    studio: new Set(["minimax", "pika", "kling", "runway"]),
+    free:   new Set(["pika"]),
+    basic:  new Set(["pika", "wan"]),
+    pro:    new Set(["pika", "wan", "kling"]),
+    studio: new Set(["pika", "wan", "kling", "runway"]),
   };
   const allowed = map[p] || map.free;
   return allowed.has(mk);
@@ -1732,20 +1732,18 @@ const bucket = storage.bucket("genova-27d76.firebasestorage.app");
 
 
 // ------------------------------------------------------------
-// ✅ Provider configuration + helpers (MiniMax / Pika / Kling / Runway)
+// ✅ Provider configuration + helpers (Pika / WAN / Kling / Runway)
 // ------------------------------------------------------------
 const PROVIDERS = {
-  minimax: {
-    apiKey: String(process.env.MINIMAX_API_KEY || "").trim(),
-    baseUrl: String(process.env.MINIMAX_BASE_URL || "https://api.minimax.io").trim().replace(/\/+$/, ""),
-    textModel: String(process.env.MINIMAX_TEXT_MODEL || "MiniMax-Hailuo-2.3").trim(),
-    imageModel: String(process.env.MINIMAX_IMAGE_MODEL || "MiniMax-Hailuo-2.3-Fast").trim(),
-    callbackUrl: String(process.env.MINIMAX_CALLBACK_URL || "").trim(),
-  },
   pika: {
     apiKey: String(process.env.PIKA_API_KEY || "").trim(),
     textModel: String(process.env.PIKA_TEXT_MODEL || "fal-ai/pika/v2.2/text-to-video").trim(),
     imageModel: String(process.env.PIKA_IMAGE_MODEL || "fal-ai/pika/v2.2/image-to-video").trim(),
+  },
+  wan: {
+    apiKey: String(process.env.WAN_API_KEY || "").trim(),
+    textModel: String(process.env.WAN_TEXT_MODEL || "fal-ai/wan/v2.7/text-to-video").trim(),
+    imageModel: String(process.env.WAN_IMAGE_MODEL || "fal-ai/wan/v2.7/image-to-video").trim(),
   },
   kling: {
     accessKey: String(process.env.KLING_ACCESS_KEY || "").trim(),
@@ -1769,14 +1767,15 @@ function resolveProviderFromModel(rawModel) {
   const m = String(rawModel || "").trim().toLowerCase();
   if (m === "runway") return "runway";
   if (m === "kling") return "kling";
-  if (m === "pika") return "pika";
-  if (m === "minimax" || m === "stable") return "minimax"; // legacy stable -> MiniMax
+  if (m === "pika" || m === "pika lite" || m === "pikalite" || m === "stable" || m === "minimax") return "pika"; // legacy free aliases -> Pika
+  if (m === "wan" || m === "wan 2.7") return "wan";
   throw new Error(`UNKNOWN_MODEL:${rawModel}`);
 }
 
 function mapOutputToProviderModel(rawModel) {
   const p = resolveProviderFromModel(rawModel);
-  if (p === "minimax") return "MiniMax";
+  if (p === "pika") return "Pika";
+  if (p === "wan") return "WAN";
   return String(rawModel || "").trim();
 }
 
@@ -1788,7 +1787,7 @@ function mapRunwayRatio(orientation) {
   return String(orientation || "").toLowerCase() === "landscape" ? "1280:768" : "768:1280";
 }
 
-function mapMiniMaxResolution(resolution) {
+function mapWanResolution(resolution) {
   const r = String(resolution || "").toLowerCase();
   if (r === "4k") return "1080P";
   if (r === "1080p") return "1080P";
@@ -1831,7 +1830,8 @@ async function httpJson(url, { method = "GET", headers = {}, body = undefined, t
 function ensureProviderReady(provider) {
   const p = PROVIDERS[provider];
   if (!p) throw new Error(`UNKNOWN_PROVIDER:${provider}`);
-  if (provider === "minimax" && !p.apiKey) throw new Error("MINIMAX_API_KEY_MISSING");
+  if (provider === "pika" && !p.apiKey) throw new Error("PIKA_API_KEY_MISSING");
+  if (provider === "wan" && !p.apiKey) throw new Error("WAN_API_KEY_MISSING");
   if (provider === "pika" && !p.apiKey) throw new Error("PIKA_API_KEY_MISSING");
   if (provider === "kling" && (!p.accessKey || !p.secretKey)) throw new Error("KLING_KEY_MISSING");
   if (provider === "runway" && !p.apiKey) throw new Error("RUNWAY_API_KEY_MISSING");
@@ -1874,13 +1874,13 @@ function pickVideoUrlFromAny(obj) {
   return null;
 }
 
-async function createMiniMaxTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
-  const cfg = ensureProviderReady("minimax");
+async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
+  const cfg = ensureProviderReady("wan");
   const payload = {
     model: hasImage ? cfg.imageModel : cfg.textModel,
     prompt: String(prompt || "").trim(),
     duration: Number(lengthSec || 6),
-    resolution: mapMiniMaxResolution(resolution),
+    resolution: mapWanResolution(resolution),
   };
   if (cfg.callbackUrl) payload.callback_url = cfg.callbackUrl;
   if (hasImage && localImagePath) {
@@ -1899,13 +1899,13 @@ async function createMiniMaxTask({ uid, prompt, hasImage, localImagePath, mimeTy
   const statusMsg = String(create?.json?.base_resp?.status_msg || "");
 
   if (statusCode !== 0) {
-    throw new Error(`MINIMAX_CREATE_FAILED:${statusCode}:${statusMsg}`);
+    throw new Error(`WAN_CREATE_FAILED:${statusCode}:${statusMsg}`);
   }
 
   const taskId = String(create?.json?.task_id || "").trim();
   if (!taskId) {
-    console.log("❌ MINIMAX raw response", create?.json);
-    throw new Error("MINIMAX_TASK_ID_MISSING");
+    console.log("❌ WAN raw response", create?.json);
+    throw new Error("WAN_TASK_ID_MISSING");
   }
 
   let fileId = null;
@@ -1922,10 +1922,10 @@ async function createMiniMaxTask({ uid, prompt, hasImage, localImagePath, mimeTy
       break;
     }
     if (status === "failed") {
-      throw new Error(`MINIMAX_FAILED:${j.base_resp?.status_msg || j.status_msg || "failed"}`);
+      throw new Error(`WAN_FAILED:${j.base_resp?.status_msg || j.status_msg || "failed"}`);
     }
   }
-  if (!fileId) throw new Error("MINIMAX_TIMEOUT");
+  if (!fileId) throw new Error("WAN_TIMEOUT");
 
   const dl = await httpJson(`${cfg.baseUrl}/v1/files/retrieve?file_id=${encodeURIComponent(fileId)}`, {
     headers: { Authorization: `Bearer ${cfg.apiKey}` },
@@ -1937,7 +1937,7 @@ async function createMiniMaxTask({ uid, prompt, hasImage, localImagePath, mimeTy
     dl.json?.download_url ||
     dl.json?.url ||
     pickVideoUrlFromAny(dl.json);
-  if (!videoUrl) throw new Error("MINIMAX_VIDEO_URL_MISSING");
+  if (!videoUrl) throw new Error("WAN_VIDEO_URL_MISSING");
   return { provider: "minimax", taskId, videoUrl };
 }
 
@@ -2522,7 +2522,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const useRewardedNoWatermark = String(body.useRewardedNoWatermark || '').toLowerCase() === 'true';
     const useRewardedAudioMix = String(body.useRewardedAudioMix || '').toLowerCase() === 'true';
 const prompt = String(body.prompt || body.text || "").trim();
-    const model = mapOutputToProviderModel(String(body.model || "minimax").trim());
+    const model = mapOutputToProviderModel(String(body.model || "pika").trim());
     const lengthSec = Math.max(1, Math.min(60, Number(body.lengthSec ?? body.length ?? 5)));
     const fps = Math.max(1, Math.min(120, Number(body.fps ?? 30)));
     const resolution = String(body.resolution || body.res || "720p").trim();
@@ -2697,8 +2697,8 @@ const prompt = String(body.prompt || body.text || "").trim();
 
     const imageMimeType = String(req.file?.mimetype || "image/jpeg").trim() || "image/jpeg";
     const providerResult =
-      provider === "minimax"
-        ? await createMiniMaxTask({
+      provider === "wan"
+        ? await createWanTask({
             uid,
             prompt,
             hasImage: !!req.file,
