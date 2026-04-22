@@ -1740,6 +1740,7 @@ const PROVIDERS = {
   },
   wan: {
     apiKey: String(process.env.WAN_API_KEY || "").trim(),
+    baseUrl: String(process.env.WAN_BASE_URL || "https://api.minimax.io").trim().replace(/\/+$/, ""),
     textModel: String(process.env.WAN_TEXT_MODEL || "fal-ai/wan/v2.7/text-to-video").trim(),
     imageModel: String(process.env.WAN_IMAGE_MODEL || "fal-ai/wan/v2.7/image-to-video").trim(),
   },
@@ -1783,6 +1784,14 @@ function mapAspectRatio(orientation) {
 
 function mapRunwayRatio(orientation) {
   return String(orientation || "").toLowerCase() === "landscape" ? "1280:768" : "768:1280";
+}
+
+function normalizeRunwayModelName(raw) {
+  const v = String(raw || "").trim().toLowerCase();
+  if (!v) return "gen4.5";
+  if (v === "gen4.5" || v === "gen-4.5" || v === "gen45") return "gen4.5";
+  if (v.includes("runwayml/") || v.includes("text_to_video") || v.includes("image_to_video")) return "gen4.5";
+  return String(raw || "").trim();
 }
 
 function mapWanResolution(resolution) {
@@ -2057,7 +2066,7 @@ async function createRunwayTask({ uid, prompt, hasImage, localImagePath, mimeTyp
   const cfg = ensureProviderReady("runway");
   const endpoint = hasImage ? "/v1/image_to_video" : "/v1/text_to_video";
   const payload = {
-    model: hasImage ? cfg.imageModel : cfg.textModel,
+    model: normalizeRunwayModelName(hasImage ? cfg.imageModel : cfg.textModel),
     promptText: String(prompt || "").trim(),
     ratio: mapRunwayRatio(orientation),
     duration: Math.max(2, Math.min(10, Number(lengthSec || 5))),
