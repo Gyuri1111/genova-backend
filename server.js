@@ -576,15 +576,15 @@ const PACK_CATALOG = {
 // - Plan controls max allowed params + watermark defaults
 const BILLING = {
   HARD_CAPS: {
-    MAX_LENGTH_SEC: 15,
-    MAX_FPS: 30,
+    MAX_LENGTH_SEC: 20,
+    MAX_FPS: 60,
   },
   // Allowed maxima per plan (v1)
   PLAN_LIMITS: {
     free:   { maxLength: 5,  maxFps: 30, maxResolution: "480p" },
-    basic:  { maxLength: 5,  maxFps: 30, maxResolution: "720p" },
-    pro:    { maxLength: 10, maxFps: 30, maxResolution: "1080p" },
-    studio: { maxLength: 15, maxFps: 30, maxResolution: "1080p" },
+    basic:  { maxLength: 5,  maxFps: 30, maxResolution: "1080p" },
+    pro:    { maxLength: 10, maxFps: 30, maxResolution: "4k" },
+    studio: { maxLength: 20, maxFps: 60, maxResolution: "4k" },
   },
   // Cost factors
   FPS_FACTOR: {
@@ -602,6 +602,7 @@ const BILLING = {
     5: 1.00,
     10: 1.45,
     15: 1.80,
+    20: 2.10,
   },
   BASE_CREDITS: 4,
   // Model cost multipliers (v1 defaults)
@@ -696,18 +697,19 @@ function enforceCapsAndLimits({ plan, lengthSec, fps, resolution }) {
 
 function computeGenerationCost({ lengthSec, fps, resolution, model }) {
   // Multiplier-based pricing, kept in sync with HomeScreen:
-  // BASE: 5s / 480p / 30fps / Pika = BILLING.BASE_CREDITS (default 4)
+  // BASE: 5s / 480p / 30fps / Stable = BILLING.BASE_CREDITS (default 4)
   const len = (() => {
     const n = Number(lengthSec) || 0;
-    if (n <= 7) return 5;
+    if (n <= 6) return 5;
     if (n <= 12) return 10;
-    return 15;
+    if (n <= 17) return 15;
+    return 20;
   })();
 
   const fpsKey = (Number(fps) || 0) >= 45 ? 60 : 30;
   const resKey = normalizeResolution(resolution); // "480p" | "720p" | "1080p" | "4k"
 
-  const modelKey = String(model || "pika").toLowerCase().trim();
+  const modelKey = String(model || "minimax").toLowerCase().trim();
   const mLen = BILLING.LEN_FACTOR[len] ?? 1.0;
   const mFps = BILLING.FPS_FACTOR[fpsKey] ?? 1.0;
   const mRes = BILLING.RES_FACTOR[resKey] ?? 1.0;
@@ -1740,7 +1742,6 @@ const PROVIDERS = {
   },
   wan: {
     apiKey: String(process.env.WAN_API_KEY || "").trim(),
-    baseUrl: String(process.env.WAN_BASE_URL || "https://api.minimax.io").trim().replace(/\/+$/, ""),
     textModel: String(process.env.WAN_TEXT_MODEL || "fal-ai/wan/v2.7/text-to-video").trim(),
     imageModel: String(process.env.WAN_IMAGE_MODEL || "fal-ai/wan/v2.7/image-to-video").trim(),
   },
@@ -1783,22 +1784,21 @@ function mapAspectRatio(orientation) {
 }
 
 function mapRunwayRatio(orientation) {
-  return String(orientation || "").toLowerCase() === "landscape" ? "1280:768" : "768:1280";
-}
-
-function normalizeRunwayModelName(raw) {
-  const v = String(raw || "").trim().toLowerCase();
-  if (!v) return "gen4.5";
-  if (v === "gen4.5" || v === "gen-4.5" || v === "gen45") return "gen4.5";
-  if (v.includes("runwayml/") || v.includes("text_to_video") || v.includes("image_to_video")) return "gen4.5";
-  return String(raw || "").trim();
+  return String(orientation || "").toLowerCase() === "landscape" ? "1280:720" : "720:1280";
 }
 
 function mapWanResolution(resolution) {
-  const r = String(resolution || "").toLowerCase();
-  if (r === "4k") return "1080P";
-  if (r === "1080p") return "1080P";
-  return "768P";
+  const r = String(resolution || "").toLowerCase().trim();
+  if (r === "1080p" || r === "4k") return "1080p";
+  return "720p";
+}
+
+function normalizeRunwayModel(model) {
+  const m = String(model || "").trim().toLowerCase();
+  if (!m) return "gen4.5";
+  if (m === "runwayml/v1/text_to_video" || m === "runwayml/v1/image_to_video") return "gen4.5";
+  if (m === "gen4.5" || m === "gen4_5" || m === "gen45") return "gen4.5";
+  return String(model || "gen4.5").trim();
 }
 
 function mapPikaResolution(resolution) {
@@ -1882,69 +1882,56 @@ function pickVideoUrlFromAny(obj) {
 
 async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
   const cfg = ensureProviderReady("wan");
-  const payload = {
-    model: hasImage ? cfg.imageModel : cfg.textModel,
-    prompt: String(prompt || "").trim(),
-    duration: Number(lengthSec || 6),
-    resolution: mapWanResolution(resolution),
-  };
-  if (cfg.callbackUrl) payload.callback_url = cfg.callbackUrl;
+  let signedInput = null;
   if (hasImage && localImagePath) {
-    payload.first_frame_image = await localFileToDataUrl(localImagePath, mimeType || "image/jpeg");
+    signedInput = await uploadTempInputAndGetSignedUrl(uid, localImagePath, mimeType || "image/jpeg");
   }
-  const create = await httpJson(`${cfg.baseUrl}/v1/video_generation`, {
+
+  const modelSlug = hasImage ? cfg.imageModel : cfg.textModel;
+  const input = {
+    prompt: String(prompt || "").trim(),
+    duration: Math.max(2, Math.min(15, Number(lengthSec || 5))),
+    aspect_ratio: mapAspectRatio(orientation),
+    resolution: mapWanResolution(resolution),
+    enable_prompt_expansion: true,
+    enable_safety_checker: true,
+  };
+  if (hasImage && signedInput?.signedUrl) input.image_url = signedInput.signedUrl;
+
+  const submit = await httpJson(`https://queue.fal.run/${modelSlug}`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${cfg.apiKey}`,
+      Authorization: `Key ${cfg.apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ input }),
     timeoutMs: 90000,
   });
-  const statusCode = Number(create?.json?.base_resp?.status_code ?? -1);
-  const statusMsg = String(create?.json?.base_resp?.status_msg || "");
+  const requestId = String(submit.json?.request_id || submit.json?.requestId || "").trim();
+  if (!requestId) throw new Error("WAN_REQUEST_ID_MISSING");
 
-  if (statusCode !== 0) {
-    throw new Error(`WAN_CREATE_FAILED:${statusCode}:${statusMsg}`);
-  }
-
-  const taskId = String(create?.json?.task_id || "").trim();
-  if (!taskId) {
-    console.log("❌ WAN raw response", create?.json);
-    throw new Error("WAN_TASK_ID_MISSING");
-  }
-
-  let fileId = null;
+  let videoUrl = null;
   for (let i = 0; i < 30; i += 1) {
     await sleep(4000);
-    const q = await httpJson(`${cfg.baseUrl}/v1/query/video_generation?task_id=${encodeURIComponent(taskId)}`, {
-      headers: { Authorization: `Bearer ${cfg.apiKey}` },
+    const status = await httpJson(`https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`, {
+      headers: { Authorization: `Key ${cfg.apiKey}` },
       timeoutMs: 45000,
     });
-    const j = q.json || {};
-    const status = String(j.status || j.task_status || "").toLowerCase();
-    if (status === "success") {
-      fileId = String(j.file_id || j.fileId || "").trim();
+    const s = String(status.json?.status || "").toUpperCase();
+    if (s === "COMPLETED") {
+      const result = await httpJson(`https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}`, {
+        headers: { Authorization: `Key ${cfg.apiKey}` },
+        timeoutMs: 45000,
+      });
+      videoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
       break;
     }
-    if (status === "failed") {
-      throw new Error(`WAN_FAILED:${j.base_resp?.status_msg || j.status_msg || "failed"}`);
+    if (s === "FAILED") {
+      throw new Error(`WAN_FAILED:${status.json?.error || status.json?.detail || "failed"}`);
     }
   }
-  if (!fileId) throw new Error("WAN_TIMEOUT");
-
-  const dl = await httpJson(`${cfg.baseUrl}/v1/files/retrieve?file_id=${encodeURIComponent(fileId)}`, {
-    headers: { Authorization: `Bearer ${cfg.apiKey}` },
-    timeoutMs: 45000,
-  });
-  const videoUrl =
-    dl.json?.file?.download_url ||
-    dl.json?.file?.url ||
-    dl.json?.download_url ||
-    dl.json?.url ||
-    pickVideoUrlFromAny(dl.json);
-  if (!videoUrl) throw new Error("WAN_VIDEO_URL_MISSING");
-  return { provider: "wan", taskId, videoUrl };
+  if (!videoUrl) throw new Error("WAN_TIMEOUT");
+  return { provider: "wan", taskId: requestId, videoUrl };
 }
 
 async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
@@ -2066,7 +2053,7 @@ async function createRunwayTask({ uid, prompt, hasImage, localImagePath, mimeTyp
   const cfg = ensureProviderReady("runway");
   const endpoint = hasImage ? "/v1/image_to_video" : "/v1/text_to_video";
   const payload = {
-    model: normalizeRunwayModelName(hasImage ? cfg.imageModel : cfg.textModel),
+    model: normalizeRunwayModel(hasImage ? cfg.imageModel : cfg.textModel),
     promptText: String(prompt || "").trim(),
     ratio: mapRunwayRatio(orientation),
     duration: Math.max(2, Math.min(10, Number(lengthSec || 5))),
