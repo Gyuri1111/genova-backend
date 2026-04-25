@@ -2560,7 +2560,15 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const useRewardedAudioMix = String(body.useRewardedAudioMix || '').toLowerCase() === 'true';
 const prompt = String(body.prompt || body.text || "").trim();
     const model = mapOutputToProviderModel(String(body.model || "pika").trim());
-    const lengthSec = Math.max(1, Math.min(60, Number(body.lengthSec ?? body.length ?? 5)));
+    const rawLength =
+      body.lengthSec ??
+      body.videoLength ??
+      body.durationSec ??
+      body.duration ??
+      body.seconds ??
+      body.length ??
+      5;
+    const lengthSec = Math.max(1, Math.min(60, Number(rawLength)));
     const fps = Math.max(1, Math.min(120, Number(body.fps ?? 30)));
     const resolution = String(body.resolution || body.res || "720p").trim();
     const hasFile = !!req.file;
@@ -2732,6 +2740,7 @@ const prompt = String(body.prompt || body.text || "").trim();
       resolution,
       fps,
       lengthSec,
+      rawLength,
       videoTestMode,
     });
 
