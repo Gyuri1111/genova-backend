@@ -2197,6 +2197,40 @@ function tryCopyLocalPlaceholder(outPath, orientation) {
   return false;
 }
 
+function pickLocalTestVideoFileName(lengthSec) {
+  const n = Number(lengthSec || 10);
+  if (n <= 5.5) return "test_5s.mp4";
+  if (n <= 10.5) return "test_10s.mp4";
+  return "test_15s.mp4";
+}
+
+function tryCopyLocalTestVideo(outPath, lengthSec) {
+  const fileName = pickLocalTestVideoFileName(lengthSec);
+  const candidates = [
+    path.join(process.cwd(), "public", fileName),
+    path.join(__dirname, "public", fileName),
+    path.join(process.cwd(), fileName),
+    path.join(__dirname, fileName),
+  ];
+
+  console.log("🧪 LOCAL_TEST_VIDEO_CANDIDATES", { lengthSec, fileName, candidates });
+
+  for (const cand of candidates) {
+    try {
+      if (fs.existsSync(cand)) {
+        fs.copyFileSync(cand, outPath);
+        console.log("🧪 LOCAL_TEST_VIDEO_FOUND", { cand, outPath });
+        return true;
+      }
+    } catch (e) {
+      console.log("⚠️ LOCAL_TEST_VIDEO_COPY_FAILED", { cand, error: e?.message || String(e) });
+    }
+  }
+
+  console.log("🔴 LOCAL_TEST_VIDEO_NOT_FOUND", { lengthSec, fileName });
+  return false;
+}
+
 async function downloadToFile(url, outPath) {
   const https = require("https");
   const http = require("http");
@@ -2255,7 +2289,7 @@ async function uploadFileToFirebaseStorage(localPath, destPath, contentType) {
  *
  * Watermarking + thumbnail generation are handled in Firebase Functions.
  */
-async function finalizeGeneratedVideo({ uid, creationId, sourceUrl, orientation }) {
+async function finalizeGeneratedVideo({ uid, creationId, sourceUrl, orientation, lengthSec }) {
   const tmpDir = os.tmpdir();
   const safeUid = String(uid || "anon").replace(/[^a-zA-Z0-9_-]/g, "");
   const safeId = String(creationId || uuidv4()).replace(/[^a-zA-Z0-9_-]/g, "");
@@ -2263,10 +2297,20 @@ async function finalizeGeneratedVideo({ uid, creationId, sourceUrl, orientation 
   const localSrc = path.join(tmpDir, `genova_src_${safeId}.mp4`);
 
   // Acquire source
+  const sourceUrlStr = String(sourceUrl || "");
+  const isLocalTestVideo = sourceUrlStr.startsWith("local-test-video://");
   const isPlaceholder =
-    String(sourceUrl || "").includes("/placeholder.mp4") ||
-    String(sourceUrl || "").includes("/placeholder-portrait.mp4");
-  if (isPlaceholder) {
+    sourceUrlStr.includes("/placeholder.mp4") ||
+    sourceUrlStr.includes("/placeholder-portrait.mp4");
+
+  if (isLocalTestVideo) {
+    const copied = tryCopyLocalTestVideo(localSrc, lengthSec);
+    if (!copied) {
+      const err = new Error("LOCAL_TEST_VIDEO_MISSING");
+      err.code = "LOCAL_TEST_VIDEO_MISSING";
+      throw err;
+    }
+  } else if (isPlaceholder) {
     const copied = tryCopyLocalPlaceholder(localSrc, orientation);
     if (!copied) {
       // Avoid a self-HTTP call on Render (can be flaky behind the proxy).
@@ -2279,7 +2323,7 @@ async function finalizeGeneratedVideo({ uid, creationId, sourceUrl, orientation 
   }
 
   // Validate we really got an mp4 (prevents saving HTML/redirect pages)
-  const validMp4 = validateLocalMp4(localSrc, isPlaceholder ? "placeholder" : "sourceUrl");
+  const validMp4 = validateLocalMp4(localSrc, isLocalTestVideo ? "local-test-video" : (isPlaceholder ? "placeholder" : "sourceUrl"));
   if (!validMp4) {
     const err = new Error("SOURCE_NOT_MP4");
     err.code = "SOURCE_NOT_MP4";
@@ -2676,8 +2720,10 @@ const prompt = String(body.prompt || body.text || "").trim();
       createdAt,
     });
 
-    // --- Real provider generation ---
+    // --- Provider generation / local test mode ---
     const provider = resolveProviderFromModel(model);
+    const videoTestMode = String(process.env.GENOVA_VIDEO_TEST_MODE || "").trim() === "1";
+
     console.log("🎬 PROVIDER_RESOLVE", {
       provider,
       model,
@@ -2686,53 +2732,70 @@ const prompt = String(body.prompt || body.text || "").trim();
       resolution,
       fps,
       lengthSec,
+      videoTestMode,
     });
 
     const imageMimeType = String(req.file?.mimetype || "image/jpeg").trim() || "image/jpeg";
-    const providerResult =
-      provider === "wan"
-        ? await createWanTask({
-            uid,
-            prompt,
-            hasImage: !!req.file,
-            localImagePath: req.file?.path || null,
-            mimeType: imageMimeType,
-            lengthSec,
-            resolution,
-            orientation: outputFrame.orientation,
-          })
-        : provider === "pika"
-        ? await createPikaTask({
-            uid,
-            prompt,
-            hasImage: !!req.file,
-            localImagePath: req.file?.path || null,
-            mimeType: imageMimeType,
-            lengthSec,
-            resolution,
-            orientation: outputFrame.orientation,
-          })
-        : provider === "kling"
-        ? await createKlingTask({
-            uid,
-            prompt,
-            hasImage: !!req.file,
-            localImagePath: req.file?.path || null,
-            mimeType: imageMimeType,
-            lengthSec,
-            resolution,
-            orientation: outputFrame.orientation,
-          })
-        : await createRunwayTask({
-            uid,
-            prompt,
-            hasImage: !!req.file,
-            localImagePath: req.file?.path || null,
-            mimeType: imageMimeType,
-            lengthSec,
-            resolution,
-            orientation: outputFrame.orientation,
-          });
+
+    let providerResult = null;
+
+    if (videoTestMode) {
+      const testFileName = pickLocalTestVideoFileName(lengthSec);
+      console.log("🧪 GENOVA_VIDEO_TEST_MODE active - skipping external provider", {
+        lengthSec,
+        testFileName,
+      });
+      providerResult = {
+        provider: "local_test",
+        taskId: `local_test_${Date.now()}`,
+        videoUrl: `local-test-video://${testFileName}`,
+      };
+    } else {
+      providerResult =
+        provider === "wan"
+          ? await createWanTask({
+              uid,
+              prompt,
+              hasImage: !!req.file,
+              localImagePath: req.file?.path || null,
+              mimeType: imageMimeType,
+              lengthSec,
+              resolution,
+              orientation: outputFrame.orientation,
+            })
+          : provider === "pika"
+          ? await createPikaTask({
+              uid,
+              prompt,
+              hasImage: !!req.file,
+              localImagePath: req.file?.path || null,
+              mimeType: imageMimeType,
+              lengthSec,
+              resolution,
+              orientation: outputFrame.orientation,
+            })
+          : provider === "kling"
+          ? await createKlingTask({
+              uid,
+              prompt,
+              hasImage: !!req.file,
+              localImagePath: req.file?.path || null,
+              mimeType: imageMimeType,
+              lengthSec,
+              resolution,
+              orientation: outputFrame.orientation,
+            })
+          : await createRunwayTask({
+              uid,
+              prompt,
+              hasImage: !!req.file,
+              localImagePath: req.file?.path || null,
+              mimeType: imageMimeType,
+              lengthSec,
+              resolution,
+              orientation: outputFrame.orientation,
+            });
+    }
 
     const sourceUrl = String(providerResult?.videoUrl || "").trim();
     if (!sourceUrl) throw new Error("PROVIDER_VIDEO_URL_MISSING");
@@ -2764,6 +2827,7 @@ const prompt = String(body.prompt || body.text || "").trim();
 	  creationId,
 	  sourceUrl,
 	  orientation: outputFrame.orientation,
+	  lengthSec,
 	});
 
     const url = finalized.videoUrl;// Mark as ready
