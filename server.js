@@ -52,7 +52,7 @@ require("dotenv").config();
 const { emailTemplate } = require("./src/utils/emailTemplate");
 
 const BUILD_TAG =
-  "NO_FFMPEG_ON_RENDER__FAL_QUEUE_GET_PIKA_WAN__2026-05-06";
+  "NO_FFMPEG_ON_RENDER__WATERMARK_THUMB_IN_FUNCTIONS__2026-03-22_VIDEO_READY_EMAIL_VIA_API";
 
 const VIDEO_READY_EMAIL_ENDPOINT =
   process.env.VIDEO_READY_EMAIL_ENDPOINT ||
@@ -1811,21 +1811,12 @@ async function httpJson(url, { method = "GET", headers = {}, body = undefined, t
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const fetchOpts = {
+    const res = await fetch(url, {
       method,
       headers,
+      body,
       signal: controller.signal,
-    };
-
-    // Important for FAL queue polling:
-    // GET requests must be sent with absolutely no body field. Some runtimes / proxies
-    // can behave differently if body is present as undefined, and FAL queue status/result
-    // endpoints are strict about the request method/body combination.
-    if (body !== undefined && String(method || "GET").toUpperCase() !== "GET") {
-      fetchOpts.body = body;
-    }
-
-    const res = await fetch(url, fetchOpts);
+    });
     const raw = await res.text().catch(() => "");
     let json = null;
     try { json = raw ? JSON.parse(raw) : null; } catch (_) { json = null; }
@@ -1835,24 +1826,12 @@ async function httpJson(url, { method = "GET", headers = {}, body = undefined, t
       err.url = url;
       err.raw = raw;
       err.json = json;
-      err.method = String(method || "GET").toUpperCase();
       throw err;
     }
     return { res, raw, json };
   } finally {
     clearTimeout(t);
   }
-}
-
-async function falQueueGetJson(url, apiKey, timeoutMs = 45000) {
-  return httpJson(url, {
-    method: "GET",
-    headers: {
-      Authorization: `Key ${apiKey}`,
-      Accept: "application/json",
-    },
-    timeoutMs,
-  });
 }
 
 function ensureProviderReady(provider) {
@@ -1884,21 +1863,6 @@ async function uploadTempInputAndGetSignedUrl(uid, localPath, mimeType = "image/
     expires: Date.now() + 1000 * 60 * 60,
   });
   return { signedUrl, objectPath };
-}
-
-
-function buildFalQueueResponseUrl(modelSlug, requestId) {
-  return `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/response`;
-}
-
-function normalizeFalQueueResponseUrl(rawUrl, modelSlug, requestId) {
-  const fallback = buildFalQueueResponseUrl(modelSlug, requestId);
-  const u = String(rawUrl || "").trim();
-  // Some FAL models return response_url/resultUrl as /requests/<id>, but for queue
-  // result fetching that can hit the model endpoint and return 422 missing prompt.
-  // Force the queue response endpoint unless the URL already explicitly ends in /response.
-  if (!u || !/\/response(?:$|[?#])/i.test(u)) return fallback;
-  return u;
 }
 
 function pickVideoUrlFromAny(obj) {
@@ -1934,51 +1898,55 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
   };
   if (hasImage && signedInput?.signedUrl) input.image_url = signedInput.signedUrl;
 
+  // IMPORTANT: fal REST queue submit expects the model input object directly.
+  // Do NOT wrap it as { input }, otherwise models like Pika/WAN receive
+  // body.input.prompt instead of body.prompt and later fail with misleading 405/422 errors.
   const submit = await httpJson(`https://queue.fal.run/${modelSlug}`, {
     method: "POST",
     headers: {
       Authorization: `Key ${cfg.apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ input }),
+    body: JSON.stringify(input),
     timeoutMs: 90000,
   });
   const requestId = String(submit.json?.request_id || submit.json?.requestId || "").trim();
   if (!requestId) throw new Error("WAN_REQUEST_ID_MISSING");
 
-  const statusUrl =
-    submit.json?.status_url ||
-    submit.json?.statusUrl ||
-    `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
+  const fallbackStatusUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
+  const fallbackResultUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/response`;
+  const statusUrl = String(submit.json?.status_url || submit.json?.statusUrl || fallbackStatusUrl).trim();
+  let resultUrl = String(submit.json?.response_url || submit.json?.responseUrl || fallbackResultUrl).trim();
 
-  const resultUrl = normalizeFalQueueResponseUrl(
-    submit.json?.response_url ||
-      submit.json?.responseUrl ||
-      submit.json?.result_url ||
-      submit.json?.resultUrl,
+  console.log("🟦 FAL_WAN_QUEUE_URLS", {
+    requestId,
     modelSlug,
-    requestId
-  );
-
-  console.log("🟦 FAL_WAN_QUEUE_URLS", { requestId, statusUrl, resultUrl });
+    statusUrl,
+    resultUrl,
+    inputKeys: Object.keys(input || {}),
+  });
 
   let videoUrl = null;
   for (let i = 0; i < 30; i += 1) {
     await sleep(4000);
-    const status = await falQueueGetJson(statusUrl, cfg.apiKey, 45000);
+    const status = await httpJson(statusUrl, {
+      method: "GET",
+      headers: { Authorization: `Key ${cfg.apiKey}` },
+      timeoutMs: 45000,
+    });
     const s = String(status.json?.status || "").toUpperCase();
+
+    if (status.json?.response_url || status.json?.responseUrl) {
+      resultUrl = String(status.json.response_url || status.json.responseUrl).trim();
+    }
+
     if (s === "COMPLETED") {
-      const completedResultUrl = normalizeFalQueueResponseUrl(
-        status.json?.response_url ||
-          status.json?.responseUrl ||
-          status.json?.result_url ||
-          status.json?.resultUrl ||
-          resultUrl,
-        modelSlug,
-        requestId
-      );
-      console.log("🟩 FAL_WAN_RESULT_URL", { requestId, completedResultUrl });
-      const result = await falQueueGetJson(completedResultUrl, cfg.apiKey, 45000);
+      console.log("🟩 FAL_WAN_RESULT_URL", { requestId, completedResultUrl: resultUrl });
+      const result = await httpJson(resultUrl, {
+        method: "GET",
+        headers: { Authorization: `Key ${cfg.apiKey}` },
+        timeoutMs: 45000,
+      });
       videoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
       break;
     }
@@ -2005,56 +1973,60 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
   };
   if (hasImage && signedInput?.signedUrl) input.image_url = signedInput.signedUrl;
 
+  // IMPORTANT: fal REST queue submit expects the model input object directly.
+  // Do NOT wrap it as { input }, otherwise Pika receives body.input.prompt
+  // instead of body.prompt and the queue/result flow can return misleading 405/422 errors.
   const submit = await httpJson(`https://queue.fal.run/${modelSlug}`, {
     method: "POST",
     headers: {
       Authorization: `Key ${cfg.apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ input }),
+    body: JSON.stringify(input),
     timeoutMs: 90000,
   });
   const requestId = String(submit.json?.request_id || submit.json?.requestId || "").trim();
   if (!requestId) throw new Error("PIKA_REQUEST_ID_MISSING");
 
-  const statusUrl =
-    submit.json?.status_url ||
-    submit.json?.statusUrl ||
-    `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
+  const fallbackStatusUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
+  const fallbackResultUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/response`;
+  const statusUrl = String(submit.json?.status_url || submit.json?.statusUrl || fallbackStatusUrl).trim();
+  let resultUrl = String(submit.json?.response_url || submit.json?.responseUrl || fallbackResultUrl).trim();
 
-  const resultUrl = normalizeFalQueueResponseUrl(
-    submit.json?.response_url ||
-      submit.json?.responseUrl ||
-      submit.json?.result_url ||
-      submit.json?.resultUrl,
+  console.log("🟦 FAL_PIKA_QUEUE_URLS", {
+    requestId,
     modelSlug,
-    requestId
-  );
-
-  console.log("🟦 FAL_PIKA_QUEUE_URLS", { requestId, statusUrl, resultUrl });
+    statusUrl,
+    resultUrl,
+    inputKeys: Object.keys(input || {}),
+  });
 
   let videoUrl = null;
   for (let i = 0; i < 30; i += 1) {
     await sleep(4000);
-    const status = await falQueueGetJson(statusUrl, cfg.apiKey, 45000);
+    const status = await httpJson(statusUrl, {
+      method: "GET",
+      headers: { Authorization: `Key ${cfg.apiKey}` },
+      timeoutMs: 45000,
+    });
     const s = String(status.json?.status || "").toUpperCase();
+
+    if (status.json?.response_url || status.json?.responseUrl) {
+      resultUrl = String(status.json.response_url || status.json.responseUrl).trim();
+    }
+
     if (s === "COMPLETED") {
-      const completedResultUrl = normalizeFalQueueResponseUrl(
-        status.json?.response_url ||
-          status.json?.responseUrl ||
-          status.json?.result_url ||
-          status.json?.resultUrl ||
-          resultUrl,
-        modelSlug,
-        requestId
-      );
-      console.log("🟩 FAL_PIKA_RESULT_URL", { requestId, completedResultUrl });
-      const result = await falQueueGetJson(completedResultUrl, cfg.apiKey, 45000);
-      videoUrl = pickVideoUrlFromAny(result.json);
+      console.log("🟩 FAL_PIKA_RESULT_URL", { requestId, completedResultUrl: resultUrl });
+      const result = await httpJson(resultUrl, {
+        method: "GET",
+        headers: { Authorization: `Key ${cfg.apiKey}` },
+        timeoutMs: 45000,
+      });
+      videoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
       break;
     }
     if (s === "FAILED") {
-      throw new Error(`PIKA_FAILED:${status.json?.error || "failed"}`);
+      throw new Error(`PIKA_FAILED:${status.json?.error || status.json?.detail || "failed"}`);
     }
   }
   if (!videoUrl) throw new Error("PIKA_TIMEOUT");
