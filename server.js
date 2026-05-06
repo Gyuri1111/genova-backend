@@ -1763,6 +1763,12 @@ const PROVIDERS = {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// FAL video providers can take longer than 120s, especially Pika/WAN v2.x.
+// Keep the HTTP request alive longer instead of cancelling exactly when the model is still processing.
+const FAL_VIDEO_MAX_POLLS = Number(process.env.FAL_VIDEO_MAX_POLLS || 90); // 90 * 4s = ~6 minutes
+const FAL_VIDEO_POLL_INTERVAL_MS = Number(process.env.FAL_VIDEO_POLL_INTERVAL_MS || 4000);
+
+
 function resolveProviderFromModel(rawModel) {
   const m = String(rawModel || "").trim().toLowerCase();
   if (m === "runway") return "runway";
@@ -1927,8 +1933,8 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
   });
 
   let videoUrl = null;
-  for (let i = 0; i < 30; i += 1) {
-    await sleep(4000);
+  for (let i = 0; i < FAL_VIDEO_MAX_POLLS; i += 1) {
+    await sleep(FAL_VIDEO_POLL_INTERVAL_MS);
     const status = await httpJson(statusUrl, {
       method: "GET",
       headers: { Authorization: `Key ${cfg.apiKey}` },
@@ -1954,7 +1960,7 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
       throw new Error(`WAN_FAILED:${status.json?.error || status.json?.detail || "failed"}`);
     }
   }
-  if (!videoUrl) throw new Error("WAN_TIMEOUT");
+  if (!videoUrl) throw new Error(`WAN_TIMEOUT_AFTER_${FAL_VIDEO_MAX_POLLS}_POLLS`);
   return { provider: "wan", taskId: requestId, videoUrl };
 }
 
@@ -2029,7 +2035,7 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
       throw new Error(`PIKA_FAILED:${status.json?.error || status.json?.detail || "failed"}`);
     }
   }
-  if (!videoUrl) throw new Error("PIKA_TIMEOUT");
+  if (!videoUrl) throw new Error(`PIKA_TIMEOUT_AFTER_${FAL_VIDEO_MAX_POLLS}_POLLS`);
   return { provider: "pika", taskId: requestId, videoUrl };
 }
 
