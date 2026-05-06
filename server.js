@@ -1419,24 +1419,29 @@ async function sendEmailIfAllowed({ uid, userDoc, type, title, body, data }) {
 // ------------------------------------------------------------
 async function setLastResult(uid, payload) {
   if (!uid) return;
-  await db
-    .collection("users")
-    .doc(uid)
-    .set(
-      {
-        lastResult: {
-          id: payload?.id || String(Date.now()),
-          status: payload?.status || "ready", // "ready" | "error"
-          title: payload?.title || "",
-          message: payload?.message || "",
-          url: payload?.url || "",
-          meta: payload?.meta || {},
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          seenAt: null,
-        },
-      },
-      { merge: true }
-    );
+
+  const lastResult = {
+    id: payload?.id || String(Date.now()),
+    status: payload?.status || "ready", // "ready" | "error"
+    title: payload?.title || "",
+    message: payload?.message || "",
+    url: payload?.url || "",
+    meta: payload?.meta || {},
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    seenAt: null,
+  };
+
+  const userRef = db.collection("users").doc(uid);
+
+  // IMPORTANT:
+  // Use update({ lastResult }) so Firestore replaces the whole lastResult map.
+  // set(..., { merge:true }) deep-merges nested maps, which can leave stale
+  // lastResult.meta.creationId / url / status values from a previous generation.
+  try {
+    await userRef.update({ lastResult });
+  } catch (e) {
+    await userRef.set({ lastResult }, { merge: true });
+  }
 }
 
 function normalizeLastResultMeta({ model, videoLength, resolution, fps } = {}) {
@@ -1871,18 +1876,76 @@ async function uploadTempInputAndGetSignedUrl(uid, localPath, mimeType = "image/
   return { signedUrl, objectPath };
 }
 
+function isUsableGeneratedVideoUrl(value) {
+  const u = String(value || "").trim();
+  if (!u) return false;
+  const lower = u.toLowerCase();
+
+  // Never treat queue/control URLs or app placeholders as provider output videos.
+  if (lower.includes("queue.fal.run/")) return false;
+  if (lower.includes("/placeholder.mp4") || lower.includes("/placeholder-portrait.mp4")) return false;
+  if (lower.startsWith("local-test-video://")) return false;
+
+  // fal/media + common mp4 URLs are acceptable. Some fal URLs are signed and
+  // might not end with .mp4, so prefer host patterns as well.
+  return (
+    lower.includes("fal.media") ||
+    lower.includes("falserverless") ||
+    lower.includes("storage.googleapis.com") ||
+    lower.includes("firebasestorage.googleapis.com") ||
+    lower.includes(".mp4")
+  );
+}
+
+function logFalResultJson(label, json) {
+  try {
+    const raw = JSON.stringify(json || null, null, 2);
+    console.log(label, raw.slice(0, 8000));
+  } catch (e) {
+    console.log(label, { stringifyError: e?.message || String(e), type: typeof json });
+  }
+}
+
 function pickVideoUrlFromAny(obj) {
   if (!obj || typeof obj !== "object") return null;
-  const direct = obj.videoUrl || obj.video_url || obj.url || null;
-  if (direct) return String(direct);
-  const output0 = Array.isArray(obj.output) && obj.output[0] ? obj.output[0] : null;
-  if (output0) return String(output0);
-  const data = obj.data || {};
-  const d1 = data.videoUrl || data.video_url || data.url || null;
-  if (d1) return String(d1);
-  if (Array.isArray(data.videos) && data.videos[0]?.url) return String(data.videos[0].url);
-  if (obj.task_result?.videos?.[0]?.url) return String(obj.task_result.videos[0].url);
-  if (obj.data?.task_result?.videos?.[0]?.url) return String(obj.data.task_result.videos[0].url);
+
+  const candidates = [
+    obj.video?.url,
+    obj.data?.video?.url,
+    obj.output?.video?.url,
+    obj.data?.output?.video?.url,
+    obj.result?.video?.url,
+    obj.data?.result?.video?.url,
+    obj.videoUrl,
+    obj.video_url,
+    obj.data?.videoUrl,
+    obj.data?.video_url,
+    obj.task_result?.video?.url,
+    obj.data?.task_result?.video?.url,
+    obj.task_result?.videos?.[0]?.url,
+    obj.data?.task_result?.videos?.[0]?.url,
+    Array.isArray(obj.videos) ? obj.videos[0]?.url : null,
+    Array.isArray(obj.data?.videos) ? obj.data.videos[0]?.url : null,
+    Array.isArray(obj.output) ? obj.output[0]?.url || obj.output[0] : null,
+    Array.isArray(obj.data?.output) ? obj.data.output[0]?.url || obj.data.output[0] : null,
+
+    // Last resort only: generic url fields can also mean queue/control URLs.
+    obj.url,
+    obj.data?.url,
+  ];
+
+  for (const c of candidates) {
+    if (isUsableGeneratedVideoUrl(c)) return String(c).trim();
+  }
+
+  console.log("🔴 FAL_RESULT_VIDEO_URL_NOT_FOUND", {
+    topLevelKeys: Object.keys(obj || {}),
+    dataKeys: obj?.data && typeof obj.data === "object" ? Object.keys(obj.data) : [],
+    outputType: Array.isArray(obj?.output) ? "array" : typeof obj?.output,
+    hasVideo: !!obj?.video,
+    hasDataVideo: !!obj?.data?.video,
+  });
+
   return null;
 }
 
@@ -1953,7 +2016,9 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
         headers: { Authorization: `Key ${cfg.apiKey}` },
         timeoutMs: 45000,
       });
+      logFalResultJson("🟨 FAL_WAN_RESULT_JSON", result.json);
       videoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
+      console.log("🟨 FAL_WAN_PICKED_VIDEO_URL", { requestId, videoUrl: videoUrl || null });
       break;
     }
     if (s === "FAILED") {
@@ -2008,8 +2073,8 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
   });
 
   let videoUrl = null;
-  for (let i = 0; i < 30; i += 1) {
-    await sleep(4000);
+  for (let i = 0; i < FAL_VIDEO_MAX_POLLS; i += 1) {
+    await sleep(FAL_VIDEO_POLL_INTERVAL_MS);
     const status = await httpJson(statusUrl, {
       method: "GET",
       headers: { Authorization: `Key ${cfg.apiKey}` },
@@ -2028,7 +2093,9 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
         headers: { Authorization: `Key ${cfg.apiKey}` },
         timeoutMs: 45000,
       });
+      logFalResultJson("🟨 FAL_PIKA_RESULT_JSON", result.json);
       videoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
+      console.log("🟨 FAL_PIKA_PICKED_VIDEO_URL", { requestId, videoUrl: videoUrl || null });
       break;
     }
     if (s === "FAILED") {
@@ -2373,6 +2440,7 @@ async function finalizeGeneratedVideo({ uid, creationId, sourceUrl, orientation,
       console.log("🎬 wrote inline placeholder mp4 to:", localSrc);
     }
   } else {
+    console.log("⬇️ downloading provider video source", { sourceUrl: sourceUrlStr.slice(0, 240), localSrc });
     await downloadToFile(sourceUrl, localSrc);
   }
 
@@ -2751,9 +2819,32 @@ const prompt = String(body.prompt || body.text || "").trim();
 	hasGetVideoFrameForResolution: typeof getVideoFrameForResolution,
 	});
 
-    // Build result skeleton
-    const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    // Stable creation id + filename must be decided BEFORE lastResult.processing.
+    // Otherwise lastResult.id can point to a temporary id while meta.creationId points
+    // to an older client-created pending doc after dedupe.
+    const generatedId = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const createdAt = admin.firestore.Timestamp.now();
+
+    let fileName = String(body.fileName || "").trim() || "";
+    const watermarkApplied = !!billing?.watermarkApplied;
+    if (!fileName) {
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
+      fileName = `GeNova_${model}_${lengthSec}s_${resolution}_${fps}fps_${stamp}.mp4`;
+    }
+
+    const clientCreationId = String(body.creationId || body.creationDocId || body.docId || "").trim();
+    let creationId = clientCreationId || "";
+    if (!creationId) {
+      const pendingId = await findRecentPendingCreationId(db, uid, { model, lengthSec, resolution, fps, fileName });
+      if (pendingId) {
+        creationId = pendingId;
+        console.log("🧩 using existing pending creation docId (dedupe):", creationId);
+      }
+    }
+    if (!creationId) creationId = generatedId;
+    const id = creationId;
 
     const meta = {
 	  model,
@@ -2769,6 +2860,9 @@ const prompt = String(body.prompt || body.text || "").trim();
 	  aspectRatio: outputFrame.aspectRatio,
 	  orientation: outputFrame.orientation,
 	  provider: resolveProviderFromModel(model),
+      creationId,
+      fileName,
+      watermarkRequired: !!watermarkApplied,
 	};
 
     // Mark as processing first
@@ -2861,30 +2955,19 @@ const prompt = String(body.prompt || body.text || "").trim();
     }
 
     const sourceUrl = String(providerResult?.videoUrl || "").trim();
+    console.log("🎥 PROVIDER_VIDEO_URL_RESOLVED", {
+      provider: providerResult?.provider || provider,
+      taskId: providerResult?.taskId || null,
+      sourceUrl: sourceUrl ? sourceUrl.slice(0, 240) : "",
+      usable: isUsableGeneratedVideoUrl(sourceUrl),
+    });
     if (!sourceUrl) throw new Error("PROVIDER_VIDEO_URL_MISSING");
-
-    let fileName = String(body.fileName || "").trim() || "";
-    const watermarkApplied = !!billing?.watermarkApplied;
-    // ✅ If client did not send fileName, generate a stable one (needed for Firestore + share)
-    if (!fileName) {
-      const now = new Date();
-      const pad = (n) => String(n).padStart(2, "0");
-      const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
-      fileName = `GeNova_${model}_${lengthSec}s_${resolution}_${fps}fps_${stamp}.mp4`;
+    if (!videoTestMode && !isUsableGeneratedVideoUrl(sourceUrl)) {
+      const err = new Error("PROVIDER_VIDEO_URL_INVALID_OR_PLACEHOLDER");
+      err.sourceUrl = sourceUrl;
+      throw err;
     }
 
-
-    // Client may send creationId + fileName (recommended)
-    const clientCreationId = String(body.creationId || body.creationDocId || body.docId || "").trim();
-    let creationId = clientCreationId || "";
-    if (!creationId) {
-      const pendingId = await findRecentPendingCreationId(db, uid, { model, lengthSec, resolution, fps, fileName });
-      if (pendingId) {
-        creationId = pendingId;
-        console.log("🧩 using existing pending creation docId (dedupe):", creationId);
-      }
-    }
-    if (!creationId) creationId = id;
     const finalized = await finalizeGeneratedVideo({
 	  uid,
 	  creationId,
