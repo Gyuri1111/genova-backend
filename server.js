@@ -1886,6 +1886,21 @@ async function uploadTempInputAndGetSignedUrl(uid, localPath, mimeType = "image/
   return { signedUrl, objectPath };
 }
 
+
+function buildFalQueueResponseUrl(modelSlug, requestId) {
+  return `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/response`;
+}
+
+function normalizeFalQueueResponseUrl(rawUrl, modelSlug, requestId) {
+  const fallback = buildFalQueueResponseUrl(modelSlug, requestId);
+  const u = String(rawUrl || "").trim();
+  // Some FAL models return response_url/resultUrl as /requests/<id>, but for queue
+  // result fetching that can hit the model endpoint and return 422 missing prompt.
+  // Force the queue response endpoint unless the URL already explicitly ends in /response.
+  if (!u || !/\/response(?:$|[?#])/i.test(u)) return fallback;
+  return u;
+}
+
 function pickVideoUrlFromAny(obj) {
   if (!obj || typeof obj !== "object") return null;
   const direct = obj.videoUrl || obj.video_url || obj.url || null;
@@ -1936,12 +1951,14 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
     submit.json?.statusUrl ||
     `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
 
-  const resultUrl =
+  const resultUrl = normalizeFalQueueResponseUrl(
     submit.json?.response_url ||
-    submit.json?.responseUrl ||
-    submit.json?.result_url ||
-    submit.json?.resultUrl ||
-    `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/response`;
+      submit.json?.responseUrl ||
+      submit.json?.result_url ||
+      submit.json?.resultUrl,
+    modelSlug,
+    requestId
+  );
 
   console.log("🟦 FAL_WAN_QUEUE_URLS", { requestId, statusUrl, resultUrl });
 
@@ -1951,12 +1968,15 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
     const status = await falQueueGetJson(statusUrl, cfg.apiKey, 45000);
     const s = String(status.json?.status || "").toUpperCase();
     if (s === "COMPLETED") {
-      const completedResultUrl =
+      const completedResultUrl = normalizeFalQueueResponseUrl(
         status.json?.response_url ||
-        status.json?.responseUrl ||
-        status.json?.result_url ||
-        status.json?.resultUrl ||
-        resultUrl;
+          status.json?.responseUrl ||
+          status.json?.result_url ||
+          status.json?.resultUrl ||
+          resultUrl,
+        modelSlug,
+        requestId
+      );
       console.log("🟩 FAL_WAN_RESULT_URL", { requestId, completedResultUrl });
       const result = await falQueueGetJson(completedResultUrl, cfg.apiKey, 45000);
       videoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
@@ -2002,12 +2022,14 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
     submit.json?.statusUrl ||
     `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
 
-  const resultUrl =
+  const resultUrl = normalizeFalQueueResponseUrl(
     submit.json?.response_url ||
-    submit.json?.responseUrl ||
-    submit.json?.result_url ||
-    submit.json?.resultUrl ||
-    `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/response`;
+      submit.json?.responseUrl ||
+      submit.json?.result_url ||
+      submit.json?.resultUrl,
+    modelSlug,
+    requestId
+  );
 
   console.log("🟦 FAL_PIKA_QUEUE_URLS", { requestId, statusUrl, resultUrl });
 
@@ -2017,12 +2039,15 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
     const status = await falQueueGetJson(statusUrl, cfg.apiKey, 45000);
     const s = String(status.json?.status || "").toUpperCase();
     if (s === "COMPLETED") {
-      const completedResultUrl =
+      const completedResultUrl = normalizeFalQueueResponseUrl(
         status.json?.response_url ||
-        status.json?.responseUrl ||
-        status.json?.result_url ||
-        status.json?.resultUrl ||
-        resultUrl;
+          status.json?.responseUrl ||
+          status.json?.result_url ||
+          status.json?.resultUrl ||
+          resultUrl,
+        modelSlug,
+        requestId
+      );
       console.log("🟩 FAL_PIKA_RESULT_URL", { requestId, completedResultUrl });
       const result = await falQueueGetJson(completedResultUrl, cfg.apiKey, 45000);
       videoUrl = pickVideoUrlFromAny(result.json);
