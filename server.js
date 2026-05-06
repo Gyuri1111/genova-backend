@@ -52,7 +52,7 @@ require("dotenv").config();
 const { emailTemplate } = require("./src/utils/emailTemplate");
 
 const BUILD_TAG =
-  "NO_FFMPEG_ON_RENDER__WATERMARK_THUMB_IN_FUNCTIONS__2026-03-22_VIDEO_READY_EMAIL_VIA_API";
+  "NO_FFMPEG_ON_RENDER__FAL_QUEUE_GET_PIKA_WAN__2026-05-06";
 
 const VIDEO_READY_EMAIL_ENDPOINT =
   process.env.VIDEO_READY_EMAIL_ENDPOINT ||
@@ -1811,12 +1811,21 @@ async function httpJson(url, { method = "GET", headers = {}, body = undefined, t
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
+    const fetchOpts = {
       method,
       headers,
-      body,
       signal: controller.signal,
-    });
+    };
+
+    // Important for FAL queue polling:
+    // GET requests must be sent with absolutely no body field. Some runtimes / proxies
+    // can behave differently if body is present as undefined, and FAL queue status/result
+    // endpoints are strict about the request method/body combination.
+    if (body !== undefined && String(method || "GET").toUpperCase() !== "GET") {
+      fetchOpts.body = body;
+    }
+
+    const res = await fetch(url, fetchOpts);
     const raw = await res.text().catch(() => "");
     let json = null;
     try { json = raw ? JSON.parse(raw) : null; } catch (_) { json = null; }
@@ -1826,12 +1835,24 @@ async function httpJson(url, { method = "GET", headers = {}, body = undefined, t
       err.url = url;
       err.raw = raw;
       err.json = json;
+      err.method = String(method || "GET").toUpperCase();
       throw err;
     }
     return { res, raw, json };
   } finally {
     clearTimeout(t);
   }
+}
+
+async function falQueueGetJson(url, apiKey, timeoutMs = 45000) {
+  return httpJson(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Key ${apiKey}`,
+      Accept: "application/json",
+    },
+    timeoutMs,
+  });
 }
 
 function ensureProviderReady(provider) {
@@ -1910,21 +1931,27 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
   const requestId = String(submit.json?.request_id || submit.json?.requestId || "").trim();
   if (!requestId) throw new Error("WAN_REQUEST_ID_MISSING");
 
+  const statusUrl =
+    submit.json?.status_url ||
+    submit.json?.statusUrl ||
+    `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
+
+  const resultUrl =
+    submit.json?.response_url ||
+    submit.json?.responseUrl ||
+    submit.json?.result_url ||
+    submit.json?.resultUrl ||
+    `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}`;
+
+  console.log("🟦 FAL_WAN_QUEUE_URLS", { requestId, statusUrl, resultUrl });
+
   let videoUrl = null;
   for (let i = 0; i < 30; i += 1) {
     await sleep(4000);
-    const status = await httpJson(`https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`, {
-      method: "GET",
-      headers: { Authorization: `Key ${cfg.apiKey}` },
-      timeoutMs: 45000,
-    });
+    const status = await falQueueGetJson(statusUrl, cfg.apiKey, 45000);
     const s = String(status.json?.status || "").toUpperCase();
     if (s === "COMPLETED") {
-      const result = await httpJson(`https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}`, {
-        method: "GET",
-        headers: { Authorization: `Key ${cfg.apiKey}` },
-        timeoutMs: 45000,
-      });
+      const result = await falQueueGetJson(resultUrl, cfg.apiKey, 45000);
       videoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
       break;
     }
@@ -1963,21 +1990,27 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
   const requestId = String(submit.json?.request_id || submit.json?.requestId || "").trim();
   if (!requestId) throw new Error("PIKA_REQUEST_ID_MISSING");
 
+  const statusUrl =
+    submit.json?.status_url ||
+    submit.json?.statusUrl ||
+    `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
+
+  const resultUrl =
+    submit.json?.response_url ||
+    submit.json?.responseUrl ||
+    submit.json?.result_url ||
+    submit.json?.resultUrl ||
+    `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}`;
+
+  console.log("🟦 FAL_PIKA_QUEUE_URLS", { requestId, statusUrl, resultUrl });
+
   let videoUrl = null;
   for (let i = 0; i < 30; i += 1) {
     await sleep(4000);
-    const status = await httpJson(`https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`, {
-      method: "GET",
-      headers: { Authorization: `Key ${cfg.apiKey}` },
-      timeoutMs: 45000,
-    });
+    const status = await falQueueGetJson(statusUrl, cfg.apiKey, 45000);
     const s = String(status.json?.status || "").toUpperCase();
     if (s === "COMPLETED") {
-      const result = await httpJson(`https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}`, {
-        method: "GET",
-        headers: { Authorization: `Key ${cfg.apiKey}` },
-        timeoutMs: 45000,
-      });
+      const result = await falQueueGetJson(resultUrl, cfg.apiKey, 45000);
       videoUrl = pickVideoUrlFromAny(result.json);
       break;
     }
