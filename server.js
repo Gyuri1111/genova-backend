@@ -1914,12 +1914,14 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
   for (let i = 0; i < 30; i += 1) {
     await sleep(4000);
     const status = await httpJson(`https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`, {
+      method: "GET",
       headers: { Authorization: `Key ${cfg.apiKey}` },
       timeoutMs: 45000,
     });
     const s = String(status.json?.status || "").toUpperCase();
     if (s === "COMPLETED") {
       const result = await httpJson(`https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}`, {
+        method: "GET",
         headers: { Authorization: `Key ${cfg.apiKey}` },
         timeoutMs: 45000,
       });
@@ -1965,12 +1967,14 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
   for (let i = 0; i < 30; i += 1) {
     await sleep(4000);
     const status = await httpJson(`https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`, {
+      method: "GET",
       headers: { Authorization: `Key ${cfg.apiKey}` },
       timeoutMs: 45000,
     });
     const s = String(status.json?.status || "").toUpperCase();
     if (s === "COMPLETED") {
       const result = await httpJson(`https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}`, {
+        method: "GET",
         headers: { Authorization: `Key ${cfg.apiKey}` },
         timeoutMs: 45000,
       });
