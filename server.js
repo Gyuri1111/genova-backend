@@ -3222,20 +3222,19 @@ const prompt = String(body.prompt || body.text || "").trim();
         console.warn("⚠️ creation processing doc update failed:", e?.message || e);
       }
 
-      // Webhook-primary compatibility response:
-      // Older HomeScreen/apiService paths treat HTTP 200 without the usual success/URL-shaped
-      // fields as a failed request ("request failed 200"). In webhook mode the final videoUrl
-      // is not available yet, so return an explicit processing payload with all legacy aliases.
+      // Webhook-primary compatibility response.
+      // Older HomeScreen code expects a "successful" JSON shape from /generate-video.
+      // In webhook mode there is no final videoUrl yet, so we return an explicit
+      // processing payload instead of letting the client interpret HTTP 200 as a failure.
       return res.json({
         success: true,
         ok: true,
-        started: true,
+        accepted: true,
         processing: true,
+        pending: true,
         pendingWebhook: true,
         status: "processing",
         message: "Generation started",
-        videoUrl: null,
-        url: null,
         resultId: id,
         id,
         creationId,
@@ -3246,21 +3245,34 @@ const prompt = String(body.prompt || body.text || "").trim();
         taskId: providerResult.taskId || null,
         statusUrl: providerResult.statusUrl || null,
         resultUrl: providerResult.resultUrl || null,
-        result: {
+        videoUrl: "",
+        url: "",
+        data: {
+          success: true,
+          ok: true,
+          accepted: true,
+          processing: true,
+          pendingWebhook: true,
+          status: "processing",
+          videoUrl: "",
+          url: "",
+          creationId,
+          fileName,
+          resultId: id,
           id,
+        },
+        result: {
+          success: true,
+          ok: true,
+          id,
+          creationId,
+          fileName,
           status: "processing",
           processing: true,
           pendingWebhook: true,
-          url: null,
-          videoUrl: null,
-          meta: {
-            ...meta,
-            creationId,
-            fileName,
-            providerRequestId: providerResult.taskId || null,
-            pendingWebhook: true,
-            watermarkRequired: !!watermarkApplied,
-          },
+          videoUrl: "",
+          url: "",
+          meta: { ...meta, creationId, fileName, watermarkRequired: !!watermarkApplied },
           createdAt,
         },
         billing,
