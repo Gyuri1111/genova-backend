@@ -2017,42 +2017,17 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
       resultUrl = String(status.json.response_url || status.json.responseUrl).trim();
     }
 
-    // 🔥 Pika may keep returning IN_PROGRESS even when the response endpoint already has the video.
-    // So if response_url exists, always try reading it.
-    if (resultUrl) {
-      try {
-        const result = await httpJson(resultUrl, {
-          method: "GET",
-          headers: { Authorization: `Key ${cfg.apiKey}` },
-          timeoutMs: 45000,
-        });
-
-        logFalResultJson("🟨 FAL_PIKA_RESULT_JSON", result.json);
-
-        const earlyVideoUrl =
-          pickVideoUrlFromAny(result.json) ||
-          result.json?.video?.url ||
-          result.json?.data?.video?.url ||
-          null;
-
-        if (earlyVideoUrl) {
-          videoUrl = earlyVideoUrl;
-
-          console.log("🟨 FAL_PIKA_PICKED_VIDEO_URL", {
-            requestId,
-            videoUrl: videoUrl || null,
-          });
-
-          break;
-        }
-      } catch (_) {}
-    }
-
     if (s === "COMPLETED") {
-      console.log("🟩 FAL_PIKA_RESULT_URL", {
-        requestId,
-        completedResultUrl: resultUrl,
+      console.log("🟩 FAL_WAN_RESULT_URL", { requestId, completedResultUrl: resultUrl });
+      const result = await httpJson(resultUrl, {
+        method: "GET",
+        headers: { Authorization: `Key ${cfg.apiKey}` },
+        timeoutMs: 45000,
       });
+      logFalResultJson("🟨 FAL_WAN_RESULT_JSON", result.json);
+      videoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
+      console.log("🟨 FAL_WAN_PICKED_VIDEO_URL", { requestId, videoUrl: videoUrl || null });
+      break;
     }
     if (s === "FAILED") {
       throw new Error(`WAN_FAILED:${status.json?.error || status.json?.detail || "failed"}`);
@@ -2068,14 +2043,19 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
   if (hasImage && localImagePath) {
     signedInput = await uploadTempInputAndGetSignedUrl(uid, localImagePath, mimeType || "image/jpeg");
   }
+
   const modelSlug = hasImage ? cfg.imageModel : cfg.textModel;
+
   const input = {
     prompt: String(prompt || "").trim(),
     duration: Number(lengthSec || 5),
     aspect_ratio: mapAspectRatio(orientation),
     resolution: mapPikaResolution(resolution),
   };
-  if (hasImage && signedInput?.signedUrl) input.image_url = signedInput.signedUrl;
+
+  if (hasImage && signedInput?.signedUrl) {
+    input.image_url = signedInput.signedUrl;
+  }
 
   // IMPORTANT: fal REST queue submit expects the model input object directly.
   // Do NOT wrap it as { input }, otherwise Pika receives body.input.prompt
@@ -2089,13 +2069,38 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
     body: JSON.stringify(input),
     timeoutMs: 90000,
   });
-  const requestId = String(submit.json?.request_id || submit.json?.requestId || "").trim();
-  if (!requestId) throw new Error("PIKA_REQUEST_ID_MISSING");
 
-  const fallbackStatusUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
-  const fallbackResultUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/response`;
-  const statusUrl = String(submit.json?.status_url || submit.json?.statusUrl || fallbackStatusUrl).trim();
-  let resultUrl = String(submit.json?.response_url || submit.json?.responseUrl || fallbackResultUrl).trim();
+  const requestId = String(
+    submit.json?.request_id ||
+    submit.json?.requestId ||
+    ""
+  ).trim();
+
+  if (!requestId) {
+    throw new Error("PIKA_REQUEST_ID_MISSING");
+  }
+
+  const statusUrl = String(
+    submit.json?.status_url ||
+    submit.json?.statusUrl ||
+    `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`
+  ).trim();
+
+  // Pika's queue status can stay IN_PROGRESS even after the actual video exists.
+  // For this model we therefore poll the result endpoint directly and only use status for diagnostics.
+  let resultUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/response`;
+
+  const rawResponseUrl = String(
+    submit.json?.response_url ||
+    submit.json?.responseUrl ||
+    ""
+  ).trim();
+
+  if (rawResponseUrl) {
+    resultUrl = rawResponseUrl.endsWith("/response")
+      ? rawResponseUrl
+      : `${rawResponseUrl}/response`;
+  }
 
   console.log("🟦 FAL_PIKA_QUEUE_URLS", {
     requestId,
@@ -2106,60 +2111,125 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
   });
 
   let videoUrl = null;
+  let lastStatus = null;
+  let lastResultError = null;
+
   for (let i = 0; i < FAL_VIDEO_MAX_POLLS; i += 1) {
     await sleep(FAL_VIDEO_POLL_INTERVAL_MS);
-    const status = await httpJson(statusUrl, {
-      method: "GET",
-      headers: { Authorization: `Key ${cfg.apiKey}` },
-      timeoutMs: 45000,
-    });
-    console.log("🟦 FAL_PIKA_STATUS_POLL", status.json);
 
-    const rawStatus =
-      status.json?.status ??
-      status.json?.state ??
-      status.json?.request_status ??
-      "";
+    // Status is diagnostic only for Pika.
+    try {
+      const status = await httpJson(statusUrl, {
+        method: "GET",
+        headers: { Authorization: `Key ${cfg.apiKey}` },
+        timeoutMs: 45000,
+      });
 
-    const s = String(rawStatus).trim().toUpperCase();
+      lastStatus = status.json || null;
 
-    if (status.json?.response_url || status.json?.responseUrl) {
-      resultUrl = String(status.json.response_url || status.json.responseUrl).trim();
+      console.log("🟦 FAL_PIKA_STATUS_POLL", {
+        poll: i + 1,
+        status: lastStatus?.status ?? null,
+        request_id: lastStatus?.request_id ?? lastStatus?.requestId ?? requestId,
+        response_url: lastStatus?.response_url ?? lastStatus?.responseUrl ?? null,
+        status_url: lastStatus?.status_url ?? lastStatus?.statusUrl ?? null,
+        hasLogs: Array.isArray(lastStatus?.logs),
+        metrics: lastStatus?.metrics || {},
+      });
+
+      const statusResponseUrl = String(
+        lastStatus?.response_url ||
+        lastStatus?.responseUrl ||
+        ""
+      ).trim();
+
+      if (statusResponseUrl) {
+        resultUrl = statusResponseUrl.endsWith("/response")
+          ? statusResponseUrl
+          : `${statusResponseUrl}/response`;
+      }
+
+      const rawStatus =
+        lastStatus?.status ??
+        lastStatus?.state ??
+        lastStatus?.request_status ??
+        "";
+
+      const s = String(rawStatus).trim().toUpperCase();
+
+      if (s === "FAILED") {
+        throw new Error(`PIKA_FAILED:${lastStatus?.error || lastStatus?.detail || "failed"}`);
+      }
+    } catch (e) {
+      // Do not abort on status endpoint noise unless it is an explicit model failure.
+      if (String(e?.message || "").startsWith("PIKA_FAILED:")) {
+        throw e;
+      }
+      console.log("🟠 FAL_PIKA_STATUS_POLL_ERROR", {
+        poll: i + 1,
+        message: e?.message || String(e),
+        status: e?.status || null,
+        raw: e?.raw ? String(e.raw).slice(0, 800) : "",
+      });
     }
 
-    if (s === "COMPLETED") {
-      console.log("🟩 FAL_PIKA_RESULT_URL", { requestId, completedResultUrl: resultUrl });
+    // Result endpoint is the source of truth for Pika.
+    try {
       const result = await httpJson(resultUrl, {
         method: "GET",
         headers: { Authorization: `Key ${cfg.apiKey}` },
         timeoutMs: 45000,
       });
+
       logFalResultJson("🟨 FAL_PIKA_RESULT_JSON", result.json);
-      videoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
-      console.log("🟨 FAL_PIKA_PICKED_VIDEO_URL", { requestId, videoUrl: videoUrl || null });
-      break;
-    }
-    if (s === "FAILED") {
-      throw new Error(`PIKA_FAILED:${status.json?.error || status.json?.detail || "failed"}`);
+
+      videoUrl =
+        pickVideoUrlFromAny(result.json) ||
+        result.json?.video?.url ||
+        result.json?.data?.video?.url ||
+        null;
+
+      console.log("🟨 FAL_PIKA_PICKED_VIDEO_URL", {
+        requestId,
+        poll: i + 1,
+        resultUrl,
+        videoUrl: videoUrl || null,
+      });
+
+      if (videoUrl) {
+        break;
+      }
+    } catch (e) {
+      lastResultError = {
+        message: e?.message || String(e),
+        status: e?.status || null,
+        raw: e?.raw ? String(e.raw).slice(0, 800) : "",
+      };
+
+      console.log("🟠 FAL_PIKA_RESULT_NOT_READY", {
+        requestId,
+        poll: i + 1,
+        resultUrl,
+        ...lastResultError,
+      });
     }
   }
-  if (!videoUrl) throw new Error(`PIKA_TIMEOUT_AFTER_${FAL_VIDEO_MAX_POLLS}_POLLS`);
-  return { provider: "pika", taskId: requestId, videoUrl };
+
+  if (!videoUrl) {
+    const err = new Error(`PIKA_TIMEOUT_AFTER_${FAL_VIDEO_MAX_POLLS}_POLLS`);
+    err.lastStatus = lastStatus;
+    err.lastResultError = lastResultError;
+    err.resultUrl = resultUrl;
+    throw err;
+  }
+
+  return {
+    provider: "pika",
+    taskId: requestId,
+    videoUrl,
+  };
 }
 
-function createKlingJwtToken(accessKey, secretKey) {
-  const header = { alg: "HS256", typ: "JWT" };
-  const now = Math.floor(Date.now() / 1000);
-  const payload = {
-    iss: accessKey,
-    exp: now + 1800,
-    nbf: now - 5,
-  };
-  const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
-  const tokenUnsigned = `${b64url(header)}.${b64url(payload)}`;
-  const sig = crypto.createHmac("sha256", secretKey).update(tokenUnsigned).digest("base64url");
-  return `${tokenUnsigned}.${sig}`;
-}
 
 async function createKlingTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
   const cfg = ensureProviderReady("kling");
