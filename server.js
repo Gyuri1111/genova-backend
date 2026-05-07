@@ -1763,6 +1763,24 @@ const PROVIDERS = {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// ------------------------------------------------------------
+// FAL webhook hybrid mode
+// ------------------------------------------------------------
+const FAL_WEBHOOK_URL = String(
+  process.env.FAL_WEBHOOK_URL ||
+  "https://genova-backend-45yb.onrender.com/fal-webhook"
+).trim();
+
+function buildFalQueueSubmitUrl(modelSlug) {
+  const base = `https://queue.fal.run/${modelSlug}`;
+  if (!FAL_WEBHOOK_URL) return base;
+
+  const sep = base.includes("?") ? "&" : "?";
+
+  return `${base}${sep}fal_webhook=${encodeURIComponent(FAL_WEBHOOK_URL)}`;
+}
+
+
 function resolveProviderFromModel(rawModel) {
   const m = String(rawModel || "").trim().toLowerCase();
   if (m === "runway") return "runway";
