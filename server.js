@@ -1763,13 +1763,6 @@ const PROVIDERS = {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// FAL queue polling interval (ms).
-// Default: 5s between status checks. Can be overridden on Render with FAL_VIDEO_POLL_INTERVAL_MS.
-const FAL_VIDEO_POLL_INTERVAL_MS = (() => {
-  const n = Number(process.env.FAL_VIDEO_POLL_INTERVAL_MS || 5000);
-  return Number.isFinite(n) && n >= 1000 ? n : 5000;
-})();
-
 // ------------------------------------------------------------
 // FAL webhook hybrid mode
 // ------------------------------------------------------------
@@ -2198,12 +2191,13 @@ async function createPikaTask({ uid, creationId = null, prompt, hasImage, localI
   const requestId = String(submit.json?.request_id || submit.json?.requestId || "").trim();
   if (!requestId) throw new Error("PIKA_REQUEST_ID_MISSING");
 
+  // IMPORTANT: Pika must be polled on the exact submitted v2.2 model slug.
+  // Some FAL responses may return a shortened /fal-ai/pika/requests/... URL, but that can keep
+  // reporting IN_PROGRESS forever / return HTTP_400 "Request is still in progress" on result fetches.
   const fallbackStatusUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
-  const fallbackResultUrl = `https://queue.fal.run/fal-ai/pika/requests/${encodeURIComponent(requestId)}`;
-  const statusUrl = String(submit.json?.status_url || submit.json?.statusUrl || fallbackStatusUrl).trim();
-  let resultUrl = String(submit.json?.response_url || submit.json?.responseUrl || fallbackResultUrl).trim();
-  // Pika v2.2 result is served at /fal-ai/pika/requests/{id}; /response returns HTTP_405.
-  resultUrl = resultUrl.replace(/\/response$/i, "");
+  const fallbackResultUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}`;
+  const statusUrl = fallbackStatusUrl;
+  let resultUrl = fallbackResultUrl;
 
   console.log("🟦 FAL_PIKA_QUEUE_URLS", {
     requestId,
@@ -2246,7 +2240,17 @@ async function createPikaTask({ uid, creationId = null, prompt, hasImage, localI
     lastStatus = status.json || null;
 
     if (status.json?.response_url || status.json?.responseUrl) {
-      resultUrl = String(status.json.response_url || status.json.responseUrl).trim().replace(/\/response$/i, "");
+      const candidateResultUrl = String(status.json.response_url || status.json.responseUrl).trim().replace(/\/response$/i, "");
+      if (candidateResultUrl.includes(`/${modelSlug}/requests/`)) {
+        resultUrl = candidateResultUrl;
+      } else {
+        console.log("🟠 FAL_PIKA_SHORT_RESPONSE_URL_IGNORED", {
+          requestId,
+          modelSlug,
+          candidateResultUrl,
+          forcedResultUrl: resultUrl,
+        });
+      }
     }
 
     console.log("🟦 FAL_PIKA_STATUS_POLL", {
@@ -2259,29 +2263,31 @@ async function createPikaTask({ uid, creationId = null, prompt, hasImage, localI
       metrics: status.json?.metrics || {},
     });
 
-    try {
-      const result = await httpJson(resultUrl, {
-        method: "GET",
-        headers: { Authorization: `Key ${cfg.apiKey}` },
-        timeoutMs: 45000,
-      });
-      logFalResultJson("🟨 FAL_PIKA_RESULT_JSON", result.json);
-      const earlyVideoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
-      console.log("🟨 FAL_PIKA_PICKED_VIDEO_URL", { requestId, poll: i + 1, resultUrl, videoUrl: earlyVideoUrl || null });
-      if (earlyVideoUrl) {
-        videoUrl = earlyVideoUrl;
-        break;
+    if (s === "COMPLETED" || s === "DONE" || s === "SUCCESS") {
+      try {
+        const result = await httpJson(resultUrl, {
+          method: "GET",
+          headers: { Authorization: `Key ${cfg.apiKey}` },
+          timeoutMs: 45000,
+        });
+        logFalResultJson("🟨 FAL_PIKA_RESULT_JSON", result.json);
+        const earlyVideoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
+        console.log("🟨 FAL_PIKA_PICKED_VIDEO_URL", { requestId, poll: i + 1, resultUrl, videoUrl: earlyVideoUrl || null });
+        if (earlyVideoUrl) {
+          videoUrl = earlyVideoUrl;
+          break;
+        }
+      } catch (e) {
+        lastResultError = { message: e?.message || String(e), status: e?.status || null, raw: e?.raw || "" };
+        console.log("🟠 FAL_PIKA_RESULT_AFTER_COMPLETED_FAILED", {
+          requestId,
+          poll: i + 1,
+          resultUrl,
+          message: lastResultError.message,
+          status: lastResultError.status,
+          raw: String(lastResultError.raw || "").slice(0, 800),
+        });
       }
-    } catch (e) {
-      lastResultError = { message: e?.message || String(e), status: e?.status || null, raw: e?.raw || "" };
-      console.log("🟠 FAL_PIKA_RESULT_NOT_READY", {
-        requestId,
-        poll: i + 1,
-        resultUrl,
-        message: lastResultError.message,
-        status: lastResultError.status,
-        raw: String(lastResultError.raw || "").slice(0, 800),
-      });
     }
 
     if (s === "FAILED") {
