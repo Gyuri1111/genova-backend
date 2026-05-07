@@ -1763,6 +1763,13 @@ const PROVIDERS = {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// FAL queue polling interval (ms).
+// Default: 5s between status checks. Can be overridden on Render with FAL_VIDEO_POLL_INTERVAL_MS.
+const FAL_VIDEO_POLL_INTERVAL_MS = (() => {
+  const n = Number(process.env.FAL_VIDEO_POLL_INTERVAL_MS || 5000);
+  return Number.isFinite(n) && n >= 1000 ? n : 5000;
+})();
+
 // ------------------------------------------------------------
 // FAL webhook hybrid mode
 // ------------------------------------------------------------
