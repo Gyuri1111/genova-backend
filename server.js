@@ -3222,20 +3222,45 @@ const prompt = String(body.prompt || body.text || "").trim();
         console.warn("⚠️ creation processing doc update failed:", e?.message || e);
       }
 
+      // Webhook-primary compatibility response:
+      // Older HomeScreen/apiService paths treat HTTP 200 without the usual success/URL-shaped
+      // fields as a failed request ("request failed 200"). In webhook mode the final videoUrl
+      // is not available yet, so return an explicit processing payload with all legacy aliases.
       return res.json({
         success: true,
+        ok: true,
+        started: true,
+        processing: true,
         pendingWebhook: true,
         status: "processing",
+        message: "Generation started",
+        videoUrl: null,
+        url: null,
         resultId: id,
+        id,
         creationId,
         fileName,
         provider: providerResult.provider || provider,
         providerRequestId: providerResult.taskId || null,
+        requestId: providerResult.taskId || null,
+        taskId: providerResult.taskId || null,
+        statusUrl: providerResult.statusUrl || null,
+        resultUrl: providerResult.resultUrl || null,
         result: {
           id,
           status: "processing",
-          url: "",
-          meta: { ...meta, creationId, fileName, watermarkRequired: !!watermarkApplied },
+          processing: true,
+          pendingWebhook: true,
+          url: null,
+          videoUrl: null,
+          meta: {
+            ...meta,
+            creationId,
+            fileName,
+            providerRequestId: providerResult.taskId || null,
+            pendingWebhook: true,
+            watermarkRequired: !!watermarkApplied,
+          },
           createdAt,
         },
         billing,
