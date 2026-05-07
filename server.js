@@ -2003,7 +2003,15 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
       headers: { Authorization: `Key ${cfg.apiKey}` },
       timeoutMs: 45000,
     });
-    const s = String(status.json?.status || "").toUpperCase();
+    console.log("🟦 FAL_PIKA_STATUS_POLL", status.json);
+
+    const rawStatus =
+      status.json?.status ??
+      status.json?.state ??
+      status.json?.request_status ??
+      "";
+
+    const s = String(rawStatus).trim().toUpperCase();
 
     if (status.json?.response_url || status.json?.responseUrl) {
       resultUrl = String(status.json.response_url || status.json.responseUrl).trim();
@@ -2080,7 +2088,15 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
       headers: { Authorization: `Key ${cfg.apiKey}` },
       timeoutMs: 45000,
     });
-    const s = String(status.json?.status || "").toUpperCase();
+    console.log("🟦 FAL_PIKA_STATUS_POLL", status.json);
+
+    const rawStatus =
+      status.json?.status ??
+      status.json?.state ??
+      status.json?.request_status ??
+      "";
+
+    const s = String(rawStatus).trim().toUpperCase();
 
     if (status.json?.response_url || status.json?.responseUrl) {
       resultUrl = String(status.json.response_url || status.json.responseUrl).trim();
