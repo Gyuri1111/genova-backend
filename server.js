@@ -1770,8 +1770,25 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // FAL video providers can take longer than 120s, especially Pika/WAN v2.x.
 // Keep the HTTP request alive longer instead of cancelling exactly when the model is still processing.
-const FAL_VIDEO_MAX_POLLS = Number(process.env.FAL_VIDEO_MAX_POLLS || 90); // 90 * 4s = ~6 minutes
+const FAL_VIDEO_MAX_POLLS = Number(process.env.FAL_VIDEO_MAX_POLLS || 180); // 180 * 4s = ~12 minutes
 const FAL_VIDEO_POLL_INTERVAL_MS = Number(process.env.FAL_VIDEO_POLL_INTERVAL_MS || 4000);
+
+function getFalVideoMaxPolls({ provider, hasImage, lengthSec } = {}) {
+  const base = Number(FAL_VIDEO_MAX_POLLS || 180);
+  const len = Math.max(5, Number(lengthSec || 5));
+
+  // WAN image-to-video, especially image+prompt, can run longer than text-only.
+  // Keep this higher so the backend does not cancel while FAL is still processing.
+  if (String(provider || "").toLowerCase() === "wan" && hasImage) {
+    return Math.max(base, len >= 10 ? 240 : 210); // ~14–16 minutes at 4s polls
+  }
+
+  // Longer provider generations need more time, regardless of provider.
+  if (len >= 15) return Math.max(base, 240); // ~16 minutes
+  if (len >= 10) return Math.max(base, 210); // ~14 minutes
+
+  return base;
+}
 
 
 function resolveProviderFromModel(rawModel) {
@@ -1995,8 +2012,14 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
     inputKeys: Object.keys(input || {}),
   });
 
+  const maxPolls = getFalVideoMaxPolls({
+    provider: "wan",
+    hasImage,
+    lengthSec,
+  });
+
   let videoUrl = null;
-  for (let i = 0; i < FAL_VIDEO_MAX_POLLS; i += 1) {
+  for (let i = 0; i < maxPolls; i += 1) {
     await sleep(FAL_VIDEO_POLL_INTERVAL_MS);
     const status = await httpJson(statusUrl, {
       method: "GET",
@@ -2009,23 +2032,56 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
       resultUrl = String(status.json.response_url || status.json.responseUrl).trim();
     }
 
-    if (s === "COMPLETED") {
-      console.log("🟩 FAL_WAN_RESULT_URL", { requestId, completedResultUrl: resultUrl });
+    // WAN image-to-video can expose a usable result before status handling is reliable.
+    // Try the result endpoint on every poll; if a real video URL exists, we are done.
+    try {
       const result = await httpJson(resultUrl, {
         method: "GET",
         headers: { Authorization: `Key ${cfg.apiKey}` },
         timeoutMs: 45000,
       });
+
       logFalResultJson("🟨 FAL_WAN_RESULT_JSON", result.json);
-      videoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
-      console.log("🟨 FAL_WAN_PICKED_VIDEO_URL", { requestId, videoUrl: videoUrl || null });
-      break;
+
+      const earlyVideoUrl =
+        pickVideoUrlFromAny(result.json) ||
+        result.json?.video?.url ||
+        result.json?.data?.video?.url ||
+        null;
+
+      console.log("🟨 FAL_WAN_PICKED_VIDEO_URL", {
+        requestId,
+        poll: i + 1,
+        resultUrl,
+        videoUrl: earlyVideoUrl || null,
+      });
+
+      if (earlyVideoUrl) {
+        videoUrl = earlyVideoUrl;
+        break;
+      }
+    } catch (e) {
+      console.log("🟠 FAL_WAN_RESULT_NOT_READY", {
+        requestId,
+        poll: i + 1,
+        resultUrl,
+        message: e?.message || String(e),
+        status: e?.status || null,
+        raw: e?.raw ? String(e.raw).slice(0, 800) : "",
+      });
+    }
+
+    if (s === "COMPLETED") {
+      console.log("🟩 FAL_WAN_RESULT_URL", {
+        requestId,
+        completedResultUrl: resultUrl,
+      });
     }
     if (s === "FAILED") {
       throw new Error(`WAN_FAILED:${status.json?.error || status.json?.detail || "failed"}`);
     }
   }
-  if (!videoUrl) throw new Error(`WAN_TIMEOUT_AFTER_${FAL_VIDEO_MAX_POLLS}_POLLS`);
+  if (!videoUrl) throw new Error(`WAN_TIMEOUT_AFTER_${maxPolls}_POLLS`);
   return { provider: "wan", taskId: requestId, videoUrl };
 }
 
