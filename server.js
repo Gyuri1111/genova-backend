@@ -1799,7 +1799,7 @@ function getFalVideoMaxPolls({ provider, hasImage, lengthSec } = {}) {
 // ------------------------------------------------------------
 const FAL_WEBHOOK_URL = String(
   process.env.FAL_WEBHOOK_URL ||
-  "https://genova-labs.hu/api/fal-webhook"
+  "https://genova-backend-45yb.onrender.com/fal-webhook"
 ).trim();
 
 function buildFalQueueSubmitUrl(modelSlug) {
