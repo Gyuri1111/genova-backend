@@ -1985,7 +1985,14 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
   const fallbackStatusUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
   const fallbackResultUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/response`;
   const statusUrl = String(submit.json?.status_url || submit.json?.statusUrl || fallbackStatusUrl).trim();
-  let resultUrl = String(submit.json?.response_url || submit.json?.responseUrl || fallbackResultUrl).trim();
+  // Pika queue API returns the FINAL result directly on:
+  // /requests/{id}
+  // and NOT on /response (that returns HTTP_405 for Pika v2.2)
+  let resultUrl = String(
+    submit.json?.response_url ||
+    submit.json?.responseUrl ||
+    `https://queue.fal.run/fal-ai/pika/requests/${encodeURIComponent(requestId)}`
+  ).trim();
 
   console.log("🟦 FAL_WAN_QUEUE_URLS", {
     requestId,
