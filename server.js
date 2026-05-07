@@ -2017,17 +2017,42 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
       resultUrl = String(status.json.response_url || status.json.responseUrl).trim();
     }
 
+    // 🔥 Pika may keep returning IN_PROGRESS even when the response endpoint already has the video.
+    // So if response_url exists, always try reading it.
+    if (resultUrl) {
+      try {
+        const result = await httpJson(resultUrl, {
+          method: "GET",
+          headers: { Authorization: `Key ${cfg.apiKey}` },
+          timeoutMs: 45000,
+        });
+
+        logFalResultJson("🟨 FAL_PIKA_RESULT_JSON", result.json);
+
+        const earlyVideoUrl =
+          pickVideoUrlFromAny(result.json) ||
+          result.json?.video?.url ||
+          result.json?.data?.video?.url ||
+          null;
+
+        if (earlyVideoUrl) {
+          videoUrl = earlyVideoUrl;
+
+          console.log("🟨 FAL_PIKA_PICKED_VIDEO_URL", {
+            requestId,
+            videoUrl: videoUrl || null,
+          });
+
+          break;
+        }
+      } catch (_) {}
+    }
+
     if (s === "COMPLETED") {
-      console.log("🟩 FAL_WAN_RESULT_URL", { requestId, completedResultUrl: resultUrl });
-      const result = await httpJson(resultUrl, {
-        method: "GET",
-        headers: { Authorization: `Key ${cfg.apiKey}` },
-        timeoutMs: 45000,
+      console.log("🟩 FAL_PIKA_RESULT_URL", {
+        requestId,
+        completedResultUrl: resultUrl,
       });
-      logFalResultJson("🟨 FAL_WAN_RESULT_JSON", result.json);
-      videoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
-      console.log("🟨 FAL_WAN_PICKED_VIDEO_URL", { requestId, videoUrl: videoUrl || null });
-      break;
     }
     if (s === "FAILED") {
       throw new Error(`WAN_FAILED:${status.json?.error || status.json?.detail || "failed"}`);
