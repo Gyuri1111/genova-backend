@@ -1790,6 +1790,92 @@ function getFalVideoMaxPolls({ provider, hasImage, lengthSec } = {}) {
   return base;
 }
 
+// ------------------------------------------------------------
+// FAL webhook hybrid mode
+// Phase 1 is fallback-safe:
+// - provider submit includes a webhook URL
+// - /fal-webhook records callbacks and maps requestId -> creationId
+// - existing polling/finalize flow remains active as fallback
+// ------------------------------------------------------------
+const FAL_WEBHOOK_URL = String(
+  process.env.FAL_WEBHOOK_URL ||
+  "https://genova-labs.hu/api/fal-webhook"
+).trim();
+
+function buildFalQueueSubmitUrl(modelSlug) {
+  const base = `https://queue.fal.run/${modelSlug}`;
+  if (!FAL_WEBHOOK_URL) return base;
+
+  // Raw REST queue webhook support uses fal_webhook query param.
+  // Keep the body as the model input object directly; do NOT wrap as { input }.
+  const sep = base.includes("?") ? "&" : "?";
+  return `${base}${sep}fal_webhook=${encodeURIComponent(FAL_WEBHOOK_URL)}`;
+}
+
+async function saveFalRequestMapping({
+  requestId,
+  provider,
+  uid,
+  creationId,
+  modelSlug,
+  statusUrl,
+  resultUrl,
+  meta,
+}) {
+  const rid = String(requestId || "").trim();
+  if (!rid) return;
+
+  try {
+    await db.collection("fal_requests").doc(rid).set(
+      {
+        requestId: rid,
+        provider: String(provider || ""),
+        uid: uid || null,
+        creationId: creationId || null,
+        modelSlug: modelSlug || null,
+        statusUrl: statusUrl || null,
+        resultUrl: resultUrl || null,
+        webhookUrl: FAL_WEBHOOK_URL || null,
+        status: "submitted",
+        meta: meta || {},
+        submittedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    console.log("🧷 FAL_REQUEST_MAPPING_SAVED", {
+      requestId: rid,
+      provider,
+      uid,
+      creationId,
+      webhookUrl: FAL_WEBHOOK_URL || null,
+    });
+  } catch (e) {
+    console.warn("⚠️ saveFalRequestMapping failed:", e?.message || e);
+  }
+}
+
+function extractFalWebhookRequestId(body) {
+  return String(
+    body?.request_id ||
+    body?.requestId ||
+    body?.gateway_request_id ||
+    body?.gatewayRequestId ||
+    body?.payload?.request_id ||
+    body?.payload?.requestId ||
+    ""
+  ).trim();
+}
+
+function extractFalWebhookPayload(body) {
+  if (body?.payload && typeof body.payload === "object") return body.payload;
+  if (body?.data && typeof body.data === "object") return body.data;
+  if (body?.result && typeof body.result === "object") return body.result;
+  return body || {};
+}
+
+
 
 function resolveProviderFromModel(rawModel) {
   const m = String(rawModel || "").trim().toLowerCase();
@@ -1966,7 +2052,7 @@ function pickVideoUrlFromAny(obj) {
   return null;
 }
 
-async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
+async function createWanTask({ uid, creationId = null, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation, webhookMeta = null }) {
   const cfg = ensureProviderReady("wan");
   let signedInput = null;
   if (hasImage && localImagePath) {
@@ -1987,7 +2073,7 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
   // IMPORTANT: fal REST queue submit expects the model input object directly.
   // Do NOT wrap it as { input }, otherwise models like Pika/WAN receive
   // body.input.prompt instead of body.prompt and later fail with misleading 405/422 errors.
-  const submit = await httpJson(`https://queue.fal.run/${modelSlug}`, {
+  const submit = await httpJson(buildFalQueueSubmitUrl(modelSlug), {
     method: "POST",
     headers: {
       Authorization: `Key ${cfg.apiKey}`,
@@ -2010,6 +2096,23 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
     statusUrl,
     resultUrl,
     inputKeys: Object.keys(input || {}),
+  });
+
+  await saveFalRequestMapping({
+    requestId,
+    provider: "wan",
+    uid,
+    creationId,
+    modelSlug,
+    statusUrl,
+    resultUrl,
+    meta: {
+      ...(webhookMeta || {}),
+      hasImage: !!hasImage,
+      lengthSec: Number(lengthSec || 5),
+      resolution: String(resolution || ""),
+      orientation: String(orientation || ""),
+    },
   });
 
   const maxPolls = getFalVideoMaxPolls({
@@ -2085,7 +2188,7 @@ async function createWanTask({ uid, prompt, hasImage, localImagePath, mimeType, 
   return { provider: "wan", taskId: requestId, videoUrl };
 }
 
-async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
+async function createPikaTask({ uid, creationId = null, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation, webhookMeta = null }) {
   const cfg = ensureProviderReady("pika");
   let signedInput = null;
   if (hasImage && localImagePath) {
@@ -2103,7 +2206,7 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
   // IMPORTANT: fal REST queue submit expects the model input object directly.
   // Do NOT wrap it as { input }, otherwise Pika receives body.input.prompt
   // instead of body.prompt and the queue/result flow can return misleading 405/422 errors.
-  const submit = await httpJson(`https://queue.fal.run/${modelSlug}`, {
+  const submit = await httpJson(buildFalQueueSubmitUrl(modelSlug), {
     method: "POST",
     headers: {
       Authorization: `Key ${cfg.apiKey}`,
@@ -2126,6 +2229,23 @@ async function createPikaTask({ uid, prompt, hasImage, localImagePath, mimeType,
     statusUrl,
     resultUrl,
     inputKeys: Object.keys(input || {}),
+  });
+
+  await saveFalRequestMapping({
+    requestId,
+    provider: "pika",
+    uid,
+    creationId,
+    modelSlug,
+    statusUrl,
+    resultUrl,
+    meta: {
+      ...(webhookMeta || {}),
+      hasImage: !!hasImage,
+      lengthSec: Number(lengthSec || 5),
+      resolution: String(resolution || ""),
+      orientation: String(orientation || ""),
+    },
   });
 
   let videoUrl = null;
@@ -2536,6 +2656,64 @@ async function genFromPrompt(out) {
 async function genFromImage(inp, out) {
   fs.copyFileSync(inp, out);
 }
+
+
+
+// ------------------------------------------------------------
+// FAL webhook receiver — Phase 1 hybrid fallback
+// IMPORTANT:
+// - return 200 quickly so fal does not retry unnecessarily
+// - record callback payload for verification
+// - existing /generate-video polling still finalizes the video in Phase 1
+// ------------------------------------------------------------
+app.post(["/fal-webhook", "/api/fal-webhook"], async (req, res) => {
+  const receivedAt = admin.firestore.FieldValue.serverTimestamp();
+
+  try {
+    const body = req.body || {};
+    const requestId = extractFalWebhookRequestId(body);
+    const status = String(body?.status || "").trim();
+    const payload = extractFalWebhookPayload(body);
+    const pickedVideoUrl = pickVideoUrlFromAny(payload) || null;
+
+    console.log("🟣 FAL_WEBHOOK_RECEIVED", {
+      requestId: requestId || null,
+      status: status || null,
+      hasPayload: !!payload,
+      pickedVideoUrl: pickedVideoUrl ? pickedVideoUrl.slice(0, 240) : null,
+      keys: Object.keys(body || {}),
+      payloadKeys: payload && typeof payload === "object" ? Object.keys(payload) : [],
+    });
+
+    if (requestId) {
+      await db.collection("fal_requests").doc(requestId).set(
+        {
+          requestId,
+          webhookReceivedAt: receivedAt,
+          webhookStatus: status || null,
+          webhookVideoUrl: pickedVideoUrl || null,
+          webhookPayloadKeys: payload && typeof payload === "object" ? Object.keys(payload) : [],
+          webhookRawKeys: Object.keys(body || {}),
+          webhookError: body?.error || null,
+          status: status === "OK" ? "webhook_ok" : (status === "ERROR" ? "webhook_error" : "webhook_received"),
+          updatedAt: receivedAt,
+        },
+        { merge: true }
+      );
+    }
+
+    return res.status(200).json({
+      ok: true,
+      received: true,
+      requestId: requestId || null,
+      hasVideoUrl: !!pickedVideoUrl,
+    });
+  } catch (e) {
+    console.warn("⚠️ /fal-webhook handler error:", e?.message || e);
+    // Return 200 even on local persistence errors to avoid duplicate webhook storms during Phase 1.
+    return res.status(200).json({ ok: true, received: true, warning: "WEBHOOK_LOCAL_ERROR" });
+  }
+});
 
 
 // ----------------------------------------------------
@@ -2968,6 +3146,8 @@ const prompt = String(body.prompt || body.text || "").trim();
         provider === "wan"
           ? await createWanTask({
               uid,
+              creationId,
+              webhookMeta: { model, fileName, fps, resolution, lengthSec, watermarkRequired: !!watermarkApplied },
               prompt,
               hasImage: !!req.file,
               localImagePath: req.file?.path || null,
@@ -2979,6 +3159,8 @@ const prompt = String(body.prompt || body.text || "").trim();
           : provider === "pika"
           ? await createPikaTask({
               uid,
+              creationId,
+              webhookMeta: { model, fileName, fps, resolution, lengthSec, watermarkRequired: !!watermarkApplied },
               prompt,
               hasImage: !!req.file,
               localImagePath: req.file?.path || null,
