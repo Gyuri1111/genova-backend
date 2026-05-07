@@ -2199,13 +2199,14 @@ async function createPikaTask({ uid, creationId = null, prompt, hasImage, localI
   const requestId = String(submit.json?.request_id || submit.json?.requestId || "").trim();
   if (!requestId) throw new Error("PIKA_REQUEST_ID_MISSING");
 
-  // IMPORTANT: Pika must be polled on the exact submitted v2.2 model slug.
-  // Some FAL responses may return a shortened /fal-ai/pika/requests/... URL, but that can keep
-  // reporting IN_PROGRESS forever / return HTTP_400 "Request is still in progress" on result fetches.
+  // IMPORTANT:
+  // Submit MUST use the exact Pika v2.2 model slug, but polling MUST use the URLs returned by FAL.
+  // For Pika, forcing `${modelSlug}/requests/{id}/status` can return HTTP_405.
+  // The returned status_url/response_url usually points to the canonical queue request route.
   const fallbackStatusUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
   const fallbackResultUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}`;
-  const statusUrl = fallbackStatusUrl;
-  let resultUrl = fallbackResultUrl;
+  const statusUrl = String(submit.json?.status_url || submit.json?.statusUrl || fallbackStatusUrl).trim();
+  let resultUrl = String(submit.json?.response_url || submit.json?.responseUrl || fallbackResultUrl).trim().replace(/\/response$/i, "");
 
   console.log("🟦 FAL_PIKA_QUEUE_URLS", {
     requestId,
@@ -2248,17 +2249,9 @@ async function createPikaTask({ uid, creationId = null, prompt, hasImage, localI
     lastStatus = status.json || null;
 
     if (status.json?.response_url || status.json?.responseUrl) {
-      const candidateResultUrl = String(status.json.response_url || status.json.responseUrl).trim().replace(/\/response$/i, "");
-      if (candidateResultUrl.includes(`/${modelSlug}/requests/`)) {
-        resultUrl = candidateResultUrl;
-      } else {
-        console.log("🟠 FAL_PIKA_SHORT_RESPONSE_URL_IGNORED", {
-          requestId,
-          modelSlug,
-          candidateResultUrl,
-          forcedResultUrl: resultUrl,
-        });
-      }
+      // Keep FAL's canonical response URL. Do not force the full v2.2 slug here;
+      // Pika can return a shorter /fal-ai/pika/requests/{id} queue route that is valid for results.
+      resultUrl = String(status.json.response_url || status.json.responseUrl).trim().replace(/\/response$/i, "");
     }
 
     console.log("🟦 FAL_PIKA_STATUS_POLL", {
