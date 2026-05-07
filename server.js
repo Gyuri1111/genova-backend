@@ -1781,6 +1781,70 @@ function buildFalQueueSubmitUrl(modelSlug) {
 }
 
 
+async function saveFalRequestMapping({
+  requestId,
+  provider,
+  uid,
+  creationId,
+  modelSlug,
+  statusUrl,
+  resultUrl,
+  meta,
+}) {
+  const rid = String(requestId || "").trim();
+  if (!rid) return;
+
+  try {
+    await db.collection("fal_requests").doc(rid).set(
+      {
+        requestId: rid,
+        provider: String(provider || ""),
+        uid: uid || null,
+        creationId: creationId || null,
+        modelSlug: modelSlug || null,
+        statusUrl: statusUrl || null,
+        resultUrl: resultUrl || null,
+        webhookUrl: FAL_WEBHOOK_URL || null,
+        status: "submitted",
+        meta: meta || {},
+        submittedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    console.log("🧷 FAL_REQUEST_MAPPING_SAVED", {
+      requestId: rid,
+      provider,
+      uid,
+      creationId,
+      webhookUrl: FAL_WEBHOOK_URL || null,
+    });
+  } catch (e) {
+    console.warn("⚠️ saveFalRequestMapping failed:", e?.message || e);
+  }
+}
+
+function extractFalWebhookRequestId(body) {
+  return String(
+    body?.request_id ||
+    body?.requestId ||
+    body?.gateway_request_id ||
+    body?.gatewayRequestId ||
+    body?.payload?.request_id ||
+    body?.payload?.requestId ||
+    ""
+  ).trim();
+}
+
+function extractFalWebhookPayload(body) {
+  if (body?.payload && typeof body.payload === "object") return body.payload;
+  if (body?.data && typeof body.data === "object") return body.data;
+  if (body?.result && typeof body.result === "object") return body.result;
+  return body || {};
+}
+
+
 function resolveProviderFromModel(rawModel) {
   const m = String(rawModel || "").trim().toLowerCase();
   if (m === "runway") return "runway";
