@@ -1837,6 +1837,24 @@ function extractFalWebhookRequestId(body) {
   ).trim();
 }
 
+
+
+function getFalVideoMaxPolls({ provider, hasImage, lengthSec } = {}) {
+  const base = Number(process.env.FAL_VIDEO_MAX_POLLS || 180);
+  const len = Math.max(5, Number(lengthSec || 5));
+
+  // WAN image-to-video generations can run longer.
+  if (String(provider || "").toLowerCase() === "wan" && hasImage) {
+    return Math.max(base, len >= 10 ? 240 : 210);
+  }
+
+  // Longer generations need more polling time.
+  if (len >= 15) return Math.max(base, 240);
+  if (len >= 10) return Math.max(base, 210);
+
+  return base;
+}
+
 function extractFalWebhookPayload(body) {
   if (body?.payload && typeof body.payload === "object") return body.payload;
   if (body?.data && typeof body.data === "object") return body.data;
