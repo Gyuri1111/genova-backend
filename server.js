@@ -1763,6 +1763,14 @@ const PROVIDERS = {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// FAL queue polling interval used by WAN/Pika fallback polling.
+// Keep this top-level so every provider helper can access it.
+const FAL_VIDEO_POLL_INTERVAL_MS = (() => {
+  const n = Number(process.env.FAL_VIDEO_POLL_INTERVAL_MS || 5000);
+  if (!Number.isFinite(n) || n < 1000) return 5000;
+  return Math.floor(n);
+})();
+
 // ------------------------------------------------------------
 // FAL webhook hybrid mode
 // ------------------------------------------------------------
