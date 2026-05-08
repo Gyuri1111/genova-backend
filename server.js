@@ -52,7 +52,7 @@ require("dotenv").config();
 const { emailTemplate } = require("./src/utils/emailTemplate");
 
 const BUILD_TAG =
-  "NO_FFMPEG_ON_RENDER__WATERMARK_THUMB_IN_FUNCTIONS__2026-03-22_VIDEO_READY_EMAIL_VIA_API";
+  "WEBHOOK_PRIMARY_POLLING_OFF__2026-05-08";
 
 const VIDEO_READY_EMAIL_ENDPOINT =
   process.env.VIDEO_READY_EMAIL_ENDPOINT ||
@@ -1419,29 +1419,24 @@ async function sendEmailIfAllowed({ uid, userDoc, type, title, body, data }) {
 // ------------------------------------------------------------
 async function setLastResult(uid, payload) {
   if (!uid) return;
-
-  const lastResult = {
-    id: payload?.id || String(Date.now()),
-    status: payload?.status || "ready", // "ready" | "error"
-    title: payload?.title || "",
-    message: payload?.message || "",
-    url: payload?.url || "",
-    meta: payload?.meta || {},
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    seenAt: null,
-  };
-
-  const userRef = db.collection("users").doc(uid);
-
-  // IMPORTANT:
-  // Use update({ lastResult }) so Firestore replaces the whole lastResult map.
-  // set(..., { merge:true }) deep-merges nested maps, which can leave stale
-  // lastResult.meta.creationId / url / status values from a previous generation.
-  try {
-    await userRef.update({ lastResult });
-  } catch (e) {
-    await userRef.set({ lastResult }, { merge: true });
-  }
+  await db
+    .collection("users")
+    .doc(uid)
+    .set(
+      {
+        lastResult: {
+          id: payload?.id || String(Date.now()),
+          status: payload?.status || "ready", // "ready" | "error"
+          title: payload?.title || "",
+          message: payload?.message || "",
+          url: payload?.url || "",
+          meta: payload?.meta || {},
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          seenAt: null,
+        },
+      },
+      { merge: true }
+    );
 }
 
 function normalizeLastResultMeta({ model, videoLength, resolution, fps } = {}) {
@@ -1768,19 +1763,13 @@ const PROVIDERS = {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// FAL video providers can take longer than 120s, especially Pika/WAN v2.x.
-// Keep the HTTP request alive longer instead of cancelling exactly when the model is still processing.
-const FAL_VIDEO_MAX_POLLS = Number(process.env.FAL_VIDEO_MAX_POLLS || 180); // 180 * 4s = ~12 minutes
-const FAL_VIDEO_POLL_INTERVAL_MS = Number(process.env.FAL_VIDEO_POLL_INTERVAL_MS || 4000);
-
-
 // ------------------------------------------------------------
 // FAL webhook-primary mode
 // ------------------------------------------------------------
-// Goal: keep the previously working polling code as fallback, but in production
-// return from /generate-video immediately after the FAL queue request is accepted.
-// FAL then calls /fal-webhook and this server finalizes the video there.
+// Webhook is now the primary finalization path. Long polling is OFF by default
+// and can be re-enabled only for emergency rollback/debug.
 const FAL_WEBHOOK_PRIMARY = String(process.env.FAL_WEBHOOK_PRIMARY || "1").trim() !== "0";
+const FAL_ENABLE_POLLING_FALLBACK = String(process.env.FAL_ENABLE_POLLING_FALLBACK || "0").trim() === "1";
 const FAL_WEBHOOK_URL = String(
   process.env.FAL_WEBHOOK_URL ||
   "https://genova-backend-45yb.onrender.com/fal-webhook"
@@ -1789,9 +1778,12 @@ const FAL_WEBHOOK_URL = String(
 function buildFalQueueSubmitUrl(modelSlug) {
   const base = `https://queue.fal.run/${modelSlug}`;
   if (!FAL_WEBHOOK_URL) return base;
+
   const sep = base.includes("?") ? "&" : "?";
+
   return `${base}${sep}fal_webhook=${encodeURIComponent(FAL_WEBHOOK_URL)}`;
 }
+
 
 async function saveFalRequestMapping({
   requestId,
@@ -1845,10 +1837,26 @@ function extractFalWebhookRequestId(body) {
     body?.gatewayRequestId ||
     body?.payload?.request_id ||
     body?.payload?.requestId ||
-    body?.data?.request_id ||
-    body?.data?.requestId ||
     ""
   ).trim();
+}
+
+
+
+function getFalVideoMaxPolls({ provider, hasImage, lengthSec } = {}) {
+  const base = Number(process.env.FAL_VIDEO_MAX_POLLS || 180);
+  const len = Math.max(5, Number(lengthSec || 5));
+
+  // WAN image-to-video generations can run longer.
+  if (String(provider || "").toLowerCase() === "wan" && hasImage) {
+    return Math.max(base, len >= 10 ? 240 : 210);
+  }
+
+  // Longer generations need more polling time.
+  if (len >= 15) return Math.max(base, 240);
+  if (len >= 10) return Math.max(base, 210);
+
+  return base;
 }
 
 function extractFalWebhookPayload(body) {
@@ -1856,33 +1864,6 @@ function extractFalWebhookPayload(body) {
   if (body?.data && typeof body.data === "object") return body.data;
   if (body?.result && typeof body.result === "object") return body.result;
   return body || {};
-}
-
-function isFalFailedStatus(status) {
-  const s = String(status || "").trim().toUpperCase();
-  return ["FAILED", "ERROR", "CANCELLED", "CANCELED"].includes(s);
-}
-
-function isFalCompletedStatus(status) {
-  const s = String(status || "").trim().toUpperCase();
-  return ["COMPLETED", "DONE", "SUCCESS", "SUCCEEDED"].includes(s);
-}
-
-function getFalVideoMaxPolls({ provider, hasImage, lengthSec } = {}) {
-  const base = Number(FAL_VIDEO_MAX_POLLS || 180);
-  const len = Math.max(5, Number(lengthSec || 5));
-
-  // WAN image-to-video, especially image+prompt, can run longer than text-only.
-  // Keep this higher so the backend does not cancel while FAL is still processing.
-  if (String(provider || "").toLowerCase() === "wan" && hasImage) {
-    return Math.max(base, len >= 10 ? 240 : 210); // ~14–16 minutes at 4s polls
-  }
-
-  // Longer provider generations need more time, regardless of provider.
-  if (len >= 15) return Math.max(base, 240); // ~16 minutes
-  if (len >= 10) return Math.max(base, 210); // ~14 minutes
-
-  return base;
 }
 
 
@@ -1998,8 +1979,6 @@ function isUsableGeneratedVideoUrl(value) {
   if (lower.includes("/placeholder.mp4") || lower.includes("/placeholder-portrait.mp4")) return false;
   if (lower.startsWith("local-test-video://")) return false;
 
-  // fal/media + common mp4 URLs are acceptable. Some fal URLs are signed and
-  // might not end with .mp4, so prefer host patterns as well.
   return (
     lower.includes("fal.media") ||
     lower.includes("falserverless") ||
@@ -2040,8 +2019,6 @@ function pickVideoUrlFromAny(obj) {
     Array.isArray(obj.data?.videos) ? obj.data.videos[0]?.url : null,
     Array.isArray(obj.output) ? obj.output[0]?.url || obj.output[0] : null,
     Array.isArray(obj.data?.output) ? obj.data.output[0]?.url || obj.data.output[0] : null,
-
-    // Last resort only: generic url fields can also mean queue/control URLs.
     obj.url,
     obj.data?.url,
   ];
@@ -2079,9 +2056,7 @@ async function createWanTask({ uid, creationId = null, prompt, hasImage, localIm
   };
   if (hasImage && signedInput?.signedUrl) input.image_url = signedInput.signedUrl;
 
-  // IMPORTANT: fal REST queue submit expects the model input object directly.
-  // Do NOT wrap it as { input }, otherwise models like Pika/WAN receive
-  // body.input.prompt instead of body.prompt and later fail with misleading 405/422 errors.
+  // fal REST queue submit expects the model input object directly, plus fal_webhook in the URL.
   const submit = await httpJson(buildFalQueueSubmitUrl(modelSlug), {
     method: "POST",
     headers: {
@@ -2106,6 +2081,7 @@ async function createWanTask({ uid, creationId = null, prompt, hasImage, localIm
     resultUrl,
     inputKeys: Object.keys(input || {}),
     webhookPrimary: FAL_WEBHOOK_PRIMARY,
+    pollingFallback: FAL_ENABLE_POLLING_FALLBACK,
   });
 
   await saveFalRequestMapping({
@@ -2125,7 +2101,7 @@ async function createWanTask({ uid, creationId = null, prompt, hasImage, localIm
     },
   });
 
-  if (FAL_WEBHOOK_PRIMARY) {
+  if (FAL_WEBHOOK_PRIMARY || !FAL_ENABLE_POLLING_FALLBACK) {
     return {
       provider: "wan",
       taskId: requestId,
@@ -2137,13 +2113,11 @@ async function createWanTask({ uid, creationId = null, prompt, hasImage, localIm
     };
   }
 
-  const maxPolls = getFalVideoMaxPolls({
-    provider: "wan",
-    hasImage,
-    lengthSec,
-  });
-
+  const maxPolls = getFalVideoMaxPolls({ provider: "wan", hasImage, lengthSec });
   let videoUrl = null;
+  let lastStatus = null;
+  let lastResultError = null;
+
   for (let i = 0; i < maxPolls; i += 1) {
     await sleep(FAL_VIDEO_POLL_INTERVAL_MS);
     const status = await httpJson(statusUrl, {
@@ -2152,61 +2126,58 @@ async function createWanTask({ uid, creationId = null, prompt, hasImage, localIm
       timeoutMs: 45000,
     });
     const s = String(status.json?.status || "").toUpperCase();
+    lastStatus = status.json || null;
 
     if (status.json?.response_url || status.json?.responseUrl) {
       resultUrl = String(status.json.response_url || status.json.responseUrl).trim();
     }
 
-    // WAN image-to-video can expose a usable result before status handling is reliable.
-    // Try the result endpoint on every poll; if a real video URL exists, we are done.
+    console.log("🟦 FAL_WAN_STATUS_POLL", {
+      poll: i + 1,
+      status: s,
+      request_id: requestId,
+      response_url: resultUrl,
+      status_url: statusUrl,
+      hasLogs: Array.isArray(status.json?.logs) && status.json.logs.length > 0,
+      metrics: status.json?.metrics || {},
+    });
+
     try {
       const result = await httpJson(resultUrl, {
         method: "GET",
         headers: { Authorization: `Key ${cfg.apiKey}` },
         timeoutMs: 45000,
       });
-
       logFalResultJson("🟨 FAL_WAN_RESULT_JSON", result.json);
-
-      const earlyVideoUrl =
-        pickVideoUrlFromAny(result.json) ||
-        result.json?.video?.url ||
-        result.json?.data?.video?.url ||
-        null;
-
-      console.log("🟨 FAL_WAN_PICKED_VIDEO_URL", {
-        requestId,
-        poll: i + 1,
-        resultUrl,
-        videoUrl: earlyVideoUrl || null,
-      });
-
+      const earlyVideoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
+      console.log("🟨 FAL_WAN_PICKED_VIDEO_URL", { requestId, poll: i + 1, resultUrl, videoUrl: earlyVideoUrl || null });
       if (earlyVideoUrl) {
         videoUrl = earlyVideoUrl;
         break;
       }
     } catch (e) {
+      lastResultError = { message: e?.message || String(e), status: e?.status || null, raw: e?.raw || "" };
       console.log("🟠 FAL_WAN_RESULT_NOT_READY", {
         requestId,
         poll: i + 1,
         resultUrl,
-        message: e?.message || String(e),
-        status: e?.status || null,
-        raw: e?.raw ? String(e.raw).slice(0, 800) : "",
+        message: lastResultError.message,
+        status: lastResultError.status,
+        raw: String(lastResultError.raw || "").slice(0, 800),
       });
     }
 
-    if (s === "COMPLETED") {
-      console.log("🟩 FAL_WAN_RESULT_URL", {
-        requestId,
-        completedResultUrl: resultUrl,
-      });
-    }
     if (s === "FAILED") {
       throw new Error(`WAN_FAILED:${status.json?.error || status.json?.detail || "failed"}`);
     }
   }
-  if (!videoUrl) throw new Error(`WAN_TIMEOUT_AFTER_${maxPolls}_POLLS`);
+
+  if (!videoUrl) {
+    const err = new Error(`WAN_TIMEOUT_AFTER_${maxPolls}_POLLS`);
+    err.lastStatus = lastStatus;
+    err.lastResultError = lastResultError;
+    throw err;
+  }
   return { provider: "wan", taskId: requestId, videoUrl };
 }
 
@@ -2225,9 +2196,7 @@ async function createPikaTask({ uid, creationId = null, prompt, hasImage, localI
   };
   if (hasImage && signedInput?.signedUrl) input.image_url = signedInput.signedUrl;
 
-  // IMPORTANT: fal REST queue submit expects the model input object directly.
-  // Do NOT wrap it as { input }, otherwise Pika receives body.input.prompt
-  // instead of body.prompt and the queue/result flow can return misleading 405/422 errors.
+  // fal REST queue submit expects the model input object directly, plus fal_webhook in the URL.
   const submit = await httpJson(buildFalQueueSubmitUrl(modelSlug), {
     method: "POST",
     headers: {
@@ -2241,9 +2210,11 @@ async function createPikaTask({ uid, creationId = null, prompt, hasImage, localI
   if (!requestId) throw new Error("PIKA_REQUEST_ID_MISSING");
 
   const fallbackStatusUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}/status`;
-  const fallbackResultUrl = `https://queue.fal.run/${modelSlug}/requests/${encodeURIComponent(requestId)}`;
+  const fallbackResultUrl = `https://queue.fal.run/fal-ai/pika/requests/${encodeURIComponent(requestId)}`;
   const statusUrl = String(submit.json?.status_url || submit.json?.statusUrl || fallbackStatusUrl).trim();
   let resultUrl = String(submit.json?.response_url || submit.json?.responseUrl || fallbackResultUrl).trim();
+  // Pika v2.2 result is served at /fal-ai/pika/requests/{id}; /response returns HTTP_405.
+  resultUrl = resultUrl.replace(/\/response$/i, "");
 
   console.log("🟦 FAL_PIKA_QUEUE_URLS", {
     requestId,
@@ -2252,6 +2223,7 @@ async function createPikaTask({ uid, creationId = null, prompt, hasImage, localI
     resultUrl,
     inputKeys: Object.keys(input || {}),
     webhookPrimary: FAL_WEBHOOK_PRIMARY,
+    pollingFallback: FAL_ENABLE_POLLING_FALLBACK,
   });
 
   await saveFalRequestMapping({
@@ -2271,7 +2243,7 @@ async function createPikaTask({ uid, creationId = null, prompt, hasImage, localI
     },
   });
 
-  if (FAL_WEBHOOK_PRIMARY) {
+  if (FAL_WEBHOOK_PRIMARY || !FAL_ENABLE_POLLING_FALLBACK) {
     return {
       provider: "pika",
       taskId: requestId,
@@ -2283,8 +2255,12 @@ async function createPikaTask({ uid, creationId = null, prompt, hasImage, localI
     };
   }
 
+  const maxPolls = getFalVideoMaxPolls({ provider: "pika", hasImage, lengthSec });
   let videoUrl = null;
-  for (let i = 0; i < FAL_VIDEO_MAX_POLLS; i += 1) {
+  let lastStatus = null;
+  let lastResultError = null;
+
+  for (let i = 0; i < maxPolls; i += 1) {
     await sleep(FAL_VIDEO_POLL_INTERVAL_MS);
     const status = await httpJson(statusUrl, {
       method: "GET",
@@ -2292,28 +2268,58 @@ async function createPikaTask({ uid, creationId = null, prompt, hasImage, localI
       timeoutMs: 45000,
     });
     const s = String(status.json?.status || "").toUpperCase();
+    lastStatus = status.json || null;
 
     if (status.json?.response_url || status.json?.responseUrl) {
-      resultUrl = String(status.json.response_url || status.json.responseUrl).trim();
+      resultUrl = String(status.json.response_url || status.json.responseUrl).trim().replace(/\/response$/i, "");
     }
 
-    if (s === "COMPLETED") {
-      console.log("🟩 FAL_PIKA_RESULT_URL", { requestId, completedResultUrl: resultUrl });
+    console.log("🟦 FAL_PIKA_STATUS_POLL", {
+      poll: i + 1,
+      status: s,
+      request_id: requestId,
+      response_url: resultUrl,
+      status_url: statusUrl,
+      hasLogs: Array.isArray(status.json?.logs) && status.json.logs.length > 0,
+      metrics: status.json?.metrics || {},
+    });
+
+    try {
       const result = await httpJson(resultUrl, {
         method: "GET",
         headers: { Authorization: `Key ${cfg.apiKey}` },
         timeoutMs: 45000,
       });
       logFalResultJson("🟨 FAL_PIKA_RESULT_JSON", result.json);
-      videoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
-      console.log("🟨 FAL_PIKA_PICKED_VIDEO_URL", { requestId, videoUrl: videoUrl || null });
-      break;
+      const earlyVideoUrl = pickVideoUrlFromAny(result.json) || result.json?.video?.url || result.json?.data?.video?.url || null;
+      console.log("🟨 FAL_PIKA_PICKED_VIDEO_URL", { requestId, poll: i + 1, resultUrl, videoUrl: earlyVideoUrl || null });
+      if (earlyVideoUrl) {
+        videoUrl = earlyVideoUrl;
+        break;
+      }
+    } catch (e) {
+      lastResultError = { message: e?.message || String(e), status: e?.status || null, raw: e?.raw || "" };
+      console.log("🟠 FAL_PIKA_RESULT_NOT_READY", {
+        requestId,
+        poll: i + 1,
+        resultUrl,
+        message: lastResultError.message,
+        status: lastResultError.status,
+        raw: String(lastResultError.raw || "").slice(0, 800),
+      });
     }
+
     if (s === "FAILED") {
       throw new Error(`PIKA_FAILED:${status.json?.error || status.json?.detail || "failed"}`);
     }
   }
-  if (!videoUrl) throw new Error(`PIKA_TIMEOUT_AFTER_${FAL_VIDEO_MAX_POLLS}_POLLS`);
+
+  if (!videoUrl) {
+    const err = new Error(`PIKA_TIMEOUT_AFTER_${maxPolls}_POLLS`);
+    err.lastStatus = lastStatus;
+    err.lastResultError = lastResultError;
+    throw err;
+  }
   return { provider: "pika", taskId: requestId, videoUrl };
 }
 
@@ -2651,7 +2657,6 @@ async function finalizeGeneratedVideo({ uid, creationId, sourceUrl, orientation,
       console.log("🎬 wrote inline placeholder mp4 to:", localSrc);
     }
   } else {
-    console.log("⬇️ downloading provider video source", { sourceUrl: sourceUrlStr.slice(0, 240), localSrc });
     await downloadToFile(sourceUrl, localSrc);
   }
 
@@ -2679,6 +2684,213 @@ async function finalizeGeneratedVideo({ uid, creationId, sourceUrl, orientation,
       bucket: videoUp.bucket,
     },
   };
+}
+
+async function tryClaimFalFinalize(requestId, finalizer) {
+  const rid = String(requestId || "").trim();
+  if (!rid) return { ok: true, reason: "no_request_id" };
+  const ref = db.collection("fal_requests").doc(rid);
+  try {
+    return await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const d = snap.exists ? (snap.data() || {}) : {};
+      if (d.finalizedAt) return { ok: false, reason: "already_finalized", data: d };
+      if (d.finalizeStartedAt && !d.finalizeFailedAt) return { ok: false, reason: "already_finalizing", data: d };
+      tx.set(ref, {
+        status: "finalizing",
+        finalizer: String(finalizer || "unknown"),
+        finalizeStartedAt: admin.firestore.FieldValue.serverTimestamp(),
+        finalizeFailedAt: null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      return { ok: true, reason: "claimed", data: d };
+    });
+  } catch (e) {
+    console.warn("⚠️ tryClaimFalFinalize failed:", e?.message || e);
+    return { ok: false, reason: "claim_error", error: e?.message || String(e) };
+  }
+}
+
+async function markFalFinalizeDone(requestId, patch = {}) {
+  const rid = String(requestId || "").trim();
+  if (!rid) return;
+  await db.collection("fal_requests").doc(rid).set({
+    ...patch,
+    status: "finalized",
+    finalizedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+}
+
+async function markFalFinalizeFailed(requestId, error) {
+  const rid = String(requestId || "").trim();
+  if (!rid) return;
+  await db.collection("fal_requests").doc(rid).set({
+    status: "finalize_failed",
+    finalizeError: error?.message || String(error || "unknown"),
+    finalizeFailedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+}
+
+async function writeFinalizedCreationDoc({ uid, creationId, finalized, meta, source = "unknown" }) {
+  const creationRef = db.collection("users").doc(uid).collection("creations").doc(creationId);
+  const nowTs = admin.firestore.Timestamp.now();
+  const model = meta?.model || "";
+  const prompt = meta?.prompt || "";
+  const lengthSec = Number(meta?.lengthSec || meta?.length || 5);
+  const fps = Number(meta?.fps || 30);
+  const resolution = String(meta?.resolution || "480p");
+  const hasImage = !!meta?.hasImage;
+  const width = Number(meta?.width || 0) || null;
+  const height = Number(meta?.height || 0) || null;
+  const aspectRatio = meta?.aspectRatio || null;
+  const orientation = meta?.orientation || null;
+  const fileName = String(meta?.fileName || "");
+  const watermarkRequired = !!meta?.watermarkRequired;
+  const cost = meta?.cost ?? null;
+  const breakdown = meta?.breakdown || {};
+
+  await creationRef.set({
+    uid,
+    createdAt: nowTs,
+    model,
+    prompt: String(prompt || ""),
+    length: lengthSec,
+    fps,
+    resolution,
+    hasImage,
+    fileName,
+    ...(width ? { width } : {}),
+    ...(height ? { height } : {}),
+    ...(aspectRatio ? { aspectRatio } : {}),
+    ...(orientation ? { orientation } : {}),
+    meta: {
+      model,
+      lengthSec,
+      fps,
+      resolution,
+      hasImage,
+      ...(width ? { width } : {}),
+      ...(height ? { height } : {}),
+      ...(aspectRatio ? { aspectRatio } : {}),
+      ...(orientation ? { orientation } : {}),
+      watermarkApplied: false,
+      cost,
+      breakdown,
+      webhookFinalized: source === "webhook",
+    },
+    status: "ready",
+    videoUrl: finalized?.videoUrl || null,
+    url: finalized?.videoUrl || null,
+    thumbUrl: null,
+    thumbnailUrl: null,
+    storage: {
+      ...(finalized?.storage || null),
+      originalVideoPath: finalized?.storage?.videoPath || null,
+      thumbPath: null,
+    },
+    watermarkApplied: false,
+    watermarkRequired,
+    watermarkStatus: watermarkRequired ? "pending" : "not_required",
+    providerFinalizeSource: source,
+    updatedAt: nowTs,
+  }, { merge: true });
+
+  console.log("✅ Firestore creation updated:", `users/${uid}/creations/${creationId}`, { source });
+}
+
+async function finalizeFalWebhookResult({ requestId, sourceUrl, payload }) {
+  const rid = String(requestId || "").trim();
+  if (!rid || !sourceUrl) return { ok: false, reason: "missing_request_or_source" };
+
+  const mapRef = db.collection("fal_requests").doc(rid);
+  const mapSnap = await mapRef.get();
+  const mapping = mapSnap.exists ? (mapSnap.data() || {}) : {};
+  const uid = String(mapping.uid || "").trim();
+  const creationId = String(mapping.creationId || "").trim();
+  const meta = mapping.meta || {};
+
+  if (!uid || !creationId) {
+    await mapRef.set({
+      status: "webhook_missing_mapping",
+      finalizeError: "Missing uid or creationId in fal_requests mapping",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    console.warn("⚠️ FAL_WEBHOOK_MISSING_MAPPING", { requestId: rid, uid, creationId });
+    return { ok: false, reason: "missing_mapping" };
+  }
+
+  const claim = await tryClaimFalFinalize(rid, "webhook");
+  if (!claim.ok) {
+    console.log("🟡 FAL_WEBHOOK_FINALIZE_SKIPPED", { requestId: rid, reason: claim.reason });
+    return { ok: true, skipped: true, reason: claim.reason };
+  }
+
+  try {
+    console.log("🟣 FAL_WEBHOOK_FINALIZE_START", {
+      requestId: rid,
+      uid,
+      creationId,
+      sourceUrl: String(sourceUrl).slice(0, 240),
+    });
+
+    const finalized = await finalizeGeneratedVideo({
+      uid,
+      creationId,
+      sourceUrl,
+      orientation: meta?.orientation || "portrait",
+      lengthSec: Number(meta?.lengthSec || 5),
+    });
+
+    await writeFinalizedCreationDoc({
+      uid,
+      creationId,
+      finalized,
+      meta,
+      source: "webhook",
+    });
+
+    await setLastResult(uid, {
+      id: creationId,
+      status: "ready",
+      title: "",
+      message: "",
+      url: finalized.videoUrl,
+      meta: { ...meta, creationId, webhookFinalized: true },
+      createdAt: admin.firestore.Timestamp.now(),
+    });
+
+    try {
+      const emailResult = await sendVideoReadyEmailViaApi({
+        uid,
+        creationId,
+        videoUrl: finalized.videoUrl,
+        model: meta?.model || "",
+        videoLength: Number(meta?.lengthSec || 5),
+        resolution: String(meta?.resolution || ""),
+        fps: Number(meta?.fps || 0),
+      });
+      console.log("📧 fal-webhook ready email result:", emailResult);
+    } catch (e) {
+      console.warn("⚠️ fal-webhook ready email api failed:", e?.message || e);
+    }
+
+    await markFalFinalizeDone(rid, {
+      uid,
+      creationId,
+      webhookVideoUrl: sourceUrl || null,
+      finalizedVideoUrl: finalized.videoUrl || null,
+      finalizedStorage: finalized.storage || null,
+    });
+
+    console.log("🟢 FAL_WEBHOOK_FINALIZE_DONE", { requestId: rid, uid, creationId });
+    return { ok: true, finalized: true, uid, creationId };
+  } catch (e) {
+    console.error("❌ FAL_WEBHOOK_FINALIZE_FAILED", { requestId: rid, error: e?.message || String(e) });
+    await markFalFinalizeFailed(rid, e);
+    return { ok: false, error: e?.message || String(e) };
+  }
 }
 
 
@@ -3030,14 +3242,13 @@ const prompt = String(body.prompt || body.text || "").trim();
 	hasGetVideoFrameForResolution: typeof getVideoFrameForResolution,
 	});
 
-    // Stable creation id + filename must be decided BEFORE lastResult.processing.
-    // Otherwise lastResult.id can point to a temporary id while meta.creationId points
-    // to an older client-created pending doc after dedupe.
-    const generatedId = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    // Build result skeleton
+    const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const createdAt = admin.firestore.Timestamp.now();
 
     let fileName = String(body.fileName || "").trim() || "";
     const watermarkApplied = !!billing?.watermarkApplied;
+    // ✅ If client did not send fileName, generate a stable one (needed for Firestore + share)
     if (!fileName) {
       const now = new Date();
       const pad = (n) => String(n).padStart(2, "0");
@@ -3045,6 +3256,7 @@ const prompt = String(body.prompt || body.text || "").trim();
       fileName = `GeNova_${model}_${lengthSec}s_${resolution}_${fps}fps_${stamp}.mp4`;
     }
 
+    // Client may send creationId + fileName (recommended)
     const clientCreationId = String(body.creationId || body.creationDocId || body.docId || "").trim();
     let creationId = clientCreationId || "";
     if (!creationId) {
@@ -3054,12 +3266,11 @@ const prompt = String(body.prompt || body.text || "").trim();
         console.log("🧩 using existing pending creation docId (dedupe):", creationId);
       }
     }
-    if (!creationId) creationId = generatedId;
-    const id = creationId;
+    if (!creationId) creationId = id;
+
 
     const meta = {
 	  model,
-      prompt: String(prompt || ""),
 	  lengthSec,
 	  fps,
 	  resolution,
@@ -3072,10 +3283,13 @@ const prompt = String(body.prompt || body.text || "").trim();
 	  aspectRatio: outputFrame.aspectRatio,
 	  orientation: outputFrame.orientation,
 	  provider: resolveProviderFromModel(model),
-      creationId,
-      fileName,
-      watermarkRequired: !!watermarkApplied,
 	};
+
+
+    meta.creationId = creationId;
+    meta.fileName = fileName;
+    meta.watermarkRequired = !!watermarkApplied;
+    meta.prompt = String(prompt || "");
 
     // Mark as processing first
     await setLastResult(uid, {
@@ -3125,6 +3339,7 @@ const prompt = String(body.prompt || body.text || "").trim();
           ? await createWanTask({
               uid,
               creationId,
+              webhookMeta: { ...meta, model, fileName, fps, resolution, lengthSec, watermarkRequired: !!watermarkApplied },
               prompt,
               hasImage: !!req.file,
               localImagePath: req.file?.path || null,
@@ -3132,12 +3347,12 @@ const prompt = String(body.prompt || body.text || "").trim();
               lengthSec,
               resolution,
               orientation: outputFrame.orientation,
-              webhookMeta: meta,
             })
           : provider === "pika"
           ? await createPikaTask({
               uid,
               creationId,
+              webhookMeta: { ...meta, model, fileName, fps, resolution, lengthSec, watermarkRequired: !!watermarkApplied },
               prompt,
               hasImage: !!req.file,
               localImagePath: req.file?.path || null,
@@ -3145,7 +3360,6 @@ const prompt = String(body.prompt || body.text || "").trim();
               lengthSec,
               resolution,
               orientation: outputFrame.orientation,
-              webhookMeta: meta,
             })
           : provider === "kling"
           ? await createKlingTask({
@@ -3222,10 +3436,6 @@ const prompt = String(body.prompt || body.text || "").trim();
         console.warn("⚠️ creation processing doc update failed:", e?.message || e);
       }
 
-      // Webhook-primary compatibility response.
-      // Older HomeScreen code expects a "successful" JSON shape from /generate-video.
-      // In webhook mode there is no final videoUrl yet, so we return an explicit
-      // processing payload instead of letting the client interpret HTTP 200 as a failure.
       return res.json({
         success: true,
         ok: true,
@@ -3234,39 +3444,23 @@ const prompt = String(body.prompt || body.text || "").trim();
         pending: true,
         pendingWebhook: true,
         status: "processing",
-        message: "Generation started",
+        message: "Generation started. Waiting for provider webhook.",
         resultId: id,
-        id,
         creationId,
         fileName,
         provider: providerResult.provider || provider,
         providerRequestId: providerResult.taskId || null,
-        requestId: providerResult.taskId || null,
-        taskId: providerResult.taskId || null,
-        statusUrl: providerResult.statusUrl || null,
-        resultUrl: providerResult.resultUrl || null,
         videoUrl: "",
         url: "",
         data: {
-          success: true,
           ok: true,
-          accepted: true,
           processing: true,
           pendingWebhook: true,
-          status: "processing",
-          videoUrl: "",
-          url: "",
           creationId,
-          fileName,
-          resultId: id,
-          id,
+          requestId: providerResult.taskId || null,
         },
         result: {
-          success: true,
-          ok: true,
           id,
-          creationId,
-          fileName,
           status: "processing",
           processing: true,
           pendingWebhook: true,
@@ -3280,17 +3474,37 @@ const prompt = String(body.prompt || body.text || "").trim();
     }
 
     const sourceUrl = String(providerResult?.videoUrl || "").trim();
-    console.log("🎥 PROVIDER_VIDEO_URL_RESOLVED", {
-      provider: providerResult?.provider || provider,
-      taskId: providerResult?.taskId || null,
-      sourceUrl: sourceUrl ? sourceUrl.slice(0, 240) : "",
-      usable: isUsableGeneratedVideoUrl(sourceUrl),
-    });
     if (!sourceUrl) throw new Error("PROVIDER_VIDEO_URL_MISSING");
-    if (!videoTestMode && !isUsableGeneratedVideoUrl(sourceUrl)) {
-      const err = new Error("PROVIDER_VIDEO_URL_INVALID_OR_PLACEHOLDER");
-      err.sourceUrl = sourceUrl;
-      throw err;
+    const providerRequestId = String(providerResult?.taskId || "").trim();
+    const fallbackClaim = await tryClaimFalFinalize(providerRequestId, "polling_fallback");
+
+    if (providerRequestId && !fallbackClaim.ok) {
+      console.log("🟡 POLLING_FINALIZE_SKIPPED", { requestId: providerRequestId, reason: fallbackClaim.reason });
+      const creationSnap = await db.collection("users").doc(uid).collection("creations").doc(creationId).get();
+      const existing = creationSnap.exists ? (creationSnap.data() || {}) : {};
+      const existingUrl = existing.videoUrl || existing.url || existing?.storage?.finalVideoUrl || null;
+      if (existingUrl) {
+        return res.json({
+          success: true,
+          videoUrl: existingUrl,
+          resultId: id,
+          creationId,
+          fileName,
+          result: { id, status: "ready", url: existingUrl, meta: { ...meta, creationId, fileName, watermarkRequired: !!watermarkApplied }, createdAt },
+          billing,
+          finalizedBy: fallbackClaim.reason,
+        });
+      }
+      return res.json({
+        success: true,
+        videoUrl: null,
+        resultId: id,
+        creationId,
+        fileName,
+        result: { id, status: "processing", url: "", meta: { ...meta, creationId, fileName, watermarkRequired: !!watermarkApplied }, createdAt },
+        billing,
+        finalizedBy: fallbackClaim.reason,
+      });
     }
 
     const finalized = await finalizeGeneratedVideo({
@@ -3300,6 +3514,16 @@ const prompt = String(body.prompt || body.text || "").trim();
 	  orientation: outputFrame.orientation,
 	  lengthSec,
 	});
+
+    if (providerRequestId) {
+      await markFalFinalizeDone(providerRequestId, {
+        uid,
+        creationId,
+        pollingVideoUrl: sourceUrl || null,
+        finalizedVideoUrl: finalized.videoUrl || null,
+        finalizedStorage: finalized.storage || null,
+      });
+    }
 
     const url = finalized.videoUrl;// Mark as ready
     await setLastResult(uid, {
@@ -3478,177 +3702,6 @@ const prompt = String(body.prompt || body.text || "").trim();
     console.error("❌ /generate-video error:", e);
     const code = e?.code || e?.message || "GENERATE_FAILED";
     return res.status(400).json({ success: false, error: code, meta: e?.meta || null });
-  }
-});
-
-
-// ------------------------------------------------------------
-// ✅ FAL webhook finalizer — webhook-primary provider completion
-// ------------------------------------------------------------
-app.post("/fal-webhook", async (req, res) => {
-  try {
-    const body = req.body || {};
-    const payload = extractFalWebhookPayload(body);
-    const requestId = extractFalWebhookRequestId(body) || extractFalWebhookRequestId(payload);
-
-    console.log("🟦 FAL_WEBHOOK_RECEIVED", {
-      requestId: requestId || null,
-      bodyKeys: Object.keys(body || {}),
-      payloadKeys: payload && typeof payload === "object" ? Object.keys(payload) : [],
-      status: payload?.status || body?.status || null,
-    });
-
-    if (!requestId) {
-      return res.status(400).json({ success: false, error: "FAL_WEBHOOK_REQUEST_ID_MISSING" });
-    }
-
-    const mapRef = db.collection("fal_requests").doc(requestId);
-    const mapSnap = await mapRef.get();
-    if (!mapSnap.exists) {
-      console.warn("⚠️ FAL_WEBHOOK_MAPPING_NOT_FOUND", { requestId });
-      return res.status(202).json({ success: true, skipped: true, reason: "mapping_not_found" });
-    }
-
-    const map = mapSnap.data() || {};
-    const uid = String(map.uid || "").trim();
-    const creationId = String(map.creationId || "").trim();
-    const meta = map.meta || {};
-    const provider = String(map.provider || meta.provider || "fal").trim();
-    const statusRaw = payload?.status || body?.status || "";
-
-    if (isFalFailedStatus(statusRaw)) {
-      await mapRef.set(
-        { status: "failed", failedAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp(), error: payload?.error || payload?.detail || body?.error || null },
-        { merge: true }
-      );
-      if (uid && creationId) {
-        await db.collection("users").doc(uid).collection("creations").doc(creationId).set(
-          { status: "failed", providerStatus: String(statusRaw || "failed"), updatedAt: admin.firestore.Timestamp.now() },
-          { merge: true }
-        );
-      }
-      return res.json({ success: true, status: "failed" });
-    }
-
-    const videoUrl = pickVideoUrlFromAny(payload) || pickVideoUrlFromAny(body);
-    if (!videoUrl) {
-      // Some FAL callbacks/status callbacks may arrive before the final response body.
-      // Keep the mapping alive and wait for the completion callback.
-      await mapRef.set(
-        { status: isFalCompletedStatus(statusRaw) ? "completed_without_video_url" : "processing", lastWebhookAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp(), lastWebhookStatus: statusRaw || null },
-        { merge: true }
-      );
-      return res.json({ success: true, pending: true, reason: "video_url_not_ready" });
-    }
-
-    if (!uid || !creationId) {
-      await mapRef.set(
-        { status: "completed_missing_uid_or_creation", providerVideoUrl: videoUrl, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-        { merge: true }
-      );
-      return res.status(202).json({ success: true, skipped: true, reason: "missing_uid_or_creation" });
-    }
-
-    // Idempotency: if already finalized, do not upload/send email twice.
-    const existingCreationRef = db.collection("users").doc(uid).collection("creations").doc(creationId);
-    const existingCreationSnap = await existingCreationRef.get();
-    const existingCreation = existingCreationSnap.exists ? (existingCreationSnap.data() || {}) : {};
-    if (String(existingCreation.status || "").toLowerCase() === "ready" && (existingCreation.videoUrl || existingCreation.url)) {
-      await mapRef.set(
-        { status: "already_finalized", providerVideoUrl: videoUrl, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-        { merge: true }
-      );
-      return res.json({ success: true, alreadyFinalized: true });
-    }
-
-    const finalized = await finalizeGeneratedVideo({
-      uid,
-      creationId,
-      sourceUrl: videoUrl,
-      orientation: meta.orientation || "portrait",
-      lengthSec: Number(meta.lengthSec || meta.length || 5),
-    });
-
-    const finalUrl = finalized.videoUrl;
-    const fileName = String(meta.fileName || "");
-    const watermarkRequired = !!meta.watermarkRequired;
-
-    await setLastResult(uid, {
-      id: creationId,
-      status: "ready",
-      title: "",
-      message: "",
-      url: finalUrl,
-      meta: { ...meta, creationId, fileName, watermarkRequired },
-      createdAt: admin.firestore.Timestamp.now(),
-    });
-
-    await existingCreationRef.set(
-      {
-        uid,
-        model: meta.model || provider,
-        prompt: String(meta.prompt || ""),
-        length: Number(meta.lengthSec || 5),
-        fps: Number(meta.fps || 30),
-        resolution: String(meta.resolution || ""),
-        hasImage: !!meta.hasImage,
-        fileName,
-        width: meta.width || null,
-        height: meta.height || null,
-        aspectRatio: meta.aspectRatio || null,
-        orientation: meta.orientation || null,
-        meta: { ...meta, creationId, fileName, watermarkRequired },
-        status: "ready",
-        providerStatus: "completed",
-        providerRequestId: requestId,
-        provider,
-        videoUrl: finalUrl,
-        url: finalUrl,
-        thumbUrl: null,
-        thumbnailUrl: null,
-        storage: {
-          ...(finalized?.storage || {}),
-          originalVideoPath: finalized?.storage?.videoPath || null,
-          thumbPath: null,
-        },
-        watermarkApplied: false,
-        watermarkRequired,
-        watermarkStatus: watermarkRequired ? "pending" : "not_required",
-        updatedAt: admin.firestore.Timestamp.now(),
-      },
-      { merge: true }
-    );
-
-    await mapRef.set(
-      {
-        status: "finalized",
-        providerVideoUrl: videoUrl,
-        finalVideoUrl: finalUrl,
-        finalizedAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    try {
-      const emailResult = await sendVideoReadyEmailViaApi({
-        uid,
-        creationId,
-        videoUrl: finalUrl,
-        model: meta.model || provider,
-        videoLength: Number(meta.lengthSec || 5),
-        resolution: String(meta.resolution || ""),
-        fps: Number(meta.fps || 30),
-      });
-      console.log("📧 fal-webhook ready email result:", emailResult);
-    } catch (e3) {
-      console.warn("⚠️ fal-webhook ready email api failed:", e3?.message || e3);
-    }
-
-    return res.json({ success: true, finalized: true, creationId, videoUrl: finalUrl });
-  } catch (e) {
-    console.error("❌ /fal-webhook error:", e);
-    return res.status(500).json({ success: false, error: e?.message || "FAL_WEBHOOK_FAILED" });
   }
 });
 
