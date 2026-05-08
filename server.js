@@ -2905,6 +2905,87 @@ async function genFromImage(inp, out) {
 }
 
 
+// ------------------------------------------------------------
+// ✅ FAL webhook endpoint — provider completion callback
+// ------------------------------------------------------------
+// Must be registered before app.listen(). FAL calls this URL when a queued
+// Pika/WAN request finishes. This route intentionally accepts anonymous POSTs,
+// because provider webhooks do not include the user's Firebase token.
+app.post("/fal-webhook", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const payload = extractFalWebhookPayload(body);
+    const requestId = extractFalWebhookRequestId(body) || extractFalWebhookRequestId(payload);
+    const statusRaw = String(
+      body?.status ||
+      payload?.status ||
+      body?.error?.status ||
+      payload?.error?.status ||
+      ""
+    ).trim();
+    const status = statusRaw.toUpperCase();
+
+    console.log("🟦 FAL_WEBHOOK_RECEIVED", {
+      requestId: requestId || null,
+      bodyKeys: Object.keys(body || {}),
+      payloadKeys: payload && typeof payload === "object" ? Object.keys(payload) : [],
+      status: statusRaw || null,
+    });
+
+    if (!requestId) {
+      return res.status(400).json({ success: false, error: "missing_request_id" });
+    }
+
+    if (["FAILED", "ERROR", "CANCELLED", "CANCELED"].includes(status)) {
+      try {
+        await db.collection("fal_requests").doc(requestId).set(
+          {
+            status: "failed",
+            providerStatus: statusRaw || null,
+            providerError: body?.error || payload?.error || null,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      } catch (_) {}
+      return res.json({ success: true, failed: true, requestId });
+    }
+
+    const sourceUrl = pickVideoUrlFromAny(payload) || pickVideoUrlFromAny(body);
+
+    if (!sourceUrl) {
+      try {
+        await db.collection("fal_requests").doc(requestId).set(
+          {
+            status: "webhook_received_no_video",
+            providerStatus: statusRaw || null,
+            lastWebhookAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      } catch (_) {}
+      return res.json({ success: true, skipped: true, reason: "no_video_url", requestId });
+    }
+
+    const result = await finalizeFalWebhookResult({ requestId, sourceUrl, payload });
+
+    if (result?.reason === "missing_mapping") {
+      return res.json({ success: true, skipped: true, reason: "mapping_not_found", requestId });
+    }
+
+    if (!result?.ok) {
+      return res.status(500).json({ success: false, error: result?.error || result?.reason || "finalize_failed", requestId });
+    }
+
+    return res.json({ success: true, ...result, requestId });
+  } catch (e) {
+    console.error("❌ /fal-webhook error:", e);
+    return res.status(500).json({ success: false, error: e?.message || "FAL_WEBHOOK_FAILED" });
+  }
+});
+
+
 // ----------------------------------------------------
 // Generation routes (video + prompt) — required by app
 // ----------------------------------------------------
