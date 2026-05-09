@@ -1972,6 +1972,12 @@ async function localFileToDataUrl(localPath, mimeType = "image/jpeg") {
   return `data:${mimeType};base64,${b64}`;
 }
 
+async function localFileToRawBase64(localPath) {
+  // Kling image2video expects RAW base64 only.
+  // Do NOT include "data:image/jpeg;base64," prefix here.
+  return fs.promises.readFile(localPath, { encoding: "base64" });
+}
+
 async function uploadTempInputAndGetSignedUrl(uid, localPath, mimeType = "image/jpeg") {
   const ext = path.extname(String(localPath || "")) || ".jpg";
   const objectPath = `temp-inputs/${uid}/${Date.now()}_${crypto.randomUUID()}${ext}`;
@@ -2336,19 +2342,51 @@ async function createKlingTask({ uid, prompt, hasImage, localImagePath, mimeType
   const token = createKlingJwtToken(cfg.accessKey, cfg.secretKey);
   const endpoint = hasImage ? "/v1/videos/image2video" : "/v1/videos/text2video";
   const queryPrefix = hasImage ? "/v1/videos/image2video/" : "/v1/videos/text2video/";
+
+  // Kling native audio:
+  // Keep GeNova AudioScreen/mix pipeline untouched. This only asks Kling to return
+  // the generated MP4 with its own native audio track when supported by the model.
+  const klingSound = String(process.env.KLING_SOUND || "on").trim().toLowerCase() === "off" ? "off" : "on";
+
   const payload = {
     model_name: hasImage ? cfg.imageModel : cfg.textModel,
     prompt: String(prompt || "").trim(),
     duration: String(Math.max(3, Math.min(15, Number(lengthSec || 5)))),
     mode: "std",
-    sound: "off",
+    sound: klingSound,
     aspect_ratio: mapAspectRatio(orientation),
     watermark_info: { enabled: false },
   };
+
   if (cfg.callbackUrl) payload.callback_url = cfg.callbackUrl;
+
   if (hasImage && localImagePath) {
-    payload.image = await localFileToDataUrl(localImagePath, mimeType || "image/jpeg");
+    // IMPORTANT:
+    // Kling /v1/videos/image2video returns HTTP_400 code=1201 when the image is sent
+    // as a data URL ("data:image/jpeg;base64,..."). It expects RAW base64 only.
+    payload.image = await localFileToRawBase64(localImagePath);
+
+    console.log("🖼️ KLING_IMAGE_BASE64_READY", {
+      uid,
+      mimeType: String(mimeType || "image/jpeg"),
+      bytes: (() => {
+        try { return fs.statSync(localImagePath).size; } catch (_) { return null; }
+      })(),
+      base64Length: String(payload.image || "").length,
+      hasDataPrefix: String(payload.image || "").startsWith("data:"),
+    });
   }
+
+  console.log("🔊 KLING_AUDIO_ENABLED", {
+    enabled: klingSound === "on",
+    sound: klingSound,
+    hasImage: !!hasImage,
+    model: hasImage ? cfg.imageModel : cfg.textModel,
+    duration: payload.duration,
+    resolution: String(resolution || ""),
+    aspect_ratio: payload.aspect_ratio,
+  });
+
   const create = await httpJson(`${cfg.baseUrl}${endpoint}`, {
     method: "POST",
     headers: {
@@ -2358,6 +2396,7 @@ async function createKlingTask({ uid, prompt, hasImage, localImagePath, mimeType
     body: JSON.stringify(payload),
     timeoutMs: 90000,
   });
+
   const taskId = String(create.json?.data?.task_id || create.json?.task_id || "").trim();
   if (!taskId) throw new Error("KLING_TASK_ID_MISSING");
 
@@ -2377,6 +2416,7 @@ async function createKlingTask({ uid, prompt, hasImage, localImagePath, mimeType
       throw new Error(`KLING_FAILED:${q.json?.data?.task_status_msg || q.json?.task_status_msg || "failed"}`);
     }
   }
+
   if (!videoUrl) throw new Error("KLING_TIMEOUT");
   return { provider: "kling", taskId, videoUrl };
 }
