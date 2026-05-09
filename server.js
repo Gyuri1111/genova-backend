@@ -1754,8 +1754,8 @@ const PROVIDERS = {
     accessKey: String(process.env.KLING_ACCESS_KEY || "").trim(),
     secretKey: String(process.env.KLING_SECRET_KEY || "").trim(),
     baseUrl: String(process.env.KLING_BASE_URL || "https://api-singapore.klingai.com").trim().replace(/\/+$/, ""),
-    textModel: String(process.env.KLING_TEXT_MODEL || "kling-v2-6").trim(),
-    imageModel: String(process.env.KLING_IMAGE_MODEL || "kling-v2-6").trim(),
+    textModel: String(process.env.KLING_TEXT_MODEL || "kling-v3-omni").trim(),
+    imageModel: String(process.env.KLING_IMAGE_MODEL || "kling-v3-omni").trim(),
     callbackUrl: String(process.env.KLING_CALLBACK_URL || "").trim(),
   },
   runway: {
