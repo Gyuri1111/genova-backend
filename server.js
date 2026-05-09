@@ -1972,6 +1972,12 @@ async function localFileToDataUrl(localPath, mimeType = "image/jpeg") {
   return `data:${mimeType};base64,${b64}`;
 }
 
+async function localFileToRawBase64(localPath) {
+  // Kling image2video expects RAW base64 only.
+  // Do NOT include "data:image/jpeg;base64," prefix here.
+  return fs.promises.readFile(localPath, { encoding: "base64" });
+}
+
 async function uploadTempInputAndGetSignedUrl(uid, localPath, mimeType = "image/jpeg") {
   const ext = path.extname(String(localPath || "")) || ".jpg";
   const objectPath = `temp-inputs/${uid}/${Date.now()}_${crypto.randomUUID()}${ext}`;
@@ -2338,120 +2344,72 @@ function mapKlingOmniMode(resolution) {
   return "std";
 }
 
-function isKlingOmniModel(modelName) {
-  const m = String(modelName || "").toLowerCase().trim();
-  return m.includes("omni") || m === "kling-video-o1" || m === "kling-o1";
+function buildKlingOmniPrompt({ prompt, hasImage }) {
+  const base = String(prompt || "").trim();
+
+  if (hasImage) {
+    // Kling Omni image_list references should be explicit in the prompt.
+    // This matches the official <<<image_1>>> pattern and avoids legacy image2video payloads.
+    if (base.includes("<<<image_1>>>")) return base;
+    return base
+      ? `Using <<<image_1>>> as the first frame/reference image, ${base}`
+      : "Using <<<image_1>>> as the first frame/reference image, animate it into a cinematic video.";
+  }
+
+  return base || "Generate a cinematic video.";
 }
 
 async function createKlingTask({ uid, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation }) {
   const cfg = ensureProviderReady("kling");
   const token = createKlingJwtToken(cfg.accessKey, cfg.secretKey);
 
-  const modelName = String(hasImage ? cfg.imageModel : cfg.textModel || "kling-v3-omni").trim() || "kling-v3-omni";
+  const endpoint = "/v1/videos/omni-video";
+  const queryPrefix = "/v1/videos/omni-video/";
+  const modelName = "kling-v3-omni";
   const duration = String(Math.max(3, Math.min(15, Number(lengthSec || 5))));
+  const mode = mapKlingOmniMode(resolution);
   const aspectRatio = mapAspectRatio(orientation);
 
-  // ✅ Kling V3 Omni uses a different API than the legacy image2video/text2video endpoints.
-  // It supports native generated audio via sound:"on" and maps quality/resolution through mode:
-  //   std = 720p, pro = 1080p, 4k = 4K
-  if (isKlingOmniModel(modelName)) {
-    const endpoint = "/v1/videos/omni-video";
-    const queryPrefix = "/v1/videos/omni-video/";
-    const mode = mapKlingOmniMode(resolution);
-
-    const payload = {
-      model_name: modelName,
-      multi_shot: false,
-      prompt: String(prompt || "").trim() || (hasImage ? "Animate the reference image into a cinematic video." : "Generate a cinematic video."),
-      duration,
-      mode,
-      sound: "on",
-      watermark_info: { enabled: false },
-    };
-
-    // For normal text-to-video, aspect_ratio is required.
-    // For first-frame image generation, Kling accepts the first_frame image as framing input.
-    payload.aspect_ratio = aspectRatio;
-
-    if (cfg.callbackUrl) payload.callback_url = cfg.callbackUrl;
-
-    if (hasImage && localImagePath) {
-      // Omni image_list accepts either URL or base64. Signed URL is safer here than data-url/base64,
-      // and avoids the old "File is not in a valid base64 format" failure from /image2video.
-      const uploaded = await uploadTempInputAndGetSignedUrl(uid || "anonymous", localImagePath, mimeType || "image/jpeg");
-      payload.image_list = [
-        {
-          image_url: uploaded.signedUrl,
-          type: "first_frame",
-        },
-      ];
-    }
-
-    console.log("🟦 KLING_OMNI_ENABLED", {
-      endpoint,
-      model_name: payload.model_name,
-      sound: payload.sound,
-      mode: payload.mode,
-      resolution: normalizeResolution(resolution),
-      aspect_ratio: payload.aspect_ratio,
-      duration: payload.duration,
-      hasImage: !!hasImage,
-      imageListCount: Array.isArray(payload.image_list) ? payload.image_list.length : 0,
-    });
-
-    const create = await httpJson(`${cfg.baseUrl}${endpoint}`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-      timeoutMs: 90000,
-    });
-
-    const taskId = String(create.json?.data?.task_id || create.json?.task_id || "").trim();
-    if (!taskId) throw new Error("KLING_OMNI_TASK_ID_MISSING");
-
-    let videoUrl = null;
-    for (let i = 0; i < 60; i += 1) {
-      await sleep(4000);
-      const q = await httpJson(`${cfg.baseUrl}${queryPrefix}${encodeURIComponent(taskId)}`, {
-        headers: { Authorization: `Bearer ${token}` },
-        timeoutMs: 45000,
-      });
-      const status = String(q.json?.data?.task_status || q.json?.task_status || "").toLowerCase();
-      console.log("🟦 KLING_OMNI_STATUS_POLL", { poll: i + 1, taskId, status });
-      if (status === "succeed" || status === "success") {
-        videoUrl = pickVideoUrlFromAny(q.json);
-        console.log("🟩 KLING_OMNI_VIDEO_READY", { taskId, videoUrl: videoUrl || null });
-        break;
-      }
-      if (status === "failed") {
-        throw new Error(`KLING_OMNI_FAILED:${q.json?.data?.task_status_msg || q.json?.task_status_msg || "failed"}`);
-      }
-    }
-
-    if (!videoUrl) throw new Error("KLING_OMNI_TIMEOUT");
-    return { provider: "kling", taskId, videoUrl };
-  }
-
-  // Legacy Kling V2.x fallback: keep the old endpoints, but do not enable native audio here
-  // because kling-v2-6/std rejects sound:on.
-  const endpoint = hasImage ? "/v1/videos/image2video" : "/v1/videos/text2video";
-  const queryPrefix = hasImage ? "/v1/videos/image2video/" : "/v1/videos/text2video/";
   const payload = {
     model_name: modelName,
-    prompt: String(prompt || "").trim(),
-    duration,
-    mode: "std",
-    sound: "off",
+    prompt: buildKlingOmniPrompt({ prompt, hasImage: !!hasImage }),
+    mode,
+    sound: "on",
     aspect_ratio: aspectRatio,
+    duration,
+    image_list: [],
+    element_list: [],
+    video_list: [],
     watermark_info: { enabled: false },
   };
+
   if (cfg.callbackUrl) payload.callback_url = cfg.callbackUrl;
+
   if (hasImage && localImagePath) {
-    payload.image = await localFileToDataUrl(localImagePath, mimeType || "image/jpeg");
+    // Omni accepts image URL or Base64 in image_list.image_url.
+    // We use a temporary signed URL to avoid the legacy /image2video base64 format errors.
+    const uploaded = await uploadTempInputAndGetSignedUrl(uid || "anonymous", localImagePath, mimeType || "image/jpeg");
+    payload.image_list = [
+      {
+        image_url: uploaded.signedUrl,
+        type: "first_frame",
+      },
+    ];
   }
+
+  console.log("🟦 KLING_OMNI_POST", {
+    endpoint,
+    model_name: payload.model_name,
+    sound: payload.sound,
+    mode: payload.mode,
+    resolution: normalizeResolution(resolution),
+    aspect_ratio: payload.aspect_ratio,
+    duration: payload.duration,
+    hasImage: !!hasImage,
+    promptUsesImageToken: String(payload.prompt || "").includes("<<<image_1>>>"),
+    imageListCount: Array.isArray(payload.image_list) ? payload.image_list.length : 0,
+  });
+
   const create = await httpJson(`${cfg.baseUrl}${endpoint}`, {
     method: "POST",
     headers: {
@@ -2461,26 +2419,36 @@ async function createKlingTask({ uid, prompt, hasImage, localImagePath, mimeType
     body: JSON.stringify(payload),
     timeoutMs: 90000,
   });
+
   const taskId = String(create.json?.data?.task_id || create.json?.task_id || "").trim();
-  if (!taskId) throw new Error("KLING_TASK_ID_MISSING");
+  if (!taskId) throw new Error("KLING_OMNI_TASK_ID_MISSING");
 
   let videoUrl = null;
-  for (let i = 0; i < 35; i += 1) {
+  for (let i = 0; i < 60; i += 1) {
     await sleep(4000);
     const q = await httpJson(`${cfg.baseUrl}${queryPrefix}${encodeURIComponent(taskId)}`, {
       headers: { Authorization: `Bearer ${token}` },
       timeoutMs: 45000,
     });
+
     const status = String(q.json?.data?.task_status || q.json?.task_status || "").toLowerCase();
+
     if (status === "succeed" || status === "success") {
       videoUrl = pickVideoUrlFromAny(q.json);
+      console.log("🟩 KLING_OMNI_RESULT", {
+        taskId,
+        status,
+        videoUrl: videoUrl || null,
+      });
       break;
     }
-    if (status === "failed") {
-      throw new Error(`KLING_FAILED:${q.json?.data?.task_status_msg || q.json?.task_status_msg || "failed"}`);
+
+    if (status === "failed" || status === "failure") {
+      throw new Error(`KLING_OMNI_FAILED:${q.json?.data?.task_status_msg || q.json?.task_status_msg || "failed"}`);
     }
   }
-  if (!videoUrl) throw new Error("KLING_TIMEOUT");
+
+  if (!videoUrl) throw new Error("KLING_OMNI_TIMEOUT");
   return { provider: "kling", taskId, videoUrl };
 }
 
