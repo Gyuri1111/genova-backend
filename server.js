@@ -185,7 +185,12 @@ function getPublicBaseUrl(req) {
   return `${proto}://${host}`;
 }
 
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({
+  limit: "10mb",
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  },
+}));
 
 // ===== DEBUG_REQUEST_LOGGER (TEMP) =====
 app.use((req, res, next) => {
@@ -608,6 +613,7 @@ const BILLING = {
   // Model cost multipliers (v1 defaults)
   MODEL_FACTOR: {
     pika: 1.00,
+    ltx: 1.00,
     wan: 1.25,
     kling: 1.55,
     runway: 1.85,
@@ -624,10 +630,10 @@ function isModelAllowedByPlan(plan, model) {
   const p = normalizePlan(plan);
   const mk = String(model || "pika").toLowerCase().trim();
   const map = {
-    free:   new Set(["pika"]),
-    basic:  new Set(["pika", "wan"]),
-    pro:    new Set(["pika", "wan", "kling"]),
-    studio: new Set(["pika", "wan", "kling", "runway"]),
+    free:   new Set(["pika", "ltx"]),
+    basic:  new Set(["pika", "ltx", "wan"]),
+    pro:    new Set(["pika", "ltx", "wan", "kling"]),
+    studio: new Set(["pika", "ltx", "wan", "kling", "runway"]),
   };
   const allowed = map[p] || map.free;
   return allowed.has(mk);
@@ -1737,13 +1743,20 @@ const bucket = storage.bucket("genova-27d76.firebasestorage.app");
 
 
 // ------------------------------------------------------------
-// ✅ Provider configuration + helpers (Pika / WAN / Kling / Runway)
+// ✅ Provider configuration + helpers (Pika / LTX / WAN / Kling / Runway)
 // ------------------------------------------------------------
 const PROVIDERS = {
   pika: {
     apiKey: String(process.env.PIKA_API_KEY || "").trim(),
     textModel: String(process.env.PIKA_TEXT_MODEL || "fal-ai/pika/v2.2/text-to-video").trim(),
     imageModel: String(process.env.PIKA_IMAGE_MODEL || "fal-ai/pika/v2.2/image-to-video").trim(),
+  },
+  ltx: {
+    apiKey: String(process.env.WAVESPEED_API_KEY || "").trim(),
+    baseUrl: String(process.env.WAVESPEED_BASE_URL || "https://api.wavespeed.ai/api/v3").trim().replace(/\/+$/, ""),
+    textModel: String(process.env.WAVESPEED_LTX_TEXT_MODEL || "wavespeed-ai/ltx-2-19b/text-to-video").trim(),
+    imageModel: String(process.env.WAVESPEED_LTX_IMAGE_MODEL || "wavespeed-ai/ltx-2-19b/image-to-video").trim(),
+    webhookSecret: String(process.env.WAVESPEED_WEBHOOK_SECRET || "").trim(),
   },
   wan: {
     apiKey: String(process.env.WAN_API_KEY || "").trim(),
@@ -1891,6 +1904,7 @@ function resolveProviderFromModel(rawModel) {
   if (m === "runway") return "runway";
   if (m === "kling") return "kling";
   if (m === "pika" || m === "pika lite" || m === "pikalite" || m === "stable" || m === "minimax") return "pika"; // legacy free aliases -> Pika
+  if (m === "ltx" || m === "ltx-2" || m === "ltx 2" || m === "ltx-2-19b" || m === "wavespeed ltx") return "ltx";
   if (m === "wan" || m === "wan 2.7") return "wan";
   throw new Error(`UNKNOWN_MODEL:${rawModel}`);
 }
@@ -1898,6 +1912,7 @@ function resolveProviderFromModel(rawModel) {
 function mapOutputToProviderModel(rawModel) {
   const p = resolveProviderFromModel(rawModel);
   if (p === "pika") return "Pika";
+  if (p === "ltx") return "LTX";
   if (p === "wan") return "WAN";
   return String(rawModel || "").trim();
 }
@@ -1961,6 +1976,7 @@ function ensureProviderReady(provider) {
   const p = PROVIDERS[provider];
   if (!p) throw new Error(`UNKNOWN_PROVIDER:${provider}`);
   if (provider === "pika" && !p.apiKey) throw new Error("PIKA_API_KEY_MISSING");
+  if (provider === "ltx" && !p.apiKey) throw new Error("WAVESPEED_API_KEY_MISSING");
   if (provider === "wan" && !p.apiKey) throw new Error("WAN_API_KEY_MISSING");
   if (provider === "kling" && (!p.accessKey || !p.secretKey)) throw new Error("KLING_KEY_MISSING");
   if (provider === "runway" && !p.apiKey) throw new Error("RUNWAY_API_KEY_MISSING");
@@ -2009,6 +2025,8 @@ function isUsableGeneratedVideoUrl(value) {
   return (
     lower.includes("fal.media") ||
     lower.includes("falserverless") ||
+    lower.includes("cdn.wavespeed.ai") ||
+    lower.includes("wavespeed.ai/outputs") ||
     lower.includes("storage.googleapis.com") ||
     lower.includes("firebasestorage.googleapis.com") ||
     lower.includes(".mp4")
@@ -2046,6 +2064,8 @@ function pickVideoUrlFromAny(obj) {
     Array.isArray(obj.data?.videos) ? obj.data.videos[0]?.url : null,
     Array.isArray(obj.output) ? obj.output[0]?.url || obj.output[0] : null,
     Array.isArray(obj.data?.output) ? obj.data.output[0]?.url || obj.data.output[0] : null,
+    Array.isArray(obj.outputs) ? obj.outputs[0]?.url || obj.outputs[0] : null,
+    Array.isArray(obj.data?.outputs) ? obj.data.outputs[0]?.url || obj.data.outputs[0] : null,
 
     // Last resort only: generic url fields can also mean queue/control URLs.
     obj.url,
@@ -2214,6 +2234,203 @@ async function createWanTask({ uid, creationId = null, prompt, hasImage, localIm
   }
   if (!videoUrl) throw new Error(`WAN_TIMEOUT_AFTER_${maxPolls}_POLLS`);
   return { provider: "wan", taskId: requestId, videoUrl };
+}
+
+
+// ------------------------------------------------------------
+// WaveSpeed / LTX webhook-primary mode
+// ------------------------------------------------------------
+const WAVESPEED_WEBHOOK_PRIMARY = String(process.env.WAVESPEED_WEBHOOK_PRIMARY || "1").trim() !== "0";
+const WAVESPEED_WEBHOOK_URL = String(
+  process.env.WAVESPEED_WEBHOOK_URL ||
+  "https://genova-backend-45yb.onrender.com/wavespeed-webhook"
+).trim();
+
+function buildWaveSpeedSubmitUrl(cfg, modelSlug) {
+  const base = `${String(cfg.baseUrl || "https://api.wavespeed.ai/api/v3").replace(/\/+$/, "")}/${String(modelSlug || "").replace(/^\/+/, "")}`;
+  if (!WAVESPEED_WEBHOOK_URL) return base;
+  const sep = base.includes("?") ? "&" : "?";
+  return `${base}${sep}webhook=${encodeURIComponent(WAVESPEED_WEBHOOK_URL)}`;
+}
+
+function mapLtxResolution(resolution) {
+  const r = normalizeResolution(resolution);
+  if (r === "1080p" || r === "4k") return "1080p";
+  if (r === "720p") return "720p";
+  return "480p";
+}
+
+async function saveWaveSpeedRequestMapping({ requestId, provider, uid, creationId, modelSlug, statusUrl, resultUrl, meta }) {
+  const rid = String(requestId || "").trim();
+  if (!rid) return;
+
+  try {
+    await db.collection("wavespeed_requests").doc(rid).set(
+      {
+        requestId: rid,
+        provider: String(provider || "ltx"),
+        uid: uid || null,
+        creationId: creationId || null,
+        modelSlug: modelSlug || null,
+        statusUrl: statusUrl || null,
+        resultUrl: resultUrl || null,
+        webhookUrl: WAVESPEED_WEBHOOK_URL || null,
+        status: "submitted",
+        meta: meta || {},
+        submittedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    console.log("🧷 WAVESPEED_REQUEST_MAPPING_SAVED", {
+      requestId: rid,
+      provider,
+      uid,
+      creationId,
+      webhookUrl: WAVESPEED_WEBHOOK_URL || null,
+    });
+  } catch (e) {
+    console.warn("⚠️ saveWaveSpeedRequestMapping failed:", e?.message || e);
+  }
+}
+
+function verifyWaveSpeedWebhookSignature(req) {
+  const cfg = PROVIDERS.ltx || {};
+  const secretRaw = String(cfg.webhookSecret || "").trim();
+  if (!secretRaw) return true;
+
+  const webhookId = String(req.headers["webhook-id"] || "").trim();
+  const webhookTimestamp = String(req.headers["webhook-timestamp"] || "").trim();
+  const webhookSignature = String(req.headers["webhook-signature"] || "").trim();
+  const rawBody = req.rawBody ? Buffer.from(req.rawBody).toString("utf8") : JSON.stringify(req.body || {});
+
+  if (!webhookId || !webhookTimestamp || !webhookSignature) return false;
+
+  const secret = secretRaw.replace(/^whsec_/, "");
+  const signed = `${webhookId}.${webhookTimestamp}.${rawBody}`;
+  const expectedHex = crypto.createHmac("sha256", secret).update(signed).digest("hex");
+  const gotHex = webhookSignature.replace(/^v3,/, "").trim();
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expectedHex, "hex"), Buffer.from(gotHex, "hex"));
+  } catch (_) {
+    return false;
+  }
+}
+
+async function createLtxTask({ uid, creationId = null, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation, webhookMeta = null }) {
+  const cfg = ensureProviderReady("ltx");
+  let signedInput = null;
+  if (hasImage && localImagePath) {
+    signedInput = await uploadTempInputAndGetSignedUrl(uid, localImagePath, mimeType || "image/jpeg");
+  }
+
+  const modelSlug = hasImage ? cfg.imageModel : cfg.textModel;
+  const input = {
+    prompt: String(prompt || "").trim(),
+    duration: Math.max(1, Math.min(20, Number(lengthSec || 5))),
+    resolution: mapLtxResolution(resolution),
+    seed: -1,
+  };
+
+  if (hasImage && signedInput?.signedUrl) {
+    input.image = signedInput.signedUrl;
+  } else {
+    input.aspect_ratio = mapAspectRatio(orientation);
+  }
+
+  const submitUrl = buildWaveSpeedSubmitUrl(cfg, modelSlug);
+  const submit = await httpJson(submitUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${cfg.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(input),
+    timeoutMs: 90000,
+  });
+
+  const requestId = String(submit.json?.id || submit.json?.data?.id || submit.json?.request_id || submit.json?.requestId || "").trim();
+  if (!requestId) throw new Error("LTX_REQUEST_ID_MISSING");
+
+  const baseUrl = String(cfg.baseUrl || "https://api.wavespeed.ai/api/v3").replace(/\/+$/, "");
+  const statusUrl = `${baseUrl}/predictions/${encodeURIComponent(requestId)}`;
+  const resultUrl = `${baseUrl}/predictions/${encodeURIComponent(requestId)}/result`;
+
+  console.log("🟦 WAVESPEED_LTX_QUEUE_URLS", {
+    requestId,
+    modelSlug,
+    statusUrl,
+    resultUrl,
+    inputKeys: Object.keys(input || {}),
+    webhookPrimary: WAVESPEED_WEBHOOK_PRIMARY,
+    nativeAudio: true,
+  });
+
+  await saveWaveSpeedRequestMapping({
+    requestId,
+    provider: "ltx",
+    uid,
+    creationId,
+    modelSlug,
+    statusUrl,
+    resultUrl,
+    meta: {
+      ...(webhookMeta || {}),
+      hasImage: !!hasImage,
+      lengthSec: Number(lengthSec || 5),
+      resolution: String(resolution || ""),
+      orientation: String(orientation || ""),
+      nativeAudio: true,
+    },
+  });
+
+  if (WAVESPEED_WEBHOOK_PRIMARY) {
+    return {
+      provider: "ltx",
+      taskId: requestId,
+      pendingWebhook: true,
+      status: "processing",
+      statusUrl,
+      resultUrl,
+      modelSlug,
+      nativeAudio: true,
+    };
+  }
+
+  const maxPolls = getFalVideoMaxPolls({ provider: "ltx", hasImage, lengthSec });
+  let videoUrl = null;
+
+  for (let i = 0; i < maxPolls; i += 1) {
+    await sleep(FAL_VIDEO_POLL_INTERVAL_MS);
+
+    const status = await httpJson(statusUrl, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${cfg.apiKey}` },
+      timeoutMs: 45000,
+    });
+    const s = String(status.json?.status || status.json?.data?.status || "").toLowerCase();
+
+    if (s === "completed") {
+      const result = await httpJson(resultUrl, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${cfg.apiKey}` },
+        timeoutMs: 45000,
+      });
+      logFalResultJson("🟨 WAVESPEED_LTX_RESULT_JSON", result.json);
+      videoUrl = pickVideoUrlFromAny(result.json) || pickVideoUrlFromAny(status.json) || null;
+      console.log("🟨 WAVESPEED_LTX_PICKED_VIDEO_URL", { requestId, videoUrl: videoUrl || null });
+      break;
+    }
+
+    if (["failed", "error", "cancelled", "canceled"].includes(s)) {
+      throw new Error(`LTX_FAILED:${status.json?.error || status.json?.data?.error || status.json?.message || "failed"}`);
+    }
+  }
+
+  if (!videoUrl) throw new Error(`LTX_TIMEOUT_AFTER_${maxPolls}_POLLS`);
+  return { provider: "ltx", taskId: requestId, videoUrl, nativeAudio: true };
 }
 
 async function createPikaTask({ uid, creationId = null, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation, webhookMeta = null }) {
@@ -3205,6 +3422,19 @@ const prompt = String(body.prompt || body.text || "").trim();
               orientation: outputFrame.orientation,
               webhookMeta: meta,
             })
+          : provider === "ltx"
+          ? await createLtxTask({
+              uid,
+              creationId,
+              prompt,
+              hasImage: !!req.file,
+              localImagePath: req.file?.path || null,
+              mimeType: imageMimeType,
+              lengthSec,
+              resolution,
+              orientation: outputFrame.orientation,
+              webhookMeta: meta,
+            })
           : provider === "pika"
           ? await createPikaTask({
               uid,
@@ -3720,6 +3950,188 @@ app.post("/fal-webhook", async (req, res) => {
   } catch (e) {
     console.error("❌ /fal-webhook error:", e);
     return res.status(500).json({ success: false, error: e?.message || "FAL_WEBHOOK_FAILED" });
+  }
+});
+
+
+
+// ------------------------------------------------------------
+// ✅ WaveSpeed webhook finalizer — LTX provider completion
+// ------------------------------------------------------------
+app.post("/wavespeed-webhook", async (req, res) => {
+  try {
+    if (!verifyWaveSpeedWebhookSignature(req)) {
+      console.warn("⚠️ WAVESPEED_WEBHOOK_SIGNATURE_INVALID");
+      return res.status(401).json({ success: false, error: "INVALID_SIGNATURE" });
+    }
+
+    const body = req.body || {};
+    const requestId = String(body?.id || body?.data?.id || body?.request_id || body?.requestId || "").trim();
+    const statusRaw = String(body?.status || body?.data?.status || "").trim().toLowerCase();
+
+    console.log("🟦 WAVESPEED_WEBHOOK_RECEIVED", {
+      requestId: requestId || null,
+      status: statusRaw || null,
+      model: body?.model || null,
+      bodyKeys: Object.keys(body || {}),
+    });
+
+    if (!requestId) {
+      return res.status(400).json({ success: false, error: "WAVESPEED_WEBHOOK_REQUEST_ID_MISSING" });
+    }
+
+    const mapRef = db.collection("wavespeed_requests").doc(requestId);
+    const mapSnap = await mapRef.get();
+    if (!mapSnap.exists) {
+      console.warn("⚠️ WAVESPEED_WEBHOOK_MAPPING_NOT_FOUND", { requestId });
+      return res.status(202).json({ success: true, skipped: true, reason: "mapping_not_found" });
+    }
+
+    const map = mapSnap.data() || {};
+    const uid = String(map.uid || "").trim();
+    const creationId = String(map.creationId || "").trim();
+    const meta = map.meta || {};
+    const provider = String(map.provider || meta.provider || "ltx").trim();
+
+    if (["failed", "error", "cancelled", "canceled"].includes(statusRaw)) {
+      await mapRef.set(
+        { status: "failed", failedAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp(), error: body?.error || null },
+        { merge: true }
+      );
+      if (uid && creationId) {
+        await db.collection("users").doc(uid).collection("creations").doc(creationId).set(
+          { status: "failed", providerStatus: String(statusRaw || "failed"), providerError: body?.error || null, updatedAt: admin.firestore.Timestamp.now() },
+          { merge: true }
+        );
+      }
+      return res.json({ success: true, status: "failed" });
+    }
+
+    if (statusRaw !== "completed") {
+      await mapRef.set(
+        { status: statusRaw || "processing", lastWebhookAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp(), lastWebhookStatus: statusRaw || null },
+        { merge: true }
+      );
+      return res.json({ success: true, pending: true, status: statusRaw || "processing" });
+    }
+
+    const videoUrl = pickVideoUrlFromAny(body);
+    if (!videoUrl) {
+      await mapRef.set(
+        { status: "completed_without_video_url", lastWebhookAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+      return res.json({ success: true, pending: true, reason: "video_url_not_ready" });
+    }
+
+    if (!uid || !creationId) {
+      await mapRef.set(
+        { status: "completed_missing_uid_or_creation", providerVideoUrl: videoUrl, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+      return res.status(202).json({ success: true, skipped: true, reason: "missing_uid_or_creation" });
+    }
+
+    const existingCreationRef = db.collection("users").doc(uid).collection("creations").doc(creationId);
+    const existingCreationSnap = await existingCreationRef.get();
+    const existingCreation = existingCreationSnap.exists ? (existingCreationSnap.data() || {}) : {};
+    if (String(existingCreation.status || "").toLowerCase() === "ready" && (existingCreation.videoUrl || existingCreation.url)) {
+      await mapRef.set(
+        { status: "already_finalized", providerVideoUrl: videoUrl, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+      return res.json({ success: true, alreadyFinalized: true });
+    }
+
+    const finalized = await finalizeGeneratedVideo({
+      uid,
+      creationId,
+      sourceUrl: videoUrl,
+      orientation: meta.orientation || "portrait",
+      lengthSec: Number(meta.lengthSec || meta.length || 5),
+    });
+
+    const finalUrl = finalized.videoUrl;
+    const fileName = String(meta.fileName || "");
+    const watermarkRequired = !!meta.watermarkRequired;
+
+    await setLastResult(uid, {
+      id: creationId,
+      status: "ready",
+      title: "",
+      message: "",
+      url: finalUrl,
+      meta: { ...meta, creationId, fileName, watermarkRequired, nativeAudio: true },
+      createdAt: admin.firestore.Timestamp.now(),
+    });
+
+    await existingCreationRef.set(
+      {
+        uid,
+        model: meta.model || "LTX",
+        prompt: String(meta.prompt || ""),
+        length: Number(meta.lengthSec || 5),
+        fps: Number(meta.fps || 30),
+        resolution: String(meta.resolution || ""),
+        hasImage: !!meta.hasImage,
+        fileName,
+        width: meta.width || null,
+        height: meta.height || null,
+        aspectRatio: meta.aspectRatio || null,
+        orientation: meta.orientation || null,
+        meta: { ...meta, creationId, fileName, watermarkRequired, nativeAudio: true },
+        status: "ready",
+        providerStatus: "completed",
+        providerRequestId: requestId,
+        provider,
+        nativeAudio: true,
+        videoUrl: finalUrl,
+        url: finalUrl,
+        thumbUrl: null,
+        thumbnailUrl: null,
+        storage: {
+          ...(finalized?.storage || {}),
+          originalVideoPath: finalized?.storage?.videoPath || null,
+          thumbPath: null,
+        },
+        watermarkApplied: false,
+        watermarkRequired,
+        watermarkStatus: watermarkRequired ? "pending" : "not_required",
+        updatedAt: admin.firestore.Timestamp.now(),
+      },
+      { merge: true }
+    );
+
+    await mapRef.set(
+      {
+        status: "finalized",
+        providerVideoUrl: videoUrl,
+        finalVideoUrl: finalUrl,
+        finalizedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    try {
+      const emailResult = await sendVideoReadyEmailViaApi({
+        uid,
+        creationId,
+        videoUrl: finalUrl,
+        model: meta.model || "LTX",
+        videoLength: Number(meta.lengthSec || 5),
+        resolution: String(meta.resolution || ""),
+        fps: Number(meta.fps || 30),
+      });
+      console.log("📧 wavespeed-webhook ready email result:", emailResult);
+    } catch (e3) {
+      console.warn("⚠️ wavespeed-webhook ready email api failed:", e3?.message || e3);
+    }
+
+    return res.json({ success: true, finalized: true, creationId, videoUrl: finalUrl });
+  } catch (e) {
+    console.error("❌ /wavespeed-webhook error:", e);
+    return res.status(500).json({ success: false, error: e?.message || "WAVESPEED_WEBHOOK_FAILED" });
   }
 });
 
