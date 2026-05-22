@@ -612,11 +612,10 @@ const BILLING = {
   BASE_CREDITS: 4,
   // Model cost multipliers (v1 defaults)
   MODEL_FACTOR: {
-    pika: 1.00,
-    ltx: 1.00,
-    wan: 1.25,
-    kling: 1.55,
-    runway: 1.85,
+    wan: 1.35,
+    pixverse: 1.45,
+    kling: 1.75,
+    runway: 2.15,
     default: 1.00,
   },
 };
@@ -628,12 +627,12 @@ function normalizePlan(p) {
 
 function isModelAllowedByPlan(plan, model) {
   const p = normalizePlan(plan);
-  const mk = String(model || "pika").toLowerCase().trim();
+  const mk = String(model || "wan").toLowerCase().trim();
   const map = {
-    free:   new Set(["pika", "ltx"]),
-    basic:  new Set(["pika", "ltx", "wan"]),
-    pro:    new Set(["pika", "ltx", "wan", "kling"]),
-    studio: new Set(["pika", "ltx", "wan", "kling", "runway"]),
+    free:   new Set(["wan"]),
+    basic:  new Set(["wan", "pixverse"]),
+    pro:    new Set(["wan", "pixverse", "kling"]),
+    studio: new Set(["wan", "pixverse", "kling", "runway"]),
   };
   const allowed = map[p] || map.free;
   return allowed.has(mk);
@@ -1743,7 +1742,7 @@ const bucket = storage.bucket("genova-27d76.firebasestorage.app");
 
 
 // ------------------------------------------------------------
-// ✅ Provider configuration + helpers (Pika / LTX / WAN / Kling / Runway)
+// ✅ Provider configuration + helpers (WAN / PixVerse / Kling / Runway)
 // ------------------------------------------------------------
 const PROVIDERS = {
   pika: {
@@ -1751,11 +1750,11 @@ const PROVIDERS = {
     textModel: String(process.env.PIKA_TEXT_MODEL || "fal-ai/pika/v2.2/text-to-video").trim(),
     imageModel: String(process.env.PIKA_IMAGE_MODEL || "fal-ai/pika/v2.2/image-to-video").trim(),
   },
-  ltx: {
+  pixverse: {
     apiKey: String(process.env.WAVESPEED_API_KEY || "").trim(),
     baseUrl: String(process.env.WAVESPEED_BASE_URL || "https://api.wavespeed.ai/api/v3").trim().replace(/\/+$/, ""),
-    textModel: String(process.env.WAVESPEED_LTX_TEXT_MODEL || "wavespeed-ai/ltx-2-19b/text-to-video").trim(),
-    imageModel: String(process.env.WAVESPEED_LTX_IMAGE_MODEL || "wavespeed-ai/ltx-2-19b/image-to-video").trim(),
+    textModel: String(process.env.WAVESPEED_PIXVERSE_TEXT_MODEL || "pixverse/pixverse-v6/text-to-video").trim(),
+    imageModel: String(process.env.WAVESPEED_PIXVERSE_IMAGE_MODEL || "pixverse/pixverse-v6/image-to-video").trim(),
     webhookSecret: String(process.env.WAVESPEED_WEBHOOK_SECRET || "").trim(),
   },
   wan: {
@@ -1903,16 +1902,17 @@ function resolveProviderFromModel(rawModel) {
   const m = String(rawModel || "").trim().toLowerCase();
   if (m === "runway") return "runway";
   if (m === "kling") return "kling";
-  if (m === "pika" || m === "pika lite" || m === "pikalite" || m === "stable" || m === "minimax") return "pika"; // legacy free aliases -> Pika
-  if (m === "ltx" || m === "ltx-2" || m === "ltx 2" || m === "ltx-2-19b" || m === "wavespeed ltx") return "ltx";
+  // Legacy aliases are intentionally kept so old saved client values do not crash.
+  if (m === "pika" || m === "pika lite" || m === "pikalite" || m === "stable" || m === "minimax") return "wan";
+  if (m === "ltx" || m === "ltx-2" || m === "ltx 2" || m === "ltx-2-19b" || m === "wavespeed ltx") return "pixverse";
+  if (m === "pixverse" || m === "pix verse" || m === "pixverse v6" || m === "pixverse-v6") return "pixverse";
   if (m === "wan" || m === "wan 2.7") return "wan";
   throw new Error(`UNKNOWN_MODEL:${rawModel}`);
 }
 
 function mapOutputToProviderModel(rawModel) {
   const p = resolveProviderFromModel(rawModel);
-  if (p === "pika") return "Pika";
-  if (p === "ltx") return "LTX";
+  if (p === "pixverse") return "PixVerse";
   if (p === "wan") return "WAN";
   return String(rawModel || "").trim();
 }
@@ -1976,7 +1976,7 @@ function ensureProviderReady(provider) {
   const p = PROVIDERS[provider];
   if (!p) throw new Error(`UNKNOWN_PROVIDER:${provider}`);
   if (provider === "pika" && !p.apiKey) throw new Error("PIKA_API_KEY_MISSING");
-  if (provider === "ltx" && !p.apiKey) throw new Error("WAVESPEED_API_KEY_MISSING");
+  if (provider === "pixverse" && !p.apiKey) throw new Error("WAVESPEED_API_KEY_MISSING");
   if (provider === "wan" && !p.apiKey) throw new Error("WAN_API_KEY_MISSING");
   if (provider === "kling" && (!p.accessKey || !p.secretKey)) throw new Error("KLING_KEY_MISSING");
   if (provider === "runway" && !p.apiKey) throw new Error("RUNWAY_API_KEY_MISSING");
@@ -2238,7 +2238,7 @@ async function createWanTask({ uid, creationId = null, prompt, hasImage, localIm
 
 
 // ------------------------------------------------------------
-// WaveSpeed / LTX webhook-primary mode
+// WaveSpeed / PixVerse webhook-primary mode
 // ------------------------------------------------------------
 const WAVESPEED_WEBHOOK_PRIMARY = String(process.env.WAVESPEED_WEBHOOK_PRIMARY || "1").trim() !== "0";
 const WAVESPEED_WEBHOOK_URL = String(
@@ -2253,11 +2253,13 @@ function buildWaveSpeedSubmitUrl(cfg, modelSlug) {
   return `${base}${sep}webhook=${encodeURIComponent(WAVESPEED_WEBHOOK_URL)}`;
 }
 
-function mapLtxResolution(resolution) {
+function mapPixVerseResolution(resolution) {
   const r = normalizeResolution(resolution);
   if (r === "1080p" || r === "4k") return "1080p";
   if (r === "720p") return "720p";
-  return "480p";
+  // PixVerse V6 supports 360p/540p/720p/1080p, not 480p.
+  // Use 540p as the closest low-resolution fallback.
+  return "540p";
 }
 
 async function saveWaveSpeedRequestMapping({ requestId, provider, uid, creationId, modelSlug, statusUrl, resultUrl, meta }) {
@@ -2268,7 +2270,7 @@ async function saveWaveSpeedRequestMapping({ requestId, provider, uid, creationI
     await db.collection("wavespeed_requests").doc(rid).set(
       {
         requestId: rid,
-        provider: String(provider || "ltx"),
+        provider: String(provider || "pixverse"),
         uid: uid || null,
         creationId: creationId || null,
         modelSlug: modelSlug || null,
@@ -2296,7 +2298,7 @@ async function saveWaveSpeedRequestMapping({ requestId, provider, uid, creationI
 }
 
 function verifyWaveSpeedWebhookSignature(req) {
-  const cfg = PROVIDERS.ltx || {};
+  const cfg = PROVIDERS.pixverse || {};
   const secretRaw = String(cfg.webhookSecret || "").trim();
   if (!secretRaw) return true;
 
@@ -2319,8 +2321,8 @@ function verifyWaveSpeedWebhookSignature(req) {
   }
 }
 
-async function createLtxTask({ uid, creationId = null, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation, webhookMeta = null }) {
-  const cfg = ensureProviderReady("ltx");
+async function createPixVerseTask({ uid, creationId = null, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation, webhookMeta = null }) {
+  const cfg = ensureProviderReady("pixverse");
   let signedInput = null;
   if (hasImage && localImagePath) {
     signedInput = await uploadTempInputAndGetSignedUrl(uid, localImagePath, mimeType || "image/jpeg");
@@ -2329,9 +2331,11 @@ async function createLtxTask({ uid, creationId = null, prompt, hasImage, localIm
   const modelSlug = hasImage ? cfg.imageModel : cfg.textModel;
   const input = {
     prompt: String(prompt || "").trim(),
-    duration: Math.max(1, Math.min(20, Number(lengthSec || 5))),
-    resolution: mapLtxResolution(resolution),
-    seed: -1,
+    duration: Math.max(1, Math.min(15, Number(lengthSec || 5))),
+    resolution: mapPixVerseResolution(resolution),
+    // PixVerse should always generate native audio in GeNova.
+    generate_audio_switch: true,
+    thinking_type: "auto",
   };
 
   if (hasImage && signedInput?.signedUrl) {
@@ -2352,13 +2356,13 @@ async function createLtxTask({ uid, creationId = null, prompt, hasImage, localIm
   });
 
   const requestId = String(submit.json?.id || submit.json?.data?.id || submit.json?.request_id || submit.json?.requestId || "").trim();
-  if (!requestId) throw new Error("LTX_REQUEST_ID_MISSING");
+  if (!requestId) throw new Error("PIXVERSE_REQUEST_ID_MISSING");
 
   const baseUrl = String(cfg.baseUrl || "https://api.wavespeed.ai/api/v3").replace(/\/+$/, "");
   const statusUrl = `${baseUrl}/predictions/${encodeURIComponent(requestId)}`;
   const resultUrl = `${baseUrl}/predictions/${encodeURIComponent(requestId)}/result`;
 
-  console.log("🟦 WAVESPEED_LTX_QUEUE_URLS", {
+  console.log("🟦 WAVESPEED_PIXVERSE_QUEUE_URLS", {
     requestId,
     modelSlug,
     statusUrl,
@@ -2370,7 +2374,7 @@ async function createLtxTask({ uid, creationId = null, prompt, hasImage, localIm
 
   await saveWaveSpeedRequestMapping({
     requestId,
-    provider: "ltx",
+    provider: "pixverse",
     uid,
     creationId,
     modelSlug,
@@ -2388,7 +2392,7 @@ async function createLtxTask({ uid, creationId = null, prompt, hasImage, localIm
 
   if (WAVESPEED_WEBHOOK_PRIMARY) {
     return {
-      provider: "ltx",
+      provider: "pixverse",
       taskId: requestId,
       pendingWebhook: true,
       status: "processing",
@@ -2399,7 +2403,7 @@ async function createLtxTask({ uid, creationId = null, prompt, hasImage, localIm
     };
   }
 
-  const maxPolls = getFalVideoMaxPolls({ provider: "ltx", hasImage, lengthSec });
+  const maxPolls = getFalVideoMaxPolls({ provider: "pixverse", hasImage, lengthSec });
   let videoUrl = null;
 
   for (let i = 0; i < maxPolls; i += 1) {
@@ -2418,19 +2422,19 @@ async function createLtxTask({ uid, creationId = null, prompt, hasImage, localIm
         headers: { Authorization: `Bearer ${cfg.apiKey}` },
         timeoutMs: 45000,
       });
-      logFalResultJson("🟨 WAVESPEED_LTX_RESULT_JSON", result.json);
+      logFalResultJson("🟨 WAVESPEED_PIXVERSE_RESULT_JSON", result.json);
       videoUrl = pickVideoUrlFromAny(result.json) || pickVideoUrlFromAny(status.json) || null;
-      console.log("🟨 WAVESPEED_LTX_PICKED_VIDEO_URL", { requestId, videoUrl: videoUrl || null });
+      console.log("🟨 WAVESPEED_PIXVERSE_PICKED_VIDEO_URL", { requestId, videoUrl: videoUrl || null });
       break;
     }
 
     if (["failed", "error", "cancelled", "canceled"].includes(s)) {
-      throw new Error(`LTX_FAILED:${status.json?.error || status.json?.data?.error || status.json?.message || "failed"}`);
+      throw new Error(`PIXVERSE_FAILED:${status.json?.error || status.json?.data?.error || status.json?.message || "failed"}`);
     }
   }
 
-  if (!videoUrl) throw new Error(`LTX_TIMEOUT_AFTER_${maxPolls}_POLLS`);
-  return { provider: "ltx", taskId: requestId, videoUrl, nativeAudio: true };
+  if (!videoUrl) throw new Error(`PIXVERSE_TIMEOUT_AFTER_${maxPolls}_POLLS`);
+  return { provider: "pixverse", taskId: requestId, videoUrl, nativeAudio: true };
 }
 
 async function createPikaTask({ uid, creationId = null, prompt, hasImage, localImagePath, mimeType, lengthSec, resolution, orientation, webhookMeta = null }) {
@@ -3180,7 +3184,7 @@ app.post("/generate-video", verifyFirebaseToken, upload.single("file"), async (r
     const useRewardedNoWatermark = String(body.useRewardedNoWatermark || '').toLowerCase() === 'true';
     const useRewardedAudioMix = String(body.useRewardedAudioMix || '').toLowerCase() === 'true';
 const prompt = String(body.prompt || body.text || "").trim();
-    const model = mapOutputToProviderModel(String(body.model || "pika").trim());
+    const model = mapOutputToProviderModel(String(body.model || "wan").trim());
     const rawLength =
       body.lengthSec ??
       body.videoLength ??
@@ -3422,8 +3426,8 @@ const prompt = String(body.prompt || body.text || "").trim();
               orientation: outputFrame.orientation,
               webhookMeta: meta,
             })
-          : provider === "ltx"
-          ? await createLtxTask({
+          : provider === "pixverse"
+          ? await createPixVerseTask({
               uid,
               creationId,
               prompt,
@@ -3956,7 +3960,7 @@ app.post("/fal-webhook", async (req, res) => {
 
 
 // ------------------------------------------------------------
-// ✅ WaveSpeed webhook finalizer — LTX provider completion
+// ✅ WaveSpeed webhook finalizer — PixVerse provider completion
 // ------------------------------------------------------------
 app.post("/wavespeed-webhook", async (req, res) => {
   try {
@@ -3991,7 +3995,7 @@ app.post("/wavespeed-webhook", async (req, res) => {
     const uid = String(map.uid || "").trim();
     const creationId = String(map.creationId || "").trim();
     const meta = map.meta || {};
-    const provider = String(map.provider || meta.provider || "ltx").trim();
+    const provider = String(map.provider || meta.provider || "pixverse").trim();
 
     if (["failed", "error", "cancelled", "canceled"].includes(statusRaw)) {
       await mapRef.set(
@@ -4068,7 +4072,7 @@ app.post("/wavespeed-webhook", async (req, res) => {
     await existingCreationRef.set(
       {
         uid,
-        model: meta.model || "LTX",
+        model: meta.model || "PixVerse",
         prompt: String(meta.prompt || ""),
         length: Number(meta.lengthSec || 5),
         fps: Number(meta.fps || 30),
@@ -4118,7 +4122,7 @@ app.post("/wavespeed-webhook", async (req, res) => {
         uid,
         creationId,
         videoUrl: finalUrl,
-        model: meta.model || "LTX",
+        model: meta.model || "PixVerse",
         videoLength: Number(meta.lengthSec || 5),
         resolution: String(meta.resolution || ""),
         fps: Number(meta.fps || 30),
